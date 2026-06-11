@@ -28,7 +28,7 @@ cd "$ROOT"
 SCRIPTS=".claude/skills/agentbase/scripts"
 
 RUNTIME_NAME="${RUNTIME_NAME:-eventbuddy-phase0}"
-FLAVOR="${FLAVOR:-1x1-general}"
+FLAVOR="${FLAVOR:-runtime-s2-general-2x4}"
 ENV_FILE="${ENV_FILE:-.env}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 MIN_REPLICAS="${MIN_REPLICAS:-1}"
