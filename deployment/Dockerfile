@@ -3,9 +3,10 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8080
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
+# src layout: the package build (egg_info) needs src/, so copy it before install.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
 COPY src/ ./src/
+RUN pip install --no-cache-dir .
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
 EXPOSE 8080
