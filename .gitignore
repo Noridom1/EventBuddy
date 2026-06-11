@@ -13,3 +13,4 @@ venv/
 .secrets/
 .agentbase/
 .claude/
+__plans__/
