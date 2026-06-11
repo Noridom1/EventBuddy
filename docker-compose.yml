@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: eventbuddy
+      POSTGRES_PASSWORD: eventbuddy
+      POSTGRES_DB: eventbuddy
+    ports: ["5432:5432"]
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+  app:
+    build: .
+    env_file: .env
+    ports: ["8080:8080"]
+    depends_on: [db, redis]
