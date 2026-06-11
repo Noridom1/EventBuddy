@@ -6,7 +6,9 @@ from eventbuddy.config import settings
 class LLMGateway:
     """Single abstraction over the GreenNode MaaS OpenAI-compatible endpoint."""
 
-    def __init__(self, client=None, chat_model: str | None = None, summary_model: str | None = None):
+    def __init__(
+        self, client=None, chat_model: str | None = None, summary_model: str | None = None
+    ):
         self._client = client or OpenAI(
             base_url=settings.agentbase_llm_base_url,
             api_key=settings.agentbase_llm_api_key,

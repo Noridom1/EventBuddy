@@ -24,8 +24,12 @@ class Event(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
-    members: Mapped[list["EventMember"]] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True)
-    tasks: Mapped[list["Task"]] = relationship(back_populates="event", cascade="all, delete-orphan", passive_deletes=True)
+    members: Mapped[list["EventMember"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan", passive_deletes=True
+    )
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class EventMember(Base):
@@ -63,7 +67,9 @@ class Document(Base):
     drive_item_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     parse_status: Mapped[str] = mapped_column(String(20), default="pending")
-    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ScheduledJob(Base):
@@ -85,7 +91,9 @@ class FeedbackResponse(Base):
     raw_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     sentiment: Mapped[str | None] = mapped_column(String(20), nullable=True)
     themes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class Report(Base):
@@ -95,13 +103,17 @@ class Report(Base):
     metrics_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     summary_md: Mapped[str | None] = mapped_column(Text, nullable=True)
     suggestions_md: Mapped[str | None] = mapped_column(Text, nullable=True)
-    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
     log_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    event_id: Mapped[str | None] = mapped_column(ForeignKey("events.event_id", ondelete="SET NULL"), nullable=True)
+    event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("events.event_id", ondelete="SET NULL"), nullable=True
+    )
     actor_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     action: Mapped[str] = mapped_column(String(100))
     tool_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
