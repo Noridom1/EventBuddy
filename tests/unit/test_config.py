@@ -8,6 +8,6 @@ def test_settings_load_from_env(monkeypatch):
     monkeypatch.setenv("AGENTBASE_LLM_BASE_URL", "https://maas.example/v1")
     monkeypatch.setenv("AGENTBASE_LLM_API_KEY", "k")
     s = Settings()
-    assert s.database_url.startswith("postgresql+psycopg://")
+    assert s.database_url == "postgresql+psycopg://u:p@localhost/db"
     assert s.llm_chat_model  # has a default
     assert s.port == 8080  # AgentBase contract default
