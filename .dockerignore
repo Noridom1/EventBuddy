@@ -7,3 +7,9 @@ tests/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.agentbase/
+.claude/
+Makefile
+deployment/
+venv/
+__plans__/
