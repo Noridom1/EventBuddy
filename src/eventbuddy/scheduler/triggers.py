@@ -3,7 +3,12 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from eventbuddy.domain.reminders import compute_reminder_schedule
-from eventbuddy.scheduler.jobs import run_feedback_followup, run_feedback_send, run_reminder
+from eventbuddy.scheduler.jobs import (
+    run_feedback_followup,
+    run_feedback_send,
+    run_reminder,
+    run_summarize_sessions,
+)
 
 
 def build_scheduler() -> BackgroundScheduler:
@@ -19,6 +24,14 @@ def schedule_event_jobs(scheduler, *, event_id: str, start_at: datetime, end_at:
                       args=[event_id], id=f"{event_id}:feedback_send", replace_existing=True)
     scheduler.add_job(run_feedback_followup, "date", run_date=sched_times["feedback_followup"],
                       args=[event_id], id=f"{event_id}:feedback_followup", replace_existing=True)
+
+
+def schedule_summarizer(scheduler, summarizer, *, minutes: int = 5) -> None:
+    """Register the periodic rolling-summary consolidation job (Phase 1.7)."""
+    scheduler.add_job(
+        run_summarize_sessions, "interval", minutes=minutes, args=[summarizer],
+        id="summarize_sessions", replace_existing=True,
+    )
 
 
 _scheduler: BackgroundScheduler | None = None
