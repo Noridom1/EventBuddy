@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # chat path auto-degrades to regex regardless of this flag.
     agent_mode: str = "llm"
 
+    # Phase 1.8 debug surfacing. When True (default this phase), the LLM agent never
+    # silently degrades to the regex router on a *runtime* error: instead the reply carries
+    # a debug footer listing every tool call this turn (name + params) with the full
+    # exception + traceback for any that failed. Set False to restore the silent regex
+    # fallback (and drop the footer). The no-creds / agent_mode=regex degradation is decided
+    # at wiring time and is unaffected by this flag.
+    agent_debug: bool = True
+
     # Microsoft Bot Framework
     microsoft_app_id: str = ""
     microsoft_app_password: str = ""
