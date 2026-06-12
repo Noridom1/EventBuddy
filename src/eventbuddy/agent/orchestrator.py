@@ -1,21 +1,63 @@
+from eventbuddy.agent.context import RequestContext
 from eventbuddy.agent.intents import Intent, classify
+from eventbuddy.common.logging import get_logger
+
+log = get_logger("agent.orchestrator")
+
+
+def _default_role(*, user_id: str, scope: str, channel_id: str | None) -> str:
+    """Server-resolved caller role. In a 1-1 DM the user acts as the event leader (host);
+    in a channel, default to member. Wiring may inject a membership-backed resolver."""
+    return "host" if scope == "personal" else "member"
 
 
 class Orchestrator:
-    """The agent brain: classify → route to a capability → compose reply.
-    Capabilities are injected as callables so this stays unit-testable and is the
-    logic wrapped by the LangGraph graph in graph.py."""
+    """The agent brain. Phase 1.7: route the conversation through the LLM tool-calling
+    runner, degrading to the Phase 1 regex router when the LLM is unavailable, errors, or
+    when `agent_mode="regex"` forces the deterministic path. The `handle(...)` signature is
+    stable so `activity_router.py` and `api/dev.py` don't change. Memory is owned by the
+    runner's checkpointer — the orchestrator does not manage history."""
 
     def __init__(self, *, session_store, provision_fn, resolve_event_fn,
-                 remind_fn, report_fn, query_tasks_fn):
+                 remind_fn, report_fn, query_tasks_fn,
+                 runner=None, agent_mode: str = "llm", role_resolver=None):
         self.session = session_store
         self.provision = provision_fn
         self.resolve_event = resolve_event_fn
         self.remind = remind_fn
         self.report = report_fn
         self.query_tasks = query_tasks_fn
+        self.runner = runner
+        self.agent_mode = agent_mode
+        self._role_resolver = role_resolver or _default_role
 
-    def handle(self, *, user_id: str, channel_id: str | None, text: str) -> str:
+    def _build_ctx(self, user_id: str, channel_id: str | None, scope: str) -> RequestContext:
+        return RequestContext(
+            user_id=user_id,
+            channel_id=channel_id,
+            scope=scope,
+            role=self._role_resolver(user_id=user_id, scope=scope, channel_id=channel_id),
+            current_event_id=self.session.get_current_event(user_id),
+        )
+
+    def handle(self, *, user_id: str, channel_id: str | None, text: str,
+               scope: str = "personal") -> str:
+        if self.agent_mode == "llm" and self.runner is not None:
+            try:
+                ctx = self._build_ctx(user_id, channel_id, scope)
+                return self.runner.run(text, ctx)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"LLM agent failed ({type(e).__name__}: {e}); falling back to regex")
+        return self._regex_handle(user_id=user_id, channel_id=channel_id, text=text)
+
+    def reset_dm(self, user_id: str) -> None:
+        """Clear a user's 1-1 conversation memory + focused event (fresh start)."""
+        if self.runner is not None and hasattr(self.runner, "reset"):
+            self.runner.reset(f"dm:{user_id}")
+        self.session.clear_current_event(user_id)
+
+    def _regex_handle(self, *, user_id: str, channel_id: str | None, text: str) -> str:
+        """Deterministic Phase 1 router — the graceful fallback when the LLM is unavailable."""
         c = classify(text)
 
         if c.intent == Intent.CREATE_EVENT:

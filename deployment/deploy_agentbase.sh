@@ -80,7 +80,10 @@ REPO_JSON="$(bash "$SCRIPTS/cr.sh" repo get)" || die "cr.sh repo get failed (tok
 REGISTRY_URL="$(echo "$REPO_JSON" | jq -r '.registryUrl // empty')"
 REPO_NAME="$(echo "$REPO_JSON"  | jq -r '.name // empty')"
 [ -n "$REGISTRY_URL" ] && [ -n "$REPO_NAME" ] || die "Could not read registryUrl/name from CR repo response."
-IMAGE="${REGISTRY_URL}/${REPO_NAME}/${RUNTIME_NAME}:${TAG}"
+# Docker image repository components must be lowercase; the runtime NAME may be mixed-case
+# (e.g. "AgentBuddy"). Derive a lowercase image name so the two can differ.
+IMAGE_NAME="$(printf '%s' "$RUNTIME_NAME" | tr '[:upper:]' '[:lower:]')"
+IMAGE="${REGISTRY_URL}/${REPO_NAME}/${IMAGE_NAME}:${TAG}"
 ok "Registry: $REGISTRY_URL  repo: $REPO_NAME"
 ok "Image:    $IMAGE"
 

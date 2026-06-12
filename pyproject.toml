@@ -11,6 +11,8 @@ dependencies = [
   "aiohttp>=3.9",  # botbuilder's async connector imports this at import time; not auto-pulled
   "langgraph>=0.2",
   "langchain-core>=0.3",
+  "langchain-openai>=0.2",            # ChatOpenAI for the tool-calling chat path (Phase 1.7)
+  "langgraph-checkpoint-redis>=0.4",  # Redis checkpointer = conversation working window (Phase 1.7)
   "sqlalchemy>=2.0",
   "psycopg[binary]>=3.2",
   "alembic>=1.13",
@@ -25,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10", "fakeredis>=2.20"]
 
 [build-system]
 requires = ["setuptools>=68"]
