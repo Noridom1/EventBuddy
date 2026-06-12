@@ -50,6 +50,12 @@ class Orchestrator:
                 log.warning(f"LLM agent failed ({type(e).__name__}: {e}); falling back to regex")
         return self._regex_handle(user_id=user_id, channel_id=channel_id, text=text)
 
+    def reset_dm(self, user_id: str) -> None:
+        """Clear a user's 1-1 conversation memory + focused event (fresh start)."""
+        if self.runner is not None and hasattr(self.runner, "reset"):
+            self.runner.reset(f"dm:{user_id}")
+        self.session.clear_current_event(user_id)
+
     def _regex_handle(self, *, user_id: str, channel_id: str | None, text: str) -> str:
         """Deterministic Phase 1 router — the graceful fallback when the LLM is unavailable."""
         c = classify(text)

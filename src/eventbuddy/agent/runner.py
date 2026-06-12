@@ -90,6 +90,15 @@ class AgentRunner:
         except Exception:
             return True
 
+    def reset(self, thread_id: str) -> None:
+        """Drop a thread's working window (dev convenience / fresh conversation)."""
+        delete = getattr(self._checkpointer, "delete_thread", None)
+        if delete is not None:
+            try:
+                delete(thread_id)
+            except Exception:  # noqa: BLE001
+                pass
+
     def run(self, text: str, ctx: RequestContext) -> str:
         agent = create_react_agent(
             self._model,
