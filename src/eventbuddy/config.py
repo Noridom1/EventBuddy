@@ -14,8 +14,16 @@ class Settings(BaseSettings):
     # LLM (GreenNode MaaS, OpenAI-compatible)
     agentbase_llm_base_url: str = ""
     agentbase_llm_api_key: str = ""
-    llm_chat_model: str = "gemma-4-31b-it"
-    llm_summary_model: str = "qwen-3-27b"
+    # Model IDs are namespaced on the MaaS endpoint (verified 2026-06-12 — bare
+    # "gemma-4-31b-it"/"qwen-3-27b" return 404). qwen3-5-27b returns clean OpenAI
+    # tool_calls, so it's the chat brain for the Phase 1.7 tool-calling agent.
+    llm_chat_model: str = "qwen/qwen3-5-27b"
+    llm_summary_model: str = "qwen/qwen3-5-27b"
+
+    # Phase 1.7 conversational agent. "llm" = LLM tool-calling brain (requires the MaaS
+    # creds above); "regex" forces the deterministic Phase 1 router. Without LLM creds the
+    # chat path auto-degrades to regex regardless of this flag.
+    agent_mode: str = "llm"
 
     # Microsoft Bot Framework
     microsoft_app_id: str = ""
