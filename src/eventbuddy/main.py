@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from eventbuddy.api import health, messages, webhooks
 from eventbuddy.common.logging import configure_logging
+from eventbuddy.config import settings
 from eventbuddy.scheduler.triggers import shutdown_scheduler, start_scheduler
 
 
@@ -22,6 +23,9 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(messages.router)
     app.include_router(webhooks.router)
+    if settings.dev_routes_enabled:
+        from eventbuddy.api import dev
+        app.include_router(dev.router)
     return app
 
 
