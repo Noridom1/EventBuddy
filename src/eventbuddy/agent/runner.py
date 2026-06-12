@@ -5,16 +5,46 @@ the system talks to this object, not to LangGraph directly.
 Path A (the spike-selected default, 2026-06-12): `create_react_agent` runs the tool loop;
 a Redis checkpointer holds the working window; a `pre_model_hook` trims it to <=4096 tokens
 on user/assistant boundaries so no tool-call/result pair is ever orphaned."""
+import traceback
 from collections.abc import Callable
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, trim_messages
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent
 
 from eventbuddy.agent.context import RequestContext
 from eventbuddy.agent.prompts import system_prompt
+from eventbuddy.agent.tools import ToolCallRecord, begin_trace, end_trace
 
 MAX_TOKENS = 4096
 RECURSION_LIMIT = 8
+
+
+def _format_params(params: dict) -> str:
+    return ", ".join(f"{k}={v!r}" for k, v in params.items())
+
+
+def _format_footer(records: list[ToolCallRecord]) -> str:
+    """The Phase 1.8 debug footer: every tool call this turn (name + params), with the
+    exception + traceback for any that failed. Deterministic separator so it's easy to
+    strip/match in tests and downstream tooling."""
+    lines = [f"──────── debug · tool calls ({len(records)}) ────────"]
+    for r in records:
+        mark = "✓" if r.ok else "✗"
+        lines.append(f"{mark} {r.tool}({_format_params(r.params)})")
+        if not r.ok:
+            lines.append(f"    {r.error}")
+            if r.traceback:
+                lines.append("\n".join(f"    {ln}" for ln in r.traceback.rstrip().splitlines()))
+    return "\n".join(lines)
+
+
+def _format_error_block(tb: str, records: list[ToolCallRecord]) -> str:
+    """Surfaced when the loop itself errors out (no model reply produced): the traceback,
+    plus any tool calls captured before the crash."""
+    block = "[agent error]\n" + "\n".join(f"    {ln}" for ln in tb.rstrip().splitlines())
+    if records:
+        block = f"{block}\n\n{_format_footer(records)}"
+    return block
 
 
 def make_trimmer(token_counter, max_tokens: int = MAX_TOKENS) -> Callable:
@@ -56,6 +86,7 @@ class AgentRunner:
         max_tokens: int = MAX_TOKENS,
         transcript=None,
         summarizer=None,
+        debug: bool = False,
     ):
         self._model = model
         self._tools_factory = tools_factory
@@ -65,6 +96,7 @@ class AgentRunner:
         self._pre_model_hook = make_trimmer(token_counter or model, max_tokens)
         self._transcript = transcript
         self._summarizer = summarizer
+        self._debug = debug
 
     def _config(self, ctx: RequestContext) -> dict:
         return {
@@ -100,9 +132,12 @@ class AgentRunner:
                 pass
 
     def run(self, text: str, ctx: RequestContext) -> str:
+        # `handle_tool_errors=False` so a raising tool body propagates instead of being
+        # swallowed by the ToolNode — our `_traced` wrapper already owns error behavior
+        # (soft-string + record in debug, re-raise otherwise). Phase 1.8.
         agent = create_react_agent(
             self._model,
-            self._tools_factory(ctx),
+            ToolNode(self._tools_factory(ctx), handle_tool_errors=False),
             prompt=self._prompt_fn(ctx),
             checkpointer=self._checkpointer,
             pre_model_hook=self._pre_model_hook,
@@ -114,9 +149,23 @@ class AgentRunner:
         ):
             messages.extend(self._seed_messages(ctx))
         messages.append(ctx.tag(text))
-        result = agent.invoke({"messages": messages}, config=config)
-        final = result["messages"][-1]
-        return final.content if isinstance(final, AIMessage) else str(final.content)
+
+        trace, token = begin_trace()
+        try:
+            result = agent.invoke({"messages": messages}, config=config)
+            final = result["messages"][-1]
+            reply = final.content if isinstance(final, AIMessage) else str(final.content)
+            if self._debug and trace.records:
+                reply = f"{reply}\n\n{_format_footer(trace.records)}"
+            return reply
+        except Exception:
+            # Loop/infra error (LLM call, recursion limit, or a tool re-raised). In debug,
+            # surface it instead of letting the orchestrator silently fall back to regex.
+            if self._debug:
+                return _format_error_block(traceback.format_exc(), trace.records)
+            raise
+        finally:
+            end_trace(token)
 
 
 def build_agent_runner(
@@ -128,9 +177,11 @@ def build_agent_runner(
     token_counter=None,
     transcript=None,
     summarizer=None,
+    debug: bool = False,
 ) -> AgentRunner:
     """Compose the Path-A agent runner. `tools_factory(ctx)` rebuilds the tool set bound to
-    the request; `transcript`/`summarizer` (optional) enable empty-window rehydration."""
+    the request; `transcript`/`summarizer` (optional) enable empty-window rehydration.
+    `debug` turns on the Phase 1.8 tool-trace footer + error surfacing (no regex fallback)."""
     return AgentRunner(
         model=model,
         tools_factory=tools_factory,
@@ -139,4 +190,5 @@ def build_agent_runner(
         token_counter=token_counter,
         transcript=transcript,
         summarizer=summarizer,
+        debug=debug,
     )

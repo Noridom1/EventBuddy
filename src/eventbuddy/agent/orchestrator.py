@@ -1,3 +1,5 @@
+import traceback
+
 from eventbuddy.agent.context import RequestContext
 from eventbuddy.agent.intents import Intent, classify
 from eventbuddy.common.logging import get_logger
@@ -20,7 +22,8 @@ class Orchestrator:
 
     def __init__(self, *, session_store, provision_fn, resolve_event_fn,
                  remind_fn, report_fn, query_tasks_fn,
-                 runner=None, agent_mode: str = "llm", role_resolver=None):
+                 runner=None, agent_mode: str = "llm", role_resolver=None,
+                 regex_fallback_on_error: bool = True):
         self.session = session_store
         self.provision = provision_fn
         self.resolve_event = resolve_event_fn
@@ -30,6 +33,10 @@ class Orchestrator:
         self.runner = runner
         self.agent_mode = agent_mode
         self._role_resolver = role_resolver or _default_role
+        # Phase 1.8: when False, a *runtime* LLM error is surfaced (debug) instead of
+        # degrading to regex. The no-creds path (runner is None / agent_mode=regex) is
+        # decided at wiring time and is unaffected by this flag.
+        self._regex_fallback_on_error = regex_fallback_on_error
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str) -> RequestContext:
         return RequestContext(
@@ -47,6 +54,9 @@ class Orchestrator:
                 ctx = self._build_ctx(user_id, channel_id, scope)
                 return self.runner.run(text, ctx)
             except Exception as e:  # noqa: BLE001
+                if not self._regex_fallback_on_error:
+                    log.warning(f"LLM agent failed ({type(e).__name__}: {e}); surfacing (debug)")
+                    return f"[agent error] {type(e).__name__}: {e}\n{traceback.format_exc()}"
                 log.warning(f"LLM agent failed ({type(e).__name__}: {e}); falling back to regex")
         return self._regex_handle(user_id=user_id, channel_id=channel_id, text=text)
 

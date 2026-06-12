@@ -64,6 +64,7 @@ def build_orchestrator() -> Orchestrator:
         resolve_event_fn=resolve_event_fn, remind_fn=remind_fn,
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         runner=runner, agent_mode=settings.agent_mode if runner else "regex",
+        regex_fallback_on_error=not settings.agent_debug,
     )
     orch.summarizer = summarizer  # exposed so main.py can schedule the consolidation job
     return orch
@@ -107,6 +108,7 @@ def _build_runner_and_summarizer(
         session_store=session_store, provision_fn=provision_fn,
         resolve_event_fn=resolve_event_fn, remind_fn=remind_fn,
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
+        debug=settings.agent_debug,
     )
     runner = build_agent_runner(
         model,
@@ -115,5 +117,6 @@ def _build_runner_and_summarizer(
         token_counter=make_token_counter(),
         transcript=transcript,
         summarizer=summarizer,
+        debug=settings.agent_debug,
     )
     return runner, summarizer

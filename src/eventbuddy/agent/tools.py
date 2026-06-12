@@ -4,14 +4,95 @@ Each tool's **docstring is the model-facing description** — keep them action-o
 Identity/role/focused-event come from the server-built `RequestContext` captured in the
 factory closure, so they are NOT in any tool's argument schema and cannot be model-set
 (cross-cutting rule 2). The tool bodies delegate to the same `*_fn` capability closures
-used by the Phase 1 orchestrator (DRY) — see `wiring.py`."""
+used by the Phase 1 orchestrator (DRY) — see `wiring.py`.
+
+**Phase 1.8 — tool tracing.** Every tool call this turn is recorded into a request-scoped
+`ToolTrace` (a `ContextVar` set by the runner around `agent.invoke`) with the params the
+model passed and, on failure, the exception + traceback. The runner reads the trace to
+build the debug footer. In debug mode a failing tool returns a soft error string so the
+loop continues and the model can acknowledge it; with debug off the wrapper re-raises so
+the orchestrator's graceful regex fallback still fires (unchanged behavior)."""
+import functools
+import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 from langchain_core.tools import BaseTool, tool
 
 from eventbuddy.agent.context import RequestContext
 from eventbuddy.bot.auth import ROLE_RANK
+
+
+@dataclass
+class ToolCallRecord:
+    """One tool invocation this turn. `params` is exactly what the model passed —
+    never identity/role/scope (those come from the closed-over `RequestContext`)."""
+
+    tool: str
+    params: dict
+    ok: bool
+    error: str | None = None
+    traceback: str | None = None
+
+
+@dataclass
+class ToolTrace:
+    records: list[ToolCallRecord] = field(default_factory=list)
+
+    def add(self, rec: ToolCallRecord) -> None:
+        self.records.append(rec)
+
+    @property
+    def errored(self) -> list[ToolCallRecord]:
+        return [r for r in self.records if not r.ok]
+
+
+# Set by the runner immediately before `agent.invoke` and reset in a `finally`. The tool
+# loop runs synchronously on the request thread under `.invoke`, so the value is visible to
+# the wrapped tool bodies and isolated per request (one ContextVar copy per worker thread).
+_current_trace: ContextVar[ToolTrace | None] = ContextVar("eventbuddy_tool_trace", default=None)
+
+
+def begin_trace() -> tuple[ToolTrace, object]:
+    """Start a fresh trace for one request; returns it plus the reset token."""
+    trace = ToolTrace()
+    token = _current_trace.set(trace)
+    return trace, token
+
+
+def end_trace(token: object) -> None:
+    _current_trace.reset(token)
+
+
+def _make_traced(debug: bool) -> Callable:
+    """Build the per-request tool-body wrapper. Records every call into the active
+    `ToolTrace`; on exception records the error + traceback, then returns a soft error
+    string when `debug` (loop continues) or re-raises otherwise (regex fallback fires)."""
+
+    def _traced(fn: Callable) -> Callable:
+        @functools.wraps(fn)  # preserve name/doc/signature so @tool builds the right schema
+        def wrapper(*args, **kwargs):
+            trace = _current_trace.get()
+            params = dict(kwargs)
+            try:
+                result = fn(*args, **kwargs)
+                if trace is not None:
+                    trace.add(ToolCallRecord(fn.__name__, params, ok=True))
+                return result
+            except Exception as e:  # noqa: BLE001 — captured for the debug footer
+                if trace is not None:
+                    trace.add(ToolCallRecord(
+                        fn.__name__, params, ok=False,
+                        error=f"{type(e).__name__}: {e}", traceback=traceback.format_exc(),
+                    ))
+                if debug:
+                    return f"⚠️ {fn.__name__} failed: {type(e).__name__}: {e}"
+                raise
+
+        return wrapper
+
+    return _traced
 
 
 @dataclass
@@ -24,6 +105,9 @@ class AgentDeps:
     remind_fn: Callable
     report_fn: Callable
     query_tasks_fn: Callable
+    # When True, tool failures are softened (recorded + returned as a string) so the runner
+    # can surface them in the debug footer; when False, they re-raise (regex fallback).
+    debug: bool = False
 
 
 def _role_allows(ctx: RequestContext, min_role: str) -> bool:
@@ -32,8 +116,10 @@ def _role_allows(ctx: RequestContext, min_role: str) -> bool:
 
 def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     """Build the per-request tool set bound to this caller's context."""
+    traced = _make_traced(deps.debug)
 
     @tool
+    @traced
     def create_event(
         name: str, member_emails: list[str], objective: str = ""
     ) -> str:
@@ -48,6 +134,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         return f"Created event '{name}' (id {ev.event_id})."
 
     @tool
+    @traced
     def set_focus_event(event_query: str) -> str:
         """Switch the focused event to the one matching `event_query` (a name or fragment).
         Subsequent task/reminder/report actions apply to this event."""
@@ -58,6 +145,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         return f"Focused on '{event_query}'."
 
     @tool
+    @traced
     def prepare_reminders(note: str = "") -> str:
         """Prepare reminders for the members of the currently focused event.
         Optionally pass a `note` to include. Requires a focused event."""
@@ -70,12 +158,14 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         return "I prepared the reminders — pick a channel on the card above."
 
     @tool
+    @traced
     def list_my_tasks() -> str:
         """List the caller's assigned tasks in the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.user_id)
         return deps.query_tasks_fn(user_id=ctx.user_id, event_id=event_id)
 
     @tool
+    @traced
     def generate_report() -> str:
         """Generate the AI summary report for the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.user_id)
