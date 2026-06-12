@@ -13,7 +13,7 @@ VENV := $(ROOT)/venv
 PY   := $(VENV)/bin/python
 
 # Deploy config — override on the command line, e.g. `make deploy FLAVOR=2x4-general`
-export RUNTIME_NAME ?= eventbuddy-phase0
+export RUNTIME_NAME ?= eventbuddy-phase1
 export FLAVOR       ?= runtime-s2-general-2x4
 export ENV_FILE     ?= .env
 export PLATFORM     ?= linux/amd64
