@@ -27,6 +27,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 SCRIPTS=".claude/skills/agentbase/scripts"
 
+# `make creds` stores IAM creds in .greennode.json, but the bundled skill scripts
+# (get_token.sh) read GREENNODE_CLIENT_ID/SECRET from the environment. Bridge the two:
+# if the env vars aren't already set, load them from .greennode.json.
+if [ -z "${GREENNODE_CLIENT_ID:-}" ] || [ -z "${GREENNODE_CLIENT_SECRET:-}" ]; then
+  if [ -f .greennode.json ]; then
+    export GREENNODE_CLIENT_ID="$(jq -r '.client_id // .clientId // .iam.client_id // empty' .greennode.json)"
+    export GREENNODE_CLIENT_SECRET="$(jq -r '.client_secret // .clientSecret // .iam.client_secret // empty' .greennode.json)"
+  fi
+fi
+
 RUNTIME_NAME="${RUNTIME_NAME:-eventbuddy-phase1}"
 FLAVOR="${FLAVOR:-runtime-s2-general-2x4}"
 ENV_FILE="${ENV_FILE:-.env}"

@@ -20,6 +20,14 @@ export PLATFORM     ?= linux/amd64
 
 SCRIPTS := $(ROOT)/.claude/skills/agentbase/scripts
 
+# `make creds` stores IAM creds in .greennode.json, but the bundled skill scripts read
+# GREENNODE_CLIENT_ID/SECRET from the environment. Bridge the two so every target that
+# calls the API (deploy, destroy, status, endpoint, logs) is authenticated. An already
+# exported value wins (?=); otherwise pull it from .greennode.json.
+GN_JSON := $(ROOT)/.greennode.json
+export GREENNODE_CLIENT_ID     ?= $(shell jq -r '.client_id // .clientId // .iam.client_id // empty' $(GN_JSON) 2>/dev/null)
+export GREENNODE_CLIENT_SECRET ?= $(shell jq -r '.client_secret // .clientSecret // .iam.client_secret // empty' $(GN_JSON) 2>/dev/null)
+
 .DEFAULT_GOAL := help
 
 .PHONY: help test lint run creds deploy redeploy status health logs endpoint destroy
