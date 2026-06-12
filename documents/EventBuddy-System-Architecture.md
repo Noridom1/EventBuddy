@@ -289,15 +289,27 @@ All event-scoped tables carry `event_id` (FK → `events.event_id`) as a **manda
 ## 7. Key Flows
 
 ### 7.1 Event creation & channel provisioning
+
+The team leader creates an event **from their private 1-1 chat** with EventBuddy (not from inside a channel). They name the event and supply the member roster as a list of emails and/or whole domains to include.
+
 ```
-EO: "@EventBuddy create event 'AI Workshop' members: a@x.com, b@x.com"
- → Gatekeeper: caller is an EO        → allow
+(1-1 DM) Leader: "create event 'AI Workshop' members: a@x.com, b@x.com, @team.com"
+ → Gatekeeper: caller may create events → allow
  → Agent intent: CREATE_EVENT          → tool: provision_channel
  → Event service: INSERT events(status=ideation)
- → Graph: create Teams channel, add members, pin overview card
+ → Graph: create Teams channel, add the EventBuddy app + members, pin overview card
  → Member service: INSERT event_members(role=host/member, registration=pending)
- → Reply: pinned overview (name, objective, members, status=Ideation)
+ → Reply (in the DM): "Channel created — here's the overview" + deep link to the channel
 ```
+
+**Two entry paths to a channel↔event binding:**
+
+| Path | How | History |
+|------|-----|---------|
+| **A — agent-provisioned (primary)** | Leader runs the DM command above; the agent calls `create_channel` and adds itself + members. | No gap: the app is present from message #1. |
+| **B — manually-created channel** | A human makes the channel and adds the EventBuddy app via Teams' *Add an app*, then runs `bind this channel to <event>` (or the leader created it via path A). | ⚠ **A bot only receives messages sent *after* it was added.** Prior history is not delivered through the Activity feed. To backfill it, the app needs Graph `ChannelMessage.Read.All` via **RSC** (`channel.getAllMessages`) — a *protected* API requiring E5 / metered billing. Default stance: **add the app at channel creation** (path A) so there is no gap; treat history backfill as an optional, license-gated enhancement. |
+
+`events.teams_channel_id` (unique, nullable) is the binding key for both paths.
 
 ### 7.2 Document ingestion → proactive suggestion (HITL)
 ```
@@ -342,11 +354,14 @@ Event end_at passes → job feedback_send → Forms link to attendees
 
 ### 7.6 Personal-scope context switching
 ```
+DM: "create event 'AI Workshop' members: a@x.com, @team.com"  → provisions channel (§7.1 path A)
 DM: "focus on AI Workshop"   → session.current_event_id = <id>  (Redis)
 DM: "what tasks are due soon?"
  → all task queries + RAG implicitly filtered WHERE event_id = current_event_id
 DM (no focus set): "my tasks?" → aggregate across all events the user belongs to
+DM (no event match): general assistant / small talk
 ```
+The private 1-1 chat is both the **control plane** (leaders provision events and switch focus here) and a **general-purpose assistant** (everyday questions, plus event/task queries scoped to the focused event).
 
 ---
 
@@ -640,8 +655,12 @@ Event creation + channel provisioning, Broadcast (Outlook+Teams), Registration d
 **Phase 1.5 — Auto Report + Suggestions (Day 5–6) [the differentiator]**
 Feedback sentiment/themes, metrics aggregation, Qwen summary + suggestions, report card + draft email. *Milestone: end-to-end demo (broadcast + reminder + report).*
 
-**Phase 2 — Proactive intelligence (post-hackathon)**
-Document ingestion pipeline + proactive Adaptive Cards (data-to-action), pgvector RAG, brainstorm synthesis, personal-scope assistant with context-switching, cross-event learning.
+**Phase 1.6 — Document ingestion (pulled into hackathon scope)**
+> Originally Phase 2; **pulled forward** because the flagship demo ("read the uploaded participant list + guide, then email everyone the doc link") depends on it. See `__plans__/04-amendments.md`.
+Graph file webhook → download → parse (xlsx/docx/pdf) → LLM-structure → upsert `documents` + extracted members/tasks → proactive HITL card → bulk send. *Milestone: upload a participant xlsx in the channel → agent offers to email the roster a guide link → one click sends.*
+
+**Phase 2 — Remaining proactive intelligence (post-hackathon)**
+pgvector RAG over docs + chat, brainstorm synthesis, full personal-scope memory, cross-event learning, passive channel-history awareness (RSC `getAllMessages`).
 
 **Phase 3 — Hardening**
 Resource Gateway + Policy rollout, full audit, subscription renewal robustness, observability dashboards, scale testing.
