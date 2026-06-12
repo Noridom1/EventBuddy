@@ -2,6 +2,8 @@ from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
 
+# Import all ORM models so that their tables are registered on Base.metadata.
+import eventbuddy.domain.models  # noqa: F401
 from alembic import context
 
 # ---------------------------------------------------------------------------
@@ -12,9 +14,6 @@ from eventbuddy.config import settings
 
 # Import Base so target_metadata is populated.
 from eventbuddy.data.db import Base
-
-# Import all ORM models so that their tables are registered on Base.metadata.
-import eventbuddy.domain.models  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Alembic Config object – provides access to values in alembic.ini.

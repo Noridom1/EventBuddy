@@ -13,12 +13,20 @@ VENV := $(ROOT)/venv
 PY   := $(VENV)/bin/python
 
 # Deploy config — override on the command line, e.g. `make deploy FLAVOR=2x4-general`
-export RUNTIME_NAME ?= eventbuddy-phase0
+export RUNTIME_NAME ?= eventbuddy-phase1
 export FLAVOR       ?= runtime-s2-general-2x4
 export ENV_FILE     ?= .env
 export PLATFORM     ?= linux/amd64
 
 SCRIPTS := $(ROOT)/.claude/skills/agentbase/scripts
+
+# `make creds` stores IAM creds in .greennode.json, but the bundled skill scripts read
+# GREENNODE_CLIENT_ID/SECRET from the environment. Bridge the two so every target that
+# calls the API (deploy, destroy, status, endpoint, logs) is authenticated. An already
+# exported value wins (?=); otherwise pull it from .greennode.json.
+GN_JSON := $(ROOT)/.greennode.json
+export GREENNODE_CLIENT_ID     ?= $(shell jq -r '.client_id // .clientId // .iam.client_id // empty' $(GN_JSON) 2>/dev/null)
+export GREENNODE_CLIENT_SECRET ?= $(shell jq -r '.client_secret // .clientSecret // .iam.client_secret // empty' $(GN_JSON) 2>/dev/null)
 
 .DEFAULT_GOAL := help
 

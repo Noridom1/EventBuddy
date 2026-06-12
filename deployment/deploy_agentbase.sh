@@ -8,9 +8,9 @@
 # Idempotent: if a runtime named "$RUNTIME_NAME" already exists it is UPDATED
 # (new version), otherwise it is CREATED. Safe to run repeatedly.
 #
-# Config via env vars (all have sane Phase-0 defaults):
-#   RUNTIME_NAME   runtime + image name           (default: eventbuddy-phase0)
-#   FLAVOR         compute flavor                  (default: 1x1-general)
+# Config via env vars (all have sane Phase-1 defaults):
+#   RUNTIME_NAME   runtime + image name           (default: eventbuddy-phase1)
+#   FLAVOR         compute flavor                  (default: runtime-s2-general-2x4)
 #   ENV_FILE       env file injected at runtime    (default: .env; "none" to skip)
 #   PLATFORM       docker build platform           (default: linux/amd64)
 #   TAG            image tag                        (default: vYYYYMMDDHHMMSS)
@@ -27,7 +27,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 SCRIPTS=".claude/skills/agentbase/scripts"
 
-RUNTIME_NAME="${RUNTIME_NAME:-eventbuddy-phase0}"
+# `make creds` stores IAM creds in .greennode.json, but the bundled skill scripts
+# (get_token.sh) read GREENNODE_CLIENT_ID/SECRET from the environment. Bridge the two:
+# if the env vars aren't already set, load them from .greennode.json.
+if [ -z "${GREENNODE_CLIENT_ID:-}" ] || [ -z "${GREENNODE_CLIENT_SECRET:-}" ]; then
+  if [ -f .greennode.json ]; then
+    export GREENNODE_CLIENT_ID="$(jq -r '.client_id // .clientId // .iam.client_id // empty' .greennode.json)"
+    export GREENNODE_CLIENT_SECRET="$(jq -r '.client_secret // .clientSecret // .iam.client_secret // empty' .greennode.json)"
+  fi
+fi
+
+RUNTIME_NAME="${RUNTIME_NAME:-eventbuddy-phase1}"
 FLAVOR="${FLAVOR:-runtime-s2-general-2x4}"
 ENV_FILE="${ENV_FILE:-.env}"
 PLATFORM="${PLATFORM:-linux/amd64}"
@@ -147,7 +157,7 @@ done
 
 echo
 echo "────────────────────────────────────────────"
-echo " Deployment complete"
+echo " Deployment complete — EventBuddy Phase 1 (Lifecycle Core)"
 echo "   Runtime:    $RUNTIME_NAME"
 echo "   Runtime ID: $RUNTIME_ID"
 echo "   Image:      $IMAGE"
@@ -161,5 +171,7 @@ fi
 echo "   Console:    https://aiplatform.console.vngcloud.vn/agent-runtime?tab=runtime"
 echo "────────────────────────────────────────────"
 echo
-echo "Save this endpoint — it becomes the Azure Bot messaging endpoint in Phase 1."
+echo "Phase 1 serves: GET /health · POST /api/messages (Bot Framework) ·"
+echo "POST /api/webhooks/graph · POST /api/dev/handle (if DEV_ROUTES_ENABLED=true)."
+echo "Wire this endpoint into the Azure Bot messaging endpoint: ${URL%/}/api/messages"
 [ "$CODE" = "200" ] || exit 1

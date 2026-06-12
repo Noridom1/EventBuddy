@@ -29,5 +29,8 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
+    dev_routes_enabled: bool = False
+
 
 settings = Settings()
