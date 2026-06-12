@@ -93,7 +93,7 @@ def _build_runner_and_summarizer(
         return None, summarizer
 
     from eventbuddy.agent.memory import build_checkpointer, setup_checkpointer
-    from eventbuddy.agent.model import build_chat_model
+    from eventbuddy.agent.model import build_chat_model, make_token_counter
     from eventbuddy.agent.runner import build_agent_runner
     from eventbuddy.agent.tools import AgentDeps, build_tools
     from eventbuddy.agent.transcript import Transcript
@@ -112,6 +112,7 @@ def _build_runner_and_summarizer(
         model,
         tools_factory=lambda ctx: build_tools(deps, ctx),
         checkpointer=checkpointer,
+        token_counter=make_token_counter(),
         transcript=transcript,
         summarizer=summarizer,
     )
