@@ -11,5 +11,6 @@ __pycache__/
 .claude/
 Makefile
 deployment/
+!deployment/entrypoint.sh
 venv/
 __plans__/
