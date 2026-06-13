@@ -100,6 +100,16 @@ def _no_event_context(**_kw) -> str:
     return ""
 
 
+def _no_update_task(**_kw) -> str:
+    """Default `update_task_fn` — task updates not wired (no DB path)."""
+    return "Task updates aren't available right now."
+
+
+def _no_send_mail(**_kw) -> str:
+    """Default `send_mail_fn` — outbound mail not wired (no Graph/HITL path)."""
+    return "Sending mail isn't available right now."
+
+
 @dataclass
 class AgentDeps:
     """The capability callables + app-state store the tools delegate to."""
@@ -113,6 +123,10 @@ class AgentDeps:
     # Phase 1.9 — the single guarded DM→event cross-context read (`load_event_context`).
     # Defaults to a no-op so callers/tests that don't wire it (no LLM path) still build.
     event_context_fn: Callable = _no_event_context
+    # Impl 1 (action plane) — `update_task` (direct) + `send_outlook_mail` (HITL). Default to
+    # no-ops so the existing tests/no-DB path still build the tool set.
+    update_task_fn: Callable = _no_update_task
+    send_mail_fn: Callable = _no_send_mail
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise (regex fallback).
     debug: bool = False
@@ -170,8 +184,8 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         event_id = deps.session_store.get_current_event(ctx.user_id)
         if not event_id:
             return "No event is focused yet — tell me which event first."
-        deps.remind_fn(event_id=event_id, user_id=ctx.user_id, raw=note)
-        return "I prepared the reminders — pick a channel on the card above."
+        msg = deps.remind_fn(event_id=event_id, user_id=ctx.user_id, raw=note)
+        return msg or "I prepared the reminders — pick a channel on the card above."
 
     @tool
     @traced
@@ -179,6 +193,34 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """List the caller's assigned tasks in the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.user_id)
         return deps.query_tasks_fn(user_id=ctx.user_id, event_id=event_id)
+
+    @tool
+    @traced
+    def update_task(task_query: str, status: str) -> str:
+        """Update the status of a task in the currently focused event. `task_query` matches
+        the task by name; `status` is one of: todo, in_progress, done. You may update your
+        own tasks; moderators/hosts may update any. Requires a focused event."""
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.update_task_fn(
+            user_id=ctx.user_id, role=ctx.role, event_id=event_id,
+            task_query=task_query, status=status,
+        )
+
+    @tool
+    @traced
+    def send_outlook_mail(subject: str, body: str, recipients: list[str] | None = None) -> str:
+        """Draft an Outlook email to the focused event's members (or to `recipients` if given).
+        Sending is gated by a confirmation card — this only drafts it. Requires host or
+        moderator."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to send mail (needs host or moderator)."
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        return deps.send_mail_fn(
+            user_id=ctx.user_id, event_id=event_id,
+            subject=subject, body=body, recipients=recipients,
+        )
 
     @tool
     @traced
@@ -201,5 +243,6 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     return [
         create_event, set_focus_event, prepare_reminders,
-        list_my_tasks, generate_report, get_event_context,
+        list_my_tasks, update_task, send_outlook_mail,
+        generate_report, get_event_context,
     ]

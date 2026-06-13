@@ -55,7 +55,42 @@ def test_dev_handle_returns_routed_reply():
     c = _client(_orch_with_runner(_FakeRunner()))
     r = c.post("/api/dev/handle", json={"user_id": "u1", "text": "hello"})
     assert r.status_code == 200
-    assert r.json() == {"reply": "echo:hello"}
+    assert r.json() == {"reply": "echo:hello"}  # no `cards` key when none emitted
+
+
+def test_dev_handle_surfaces_emitted_cards():
+    from eventbuddy.bot.turn_artifacts import emit_card
+
+    class _CardRunner(_FakeRunner):
+        def run(self, text, ctx):
+            emit_card({"type": "AdaptiveCard", "id": "c1"})  # a HITL tool emitting mid-turn
+            return "prepared"
+
+    c = _client(_orch_with_runner(_CardRunner()))
+    body = c.post("/api/dev/handle", json={"user_id": "u1", "text": "remind"}).json()
+    assert body["reply"] == "prepared"
+    assert body["cards"][0]["id"] == "c1"
+
+
+def test_dev_confirm_invokes_confirm_handler():
+    orch = _orch_with_runner(_FakeRunner())
+
+    class _Confirm:
+        def resolve(self, **kw):
+            return f"confirmed:{kw['pending_id']}:{kw['channel']}"
+
+    orch.confirm_handler = _Confirm()
+    r = _client(orch).post(
+        "/api/dev/confirm",
+        json={"pending_id": "p1", "channel": "outlook", "user_id": "u1"},
+    )
+    assert r.json() == {"reply": "confirmed:p1:outlook"}
+
+
+def test_dev_confirm_without_handler_reports_cleanly():
+    c = _client(_orch_with_runner(_FakeRunner()))  # no confirm_handler attribute set
+    r = c.post("/api/dev/confirm", json={"pending_id": "p1"})
+    assert "not wired" in r.json()["error"]
 
 
 def test_multi_turn_keeps_same_dm_thread():

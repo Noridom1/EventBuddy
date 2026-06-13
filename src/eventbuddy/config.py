@@ -45,6 +45,10 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # HITL action plane (Impl 1). TTL (seconds) of a prepared pending action in Redis: long
+    # enough for the user to confirm the Adaptive Card, short enough to bound replay.
+    pending_action_ttl: int = 60 * 60
+
     # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
     dev_routes_enabled: bool = False
 

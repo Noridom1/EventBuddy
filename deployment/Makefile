@@ -18,6 +18,12 @@ export FLAVOR       ?= runtime-s2-general-2x4
 export ENV_FILE     ?= .env
 export PLATFORM     ?= linux/amd64
 
+# Test-data / smoke config (override inline). HOST_USER_ID must match your Emulator User ID
+# (or the dev-route user_id). URL defaults to the deployed DEFAULT endpoint when unset.
+HOST_USER_ID ?= dev-user
+SMOKE_USER   ?= dev-user
+URL          ?=
+
 SCRIPTS := $(ROOT)/.claude/skills/agentbase/scripts
 
 # `make creds` stores IAM creds in .greennode.json, but the bundled skill scripts read
@@ -30,7 +36,7 @@ export GREENNODE_CLIENT_SECRET ?= $(shell jq -r '.client_secret // .clientSecret
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test lint run creds deploy redeploy status health logs endpoint destroy
+.PHONY: help test lint run seed seed-clean smoke creds deploy redeploy status health logs endpoint destroy
 
 help: ## Show this help
 	@echo "EventBuddy targets:"
@@ -48,6 +54,19 @@ lint: ## Run ruff
 
 run: ## Run the app locally on :8080
 	cd $(ROOT) && $(VENV)/bin/uvicorn eventbuddy.main:app --host 0.0.0.0 --port 8080
+
+# ---- test data & end-to-end smoke (operate on the configured DATABASE_URL — i.e. the SAME
+#      cloud DB a deployed runtime reads, so you can seed/verify a deployed agent from here) ----
+seed: ## Seed demo event/members/tasks into the DB (override HOST_USER_ID=...)
+	cd $(ROOT) && $(PY) scripts/seed.py --host-user-id $(HOST_USER_ID)
+
+seed-clean: ## Remove the demo event (cascades members + tasks)
+	cd $(ROOT) && $(PY) scripts/seed.py --clean
+
+smoke: ## HITL end-to-end via dev routes (URL=<base> or the deployed endpoint; SMOKE_USER=...)
+	@base="$(URL)"; [ -n "$$base" ] || base="$$($(MAKE) -s endpoint)"; \
+	  case "$$base" in http*) ;; *) echo "No URL set and no deployed endpoint found"; exit 1;; esac; \
+	  bash $(ROOT)/scripts/smoke.sh "$$base" "$(SMOKE_USER)"
 
 # ---- deploy (GreenNode AgentBase) ----
 creds: ## Store GreenNode IAM client_id + secret (interactive, secret hidden)

@@ -8,9 +8,11 @@ from eventbuddy.common.logging import get_logger
 log = get_logger("agent.orchestrator")
 
 
-def _default_role(*, user_id: str, scope: str, channel_id: str | None) -> str:
+def _default_role(*, user_id: str, scope: str, channel_id: str | None,
+                  event_id: str | None = None) -> str:
     """Server-resolved caller role. In a 1-1 DM the user acts as the event leader (host);
-    in a channel, default to member. Wiring may inject a membership-backed resolver."""
+    in a channel, default to member. Wiring may inject a membership-backed resolver that
+    overrides this with the caller's real `EventMember.role` when an event is focused."""
     return "host" if scope == "personal" else "member"
 
 
@@ -41,12 +43,15 @@ class Orchestrator:
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
                    sent_at: datetime | None) -> RequestContext:
+        event_id = self.session.get_current_event(user_id)
         return RequestContext(
             user_id=user_id,
             channel_id=channel_id,
             scope=scope,
-            role=self._role_resolver(user_id=user_id, scope=scope, channel_id=channel_id),
-            current_event_id=self.session.get_current_event(user_id),
+            role=self._role_resolver(
+                user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
+            ),
+            current_event_id=event_id,
             sent_at=sent_at,
         )
 
@@ -87,8 +92,8 @@ class Orchestrator:
 
         if c.intent == Intent.REMIND:
             event_id = self.session.get_current_event(user_id)
-            self.remind(event_id=event_id, user_id=user_id, raw=c.slots.get("raw", ""))
-            return "I prepared the reminders — pick a channel on the card above."
+            msg = self.remind(event_id=event_id, user_id=user_id, raw=c.slots.get("raw", ""))
+            return msg or "I prepared the reminders — pick a channel on the card above."
 
         if c.intent == Intent.QUERY_TASKS:
             event_id = self.session.get_current_event(user_id)
