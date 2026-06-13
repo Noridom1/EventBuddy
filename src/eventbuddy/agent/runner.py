@@ -8,15 +8,42 @@ on user/assistant boundaries so no tool-call/result pair is ever orphaned."""
 import traceback
 from collections.abc import Callable
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, trim_messages
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    trim_messages,
+)
 from langgraph.prebuilt import ToolNode, create_react_agent
 
 from eventbuddy.agent.context import RequestContext
 from eventbuddy.agent.prompts import system_prompt
 from eventbuddy.agent.tools import ToolCallRecord, begin_trace, end_trace
+from eventbuddy.agent.transcript import sent_at_prefix
+from eventbuddy.common.logging import get_logger
+
+log = get_logger("agent.runner")
 
 MAX_TOKENS = 4096
 RECURSION_LIMIT = 8
+
+
+def _stamp(m: BaseMessage) -> BaseMessage:
+    """Prefix a rehydrated turn with its send-time (Phase 1.9) so the model can reason about
+    recency. Only applied where history is *injected* (the cold-start seed / event snapshot);
+    live-window turns read as "~now" and are covered by the system prompt's current time."""
+    prefix = sent_at_prefix(m)
+    if not prefix:
+        return m
+    content = f"{prefix}{m.content}"
+    if isinstance(m, HumanMessage):
+        if m.name:
+            return HumanMessage(content=content, name=m.name)
+        return HumanMessage(content=content)
+    if isinstance(m, AIMessage):
+        return AIMessage(content=content)
+    return m
 
 
 def _format_params(params: dict) -> str:
@@ -113,8 +140,24 @@ class AgentRunner:
             if summary:
                 seed.append(SystemMessage(content=f"Summary of earlier conversation: {summary}"))
         if self._transcript is not None:
-            seed.extend(self._transcript.rehydrate(ctx.thread_id))
+            seed.extend(_stamp(m) for m in self._transcript.rehydrate(ctx.thread_id))
         return seed
+
+    def _record_turn(self, ctx: RequestContext, text: str, reply: str) -> None:
+        """Persist this turn to the durable transcript (L2) — best-effort: a DB hiccup must
+        never break the reply. The seed/window stays the source of truth in memory; this is
+        the write path that was previously missing (so L2/L3 were empty in production)."""
+        if self._transcript is None or not reply.strip():
+            return
+        try:
+            self._transcript.record_turn(
+                ctx.thread_id,
+                human=ctx.tag(text),
+                assistant_text=reply,
+                event_id=ctx.current_event_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"transcript flush failed ({type(e).__name__}: {e}); reply unaffected")
 
     def _window_empty(self, config: dict) -> bool:
         try:
@@ -155,6 +198,7 @@ class AgentRunner:
             result = agent.invoke({"messages": messages}, config=config)
             final = result["messages"][-1]
             reply = final.content if isinstance(final, AIMessage) else str(final.content)
+            self._record_turn(ctx, text, reply)  # durable L2 write (best-effort)
             if self._debug and trace.records:
                 reply = f"{reply}\n\n{_format_footer(trace.records)}"
             return reply

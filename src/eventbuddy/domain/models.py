@@ -122,7 +122,11 @@ class ConversationMessage(Base):
     role: Mapped[str] = mapped_column(String(20))  # "user" | "assistant"
     speaker_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content: Mapped[str] = mapped_column(Text)
+    # Write/ordering field — synthetic per-flush time (strictly increasing within a flush).
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Real send-time (Phase 1.9): from `activity.timestamp` for user turns, generation-time
+    # for assistant turns. Distinct from `created_at` (which is flush-ordering, not send-time).
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SessionSummary(Base):

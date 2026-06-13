@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -120,3 +122,68 @@ def test_trimmer_keeps_last_turn_when_over_budget():
     hook = make_trimmer(_word_counter, max_tokens=5)
     trimmed = hook({"messages": history})["llm_input_messages"]
     assert len(trimmed) == 1
+
+
+# --- Phase 1.9: durable flush + timestamp rendering -----------------------------------
+
+class _RecordingTranscript:
+    """Captures record_turn calls; rehydrate returns a preset tail (cold-start seed)."""
+
+    def __init__(self, *, tail=None, raise_on_record=False):
+        self.calls = []
+        self._tail = tail or []
+        self._raise = raise_on_record
+
+    def record_turn(self, thread_id, *, human, assistant_text, event_id=None):
+        if self._raise:
+            raise RuntimeError("db down")
+        self.calls.append(
+            {"thread_id": thread_id, "human": human, "reply": assistant_text, "event_id": event_id}
+        )
+
+    def rehydrate(self, thread_id, budget=4096):
+        return list(self._tail)
+
+
+def _runner_with(transcript, model):
+    deps = _deps({})
+    return build_agent_runner(
+        model,
+        tools_factory=lambda ctx: build_tools(deps, ctx),
+        checkpointer=InMemorySaver(),
+        token_counter=_word_counter,
+        transcript=transcript,
+    )
+
+
+def test_flush_window_called_after_turn():
+    tr = _RecordingTranscript()
+    runner = _runner_with(tr, ScriptedChatModel(responses=[AIMessage(content="hello there")]))
+    reply = runner.run("hi", RequestContext(user_id="u1", current_event_id="ev-3"))
+    assert reply == "hello there"
+    assert len(tr.calls) == 1
+    call = tr.calls[0]
+    assert call["thread_id"] == "dm:u1"
+    assert call["human"].content == "hi"
+    assert call["reply"] == "hello there"
+    assert call["event_id"] == "ev-3"
+
+
+def test_flush_best_effort():
+    tr = _RecordingTranscript(raise_on_record=True)
+    runner = _runner_with(tr, ScriptedChatModel(responses=[AIMessage(content="still works")]))
+    # a transcript flush blowing up must never break the reply
+    assert runner.run("hi", RequestContext(user_id="u1")) == "still works"
+
+
+def test_seed_tail_is_timestamped_but_live_turn_is_not():
+    sent = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
+    tail = [HumanMessage(content="earlier question",
+                         additional_kwargs={"sent_at": sent.isoformat()})]
+    tr = _RecordingTranscript(tail=tail)
+    runner = _runner_with(tr, ScriptedChatModel(responses=[AIMessage(content="ok")]))
+    ctx = RequestContext(user_id="u1", sent_at=sent)
+    seeded = runner._seed_messages(ctx)
+    assert seeded[0].content.startswith("[2026-06-11 14:30 UTC] ")
+    # the live turn the runner appends is NOT stamped (system-prompt "now" covers it)
+    assert ctx.tag("a new question").content == "a new question"

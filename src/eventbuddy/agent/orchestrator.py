@@ -1,4 +1,5 @@
 import traceback
+from datetime import datetime
 
 from eventbuddy.agent.context import RequestContext
 from eventbuddy.agent.intents import Intent, classify
@@ -38,20 +39,24 @@ class Orchestrator:
         # decided at wiring time and is unaffected by this flag.
         self._regex_fallback_on_error = regex_fallback_on_error
 
-    def _build_ctx(self, user_id: str, channel_id: str | None, scope: str) -> RequestContext:
+    def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
+                   sent_at: datetime | None) -> RequestContext:
         return RequestContext(
             user_id=user_id,
             channel_id=channel_id,
             scope=scope,
             role=self._role_resolver(user_id=user_id, scope=scope, channel_id=channel_id),
             current_event_id=self.session.get_current_event(user_id),
+            sent_at=sent_at,
         )
 
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
-               scope: str = "personal") -> str:
+               scope: str = "personal", sent_at: datetime | None = None) -> str:
+        # `sent_at` (Phase 1.9) is additive + keyword-defaulted so existing callers that
+        # don't pass the ingress timestamp keep working (the stable-signature rule).
         if self.agent_mode == "llm" and self.runner is not None:
             try:
-                ctx = self._build_ctx(user_id, channel_id, scope)
+                ctx = self._build_ctx(user_id, channel_id, scope, sent_at)
                 return self.runner.run(text, ctx)
             except Exception as e:  # noqa: BLE001
                 if not self._regex_fallback_on_error:
