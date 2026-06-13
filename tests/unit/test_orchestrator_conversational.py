@@ -63,6 +63,24 @@ def test_dm_scope_threads_by_user():
     assert ctx.thread_id == "dm:u1"
 
 
+def test_sent_at_threads_into_ctx():
+    from datetime import UTC, datetime
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(**_deps(), runner=runner)
+    ts = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
+    orch.handle(user_id="u1", channel_id=None, text="hi", sent_at=ts)
+    _, ctx = runner.seen[0]
+    assert ctx.sent_at == ts
+
+
+def test_sent_at_defaults_when_absent():
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(**_deps(), runner=runner)
+    orch.handle(user_id="u1", channel_id=None, text="hi")  # no sent_at — back-compat
+    _, ctx = runner.seen[0]
+    assert ctx.sent_at is None
+
+
 def test_falls_back_to_regex_when_runner_raises():
     calls = {}
 

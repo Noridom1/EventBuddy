@@ -95,6 +95,11 @@ def _make_traced(debug: bool) -> Callable:
     return _traced
 
 
+def _no_event_context(**_kw) -> str:
+    """Default `event_context_fn` — cross-context read disabled (no LLM path wired)."""
+    return ""
+
+
 @dataclass
 class AgentDeps:
     """The capability callables + app-state store the tools delegate to."""
@@ -105,6 +110,9 @@ class AgentDeps:
     remind_fn: Callable
     report_fn: Callable
     query_tasks_fn: Callable
+    # Phase 1.9 — the single guarded DM→event cross-context read (`load_event_context`).
+    # Defaults to a no-op so callers/tests that don't wire it (no LLM path) still build.
+    event_context_fn: Callable = _no_event_context
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise (regex fallback).
     debug: bool = False
@@ -142,7 +150,15 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         if not event_id:
             return f"I couldn't find an event matching '{event_query}'."
         deps.session_store.set_current_event(ctx.user_id, event_id)
-        return f"Focused on '{event_query}'."
+        msg = f"Focused on '{event_query}'."
+        # Option B (Phase 1.9): ground the DM assistant in the event's shared conversation
+        # the moment the user focuses — deterministic, no reliance on model judgment. Only
+        # in a DM; in a channel the event memory already *is* the live window.
+        if ctx.scope == "personal":
+            snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)
+            if snapshot:
+                msg = f"{msg}\n\n{snapshot}"
+        return msg
 
     @tool
     @traced
@@ -171,4 +187,19 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         event_id = deps.session_store.get_current_event(ctx.user_id)
         return deps.report_fn(event_id=event_id)
 
-    return [create_event, set_focus_event, prepare_reminders, list_my_tasks, generate_report]
+    @tool
+    @traced
+    def get_event_context() -> str:
+        """Fetch the latest shared discussion, decisions, and open questions from the
+        currently focused event. Use when you need up-to-date context about the event the
+        user is working on."""
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event to focus on first."
+        snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)
+        return snapshot or "I don't have any shared discussion recorded for this event yet."
+
+    return [
+        create_event, set_focus_event, prepare_reminders,
+        list_my_tasks, generate_report, get_event_context,
+    ]

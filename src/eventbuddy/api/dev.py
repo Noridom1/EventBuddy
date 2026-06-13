@@ -6,6 +6,7 @@ in production: it has no Bot Framework JWT auth.
 The route is **DM-scoped**: it keys conversation memory on `dm:{user_id}`, so repeated
 POSTs with the same `user_id` continue one multi-turn conversation. Pass `reset: true` to
 start a fresh thread."""
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -40,7 +41,8 @@ async def dev_handle(
         if body.reset:
             orch.reset_dm(body.user_id)
         reply = orch.handle(
-            user_id=body.user_id, channel_id=None, text=body.text, scope="personal"
+            user_id=body.user_id, channel_id=None, text=body.text, scope="personal",
+            sent_at=datetime.now(UTC),  # dev turns are stamped "now" so L2 carries a send-time
         )
         return {"reply": reply}
     except Exception as e:

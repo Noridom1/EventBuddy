@@ -87,8 +87,74 @@ def test_list_my_tasks_passes_focused_event():
     assert tools["list_my_tasks"].invoke({}) == "u1:ev-3"
 
 
-@pytest.mark.parametrize("name", ["list_my_tasks", "generate_report"])
+@pytest.mark.parametrize("name", ["list_my_tasks", "generate_report", "get_event_context"])
 def test_readonly_tools_take_no_model_args(name):
     deps, _ = _deps()
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert tools[name].args == {}
+
+
+# --- Phase 1.9: cross-context memory (DM ← event) -------------------------------------
+
+def _ctx_fn(snapshot="Context from event 'X': earlier discussion"):
+    calls = []
+
+    def fn(*, user_id, event_id):
+        calls.append({"user_id": user_id, "event_id": event_id})
+        return snapshot
+
+    fn.calls = calls
+    return fn
+
+
+def test_focus_injects_event_context_in_dm():
+    fn = _ctx_fn("Context from event 'Launch': we agreed on Friday.")
+    deps, _ = _deps(event_context_fn=fn)
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="host")))
+    out = tools["set_focus_event"].invoke({"event_query": "Launch"})
+    assert "Focused on 'Launch'." in out
+    assert "we agreed on Friday." in out
+    assert fn.calls == [{"user_id": "u1", "event_id": "ev-7"}]  # server-resolved id, no model arg
+
+
+def test_non_member_gets_no_event_context_but_focus_succeeds():
+    fn = _ctx_fn("")  # helper returns empty for a non-member
+    deps, _ = _deps(event_context_fn=fn)
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="host")))
+    out = tools["set_focus_event"].invoke({"event_query": "Launch"})
+    assert out == "Focused on 'Launch'."
+    assert deps.session_store.get_current_event("u1") == "ev-7"  # focus still set
+
+
+def test_channel_scope_skips_injection():
+    fn = _ctx_fn()
+    deps, _ = _deps(event_context_fn=fn)
+    ctx = RequestContext(user_id="u1", channel_id="ch1", scope="channel", role="member")
+    tools = _by_name(build_tools(deps, ctx))
+    out = tools["set_focus_event"].invoke({"event_query": "Launch"})
+    assert out == "Focused on 'Launch'."
+    assert fn.calls == []  # no cross-context fetch in a channel — the event IS the live window
+
+
+def test_event_context_tools_never_take_event_arg():
+    deps, _ = _deps(event_context_fn=_ctx_fn())
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="host")))
+    assert set(tools["set_focus_event"].args) == {"event_query"}  # a name fragment, not an id
+    assert tools["get_event_context"].args == {}  # reads the server-resolved focused event
+
+
+def test_get_event_context_reads_current_event():
+    fn = _ctx_fn("Context from event 'X': latest.")
+    deps, _ = _deps(event_context_fn=fn)
+    deps.session_store.set_current_event("u1", "ev-9")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["get_event_context"].invoke({})
+    assert "latest." in out
+    assert fn.calls == [{"user_id": "u1", "event_id": "ev-9"}]
+
+
+def test_get_event_context_friendly_when_no_focus():
+    deps, _ = _deps(event_context_fn=_ctx_fn())
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["get_event_context"].invoke({})
+    assert "focus" in out.lower()

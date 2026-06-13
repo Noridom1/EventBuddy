@@ -102,3 +102,51 @@ def test_rehydrate_tags_speaker_for_user_turns(session_factory):
     out = t.rehydrate("event:ch1")
     assert isinstance(out[0], HumanMessage) and out[0].name == "Alice"
     assert isinstance(out[1], AIMessage)
+
+
+# --- Phase 1.9: send-time (sent_at) ---------------------------------------------------
+
+def test_record_turn_persists_human_send_time(session_factory):
+    t = Transcript(session_factory=session_factory)
+    sent = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
+    human = HumanMessage(content="when's the deadline?",
+                         additional_kwargs={"sent_at": sent.isoformat()})
+    assert t.record_turn("dm:u1", human=human, assistant_text="Soon.") == 2
+    with session_factory() as s:
+        rows = s.query(ConversationMessage).order_by(ConversationMessage.created_at).all()
+    assert [r.role for r in rows] == ["user", "assistant"]
+    # sqlite returns tz-naive; compare the instant (real send-time, not flush-time)
+    assert rows[0].sent_at.replace(tzinfo=UTC) == sent
+    # content stays pure — no rendered timestamp leaks in (keeps L3 time-agnostic)
+    assert rows[0].content == "when's the deadline?"
+
+
+def test_record_turn_defaults_send_time_when_absent(session_factory):
+    t = Transcript(session_factory=session_factory)
+    t.record_turn("dm:u1", human=HumanMessage(content="hi"), assistant_text="hello")
+    with session_factory() as s:
+        rows = s.query(ConversationMessage).order_by(ConversationMessage.created_at).all()
+    assert all(r.sent_at is not None for r in rows)  # falls back to generation time
+
+
+def test_rehydrate_carries_sent_at(session_factory):
+    t = Transcript(session_factory=session_factory)
+    sent = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
+    t.record_turn("dm:u1",
+                  human=HumanMessage(content="q", additional_kwargs={"sent_at": sent.isoformat()}),
+                  assistant_text="a")
+    out = t.rehydrate("dm:u1")
+    # round-trips the instant; sqlite drops tz, so compare ignoring tzinfo
+    carried = datetime.fromisoformat(out[0].additional_kwargs["sent_at"])
+    assert carried.replace(tzinfo=UTC) == sent
+
+
+def test_flush_window_persists_human_send_time(session_factory):
+    t = Transcript(session_factory=session_factory)
+    sent = datetime(2026, 6, 10, 9, 0, tzinfo=UTC)
+    msgs = [HumanMessage(content="hi", additional_kwargs={"sent_at": sent.isoformat()}),
+            AIMessage("hello")]
+    t.flush_window("dm:u1", msgs)
+    with session_factory() as s:
+        rows = s.query(ConversationMessage).order_by(ConversationMessage.created_at).all()
+    assert rows[0].sent_at.replace(tzinfo=UTC) == sent
