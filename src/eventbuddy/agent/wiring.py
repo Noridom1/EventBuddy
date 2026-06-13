@@ -1,12 +1,61 @@
 from langchain_core.messages import HumanMessage
 
-from eventbuddy.agent.orchestrator import Orchestrator
+from eventbuddy.agent.orchestrator import Orchestrator, _default_role
+from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.session import SessionStore
+from eventbuddy.bot.auth import ROLE_RANK
+from eventbuddy.bot.cards.builders import confirm_card, reminder_channel_card
+from eventbuddy.bot.confirm import ConfirmHandler
+from eventbuddy.bot.turn_artifacts import emit_card
 from eventbuddy.common.logging import get_logger
 from eventbuddy.config import settings
 from eventbuddy.data.redis import get_redis
 
 log = get_logger("agent.wiring")
+
+
+def _graph_creds() -> bool:
+    """True when client-credentials Graph auth is configured (so outbound sends can run).
+    Without it, prepare still works and cards still render — only the *send* degrades."""
+    return bool(
+        settings.graph_tenant_id and settings.graph_client_id and settings.graph_client_secret
+    )
+
+
+def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, str]:
+    """Pure dispatch for a confirmed HITL action: perform the Microsoft Graph send and return
+    `(ok, summary)`. Module-level (not a closure) so it's unit-testable with a fake Graph.
+    All mail/reminders send **individually** — never a shared To/CC (PII rule §11). Raises
+    only on an actual Graph error; a known precondition miss returns `(False, message)`."""
+    from eventbuddy.capabilities.reminders import ReminderService
+    action = payload.get("type")
+    recipients = payload.get("recipient_emails", [])
+    event_name = payload.get("event_name") or "the event"
+    if action == "remind" and channel == "teams":
+        channel_id = payload.get("channel_id")
+        if not channel_id:
+            return False, "This event has no Teams channel to post to."
+        graph.send_channel_message(
+            settings.microsoft_app_tenant_id, channel_id,
+            f"⏰ Reminder: '{payload.get('task_name')}' for {event_name} is due soon.",
+        )
+        return True, "✅ Posted the reminder to the event channel."
+    if action == "remind":  # outlook (default)
+        svc = ReminderService(graph)
+        for email in recipients:
+            svc.remind_outlook(
+                email=email, task_name=payload.get("task_name", "your task"),
+                event_name=event_name,
+            )
+        return True, f"✅ Sent {len(recipients)} Outlook reminder(s)."
+    if action == "mail":
+        for email in recipients:
+            graph.send_mail(
+                subject=payload.get("subject", ""),
+                body_html=payload.get("body_html", ""), to=[email],
+            )
+        return True, f"✅ Sent the email to {len(recipients)} recipient(s)."
+    return False, "I don't know how to perform that action."
 
 # A DM-injected event snapshot competes with the user's own turns for the 4096-token DM
 # window, so keep the cross-context read compact (Phase 1.9, Part B).
@@ -78,6 +127,7 @@ def build_orchestrator() -> Orchestrator:
     it degrades to the Phase 1 regex router. Live Microsoft actions still require Graph
     credentials; until then create-event persists locally."""
     session_store = SessionStore(get_redis())
+    pending_store = PendingActionStore(get_redis(), ttl=settings.pending_action_ttl)
 
     def provision_fn(**kw):
         from eventbuddy.capabilities.provisioning import ProvisioningService
@@ -104,8 +154,43 @@ def build_orchestrator() -> Orchestrator:
             ev = s.scalar(select(Event).where(Event.event_name.ilike(f"%{query}%")))
             return ev.event_id if ev else None
 
-    def remind_fn(**kw):
-        return None  # HITL card flow handled by activity_router; placeholder service hook
+    def remind_fn(*, event_id, user_id, raw=""):
+        """Impl 1: *prepare* (don't send) — resolve recipients, stash a one-shot pending
+        action, emit the channel-choice card. The real send happens only on confirm. Returns
+        None on success (the tool/regex caller uses its default 'pick a channel' message), or
+        a friendly string on a degraded path."""
+        if not event_id:
+            return None
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.data.repositories.members import MemberRepository
+        try:
+            with session_scope() as s:
+                ev = EventRepository(s).get(event_id)
+                if ev is None:
+                    return "I couldn't find that event anymore."
+                recipients = [m.email for m in MemberRepository(s).list(event_id) if m.email]
+                event_name, channel_id = ev.event_name, ev.teams_channel_id
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"reminder prep failed ({type(e).__name__}: {e})")
+            return "Reminders are temporarily unavailable — please try again."
+        if not recipients:
+            return "There's no one to remind for this event yet."
+        task_name = (raw or "").strip() or "your tasks"
+        payload = {
+            "type": "remind", "event_id": event_id, "event_name": event_name,
+            "channel_id": channel_id, "requested_by": user_id,
+            "task_name": task_name, "recipient_emails": recipients, "note": raw,
+        }
+        try:
+            pending_id = pending_store.put(payload)
+        except Exception as e:  # noqa: BLE001 — Redis down: emit nothing rather than a dead card
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            return "Reminders are temporarily unavailable — please try again."
+        emit_card(reminder_channel_card(
+            task_name=task_name, recipients=recipients, pending_id=pending_id
+        ))
+        return None
 
     def report_fn(*, event_id):
         return "Report generation is available in Phase 1.5."
@@ -119,8 +204,132 @@ def build_orchestrator() -> Orchestrator:
                 return "You have no assigned tasks."
             return "Your tasks:\n" + "\n".join(f"- {t.task_name} ({t.status})" for t in tasks)
 
+    def update_task_fn(*, user_id, role, event_id, task_query, status):
+        """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
+        any. Resolves the task by name within the focused event."""
+        valid = {"todo", "in_progress", "done"}
+        if status not in valid:
+            return f"Status must be one of: {', '.join(sorted(valid))}."
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.tasks import TaskRepository
+        try:
+            with session_scope() as s:
+                repo = TaskRepository(s)
+                matches = [
+                    t for t in repo.list(event_id) if task_query.lower() in t.task_name.lower()
+                ]
+                if not matches:
+                    return f"I couldn't find a task matching '{task_query}'."
+                if len(matches) > 1:
+                    return f"'{task_query}' matches multiple tasks — please be more specific."
+                t = matches[0]
+                is_mod = ROLE_RANK.get(role, 0) >= ROLE_RANK["moderator"]
+                if not is_mod and t.assignee_id != user_id:
+                    return "You can only update your own tasks (moderators can update any)."
+                name = t.task_name
+                repo.set_status(t.task_id, status)
+                return f"Updated '{name}' → {status}."
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"update_task failed ({type(e).__name__}: {e})")
+            return "Couldn't update the task right now."
+
+    def send_mail_fn(*, user_id, event_id, subject, body, recipients=None):
+        """Impl 1: draft an Outlook mail behind a HITL confirm card (bulk/outward → §9/§11).
+        Stashes a pending action + emits a confirm card; never sends here."""
+        emails = list(recipients) if recipients else []
+        event_name = None
+        if not emails:
+            if not event_id:
+                return "I don't have any recipients — focus an event or give me addresses."
+            from eventbuddy.data.db import session_scope
+            from eventbuddy.data.repositories.events import EventRepository
+            from eventbuddy.data.repositories.members import MemberRepository
+            try:
+                with session_scope() as s:
+                    ev = EventRepository(s).get(event_id)
+                    event_name = ev.event_name if ev else None
+                    emails = [m.email for m in MemberRepository(s).list(event_id) if m.email]
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"mail recipient load failed ({type(e).__name__}: {e})")
+                return "Couldn't load the recipient list right now."
+        if not emails:
+            return "There are no members to email for this event yet."
+        payload = {
+            "type": "mail", "event_id": event_id, "event_name": event_name,
+            "requested_by": user_id, "subject": subject,
+            "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+        }
+        try:
+            pending_id = pending_store.put(payload)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            return "Mail confirmation is temporarily unavailable — please try again."
+        emit_card(confirm_card(
+            title=f"Send email: {subject}", summary=f"To {len(emails)} recipient(s).",
+            pending_id=pending_id, action="mail",
+        ))
+        return "Drafted the email — confirm on the card to send."
+
+    def role_resolver(*, user_id, scope, channel_id, event_id=None):
+        """Membership-backed role (defense in depth). When an event is focused, the caller's
+        real `EventMember.role` overrides the DM-host default — so the in-tool moderator gate
+        and the confirm re-auth reflect actual membership. Falls back to `_default_role`
+        (host-in-DM) when there's no focused event yet (e.g. event creation)."""
+        if event_id:
+            from eventbuddy.data.db import session_scope
+            from eventbuddy.data.repositories.members import MemberRepository
+            try:
+                with session_scope() as s:
+                    m = MemberRepository(s).get_by_user(event_id, user_id)
+                    if m is not None:
+                        return m.role
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"role lookup failed ({type(e).__name__}: {e})")
+        return _default_role(
+            user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
+        )
+
+    def execute_confirmed_action(*, payload, channel, actor, authorized):
+        """Side-effecting half of the HITL confirm loop: the real Graph send + every
+        `audit_log` write (including denials/failures). Returns `(ok, reply_text)`. All
+        outward mail/reminders send **individually** (PII rule §11), never a shared To/CC."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.audit import AuditRepository
+        action = payload.get("type", "unknown")
+        event_id = payload.get("event_id")
+
+        def _audit(result):
+            try:
+                with session_scope() as s:
+                    AuditRepository(s).record(
+                        event_id=event_id, actor_user_id=actor, action=action,
+                        tool_name=action, payload=payload, result=result,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"audit write failed ({type(e).__name__}: {e})")
+
+        if not authorized:
+            _audit("denied")
+            return False, "You're not allowed to confirm this action."
+        if not _graph_creds():
+            _audit("failed")
+            return False, "Couldn't send — Microsoft Graph isn't configured."
+
+        from eventbuddy.integrations.graph.client import GraphClient
+        from eventbuddy.integrations.graph.token import MsalTokenProvider
+        try:
+            graph = GraphClient(MsalTokenProvider())
+            ok, summary = _perform_send(graph=graph, payload=payload, channel=channel)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"confirmed {action} send failed ({type(e).__name__}: {e})")
+            _audit("failed")
+            return False, "Couldn't send — the Microsoft Graph call failed."
+        _audit("sent" if ok else "failed")
+        return ok, summary
+
     runner, summarizer = _build_runner_and_summarizer(
-        session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn
+        session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
+        update_task_fn, send_mail_fn,
     )
 
     orch = Orchestrator(
@@ -128,9 +337,15 @@ def build_orchestrator() -> Orchestrator:
         resolve_event_fn=resolve_event_fn, remind_fn=remind_fn,
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         runner=runner, agent_mode=settings.agent_mode if runner else "regex",
+        role_resolver=role_resolver,
         regex_fallback_on_error=not settings.agent_debug,
     )
     orch.summarizer = summarizer  # exposed so main.py can schedule the consolidation job
+    # The activity router pulls this off the orchestrator to handle Adaptive Card clicks.
+    orch.confirm_handler = ConfirmHandler(
+        pending_store=pending_store, role_resolver=role_resolver,
+        execute_fn=execute_confirmed_action,
+    )
     return orch
 
 
@@ -144,7 +359,8 @@ def build_summarizer():
 
 
 def _build_runner_and_summarizer(
-    session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn
+    session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
+    update_task_fn=None, send_mail_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -172,11 +388,15 @@ def _build_runner_and_summarizer(
     # close over them — same DRY composition-root pattern as the other capability closures.
     event_context_fn = _build_event_context_fn(transcript, summarizer)
 
+    from eventbuddy.agent.tools import _no_send_mail, _no_update_task
+
     deps = AgentDeps(
         session_store=session_store, provision_fn=provision_fn,
         resolve_event_fn=resolve_event_fn, remind_fn=remind_fn,
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         event_context_fn=event_context_fn,
+        update_task_fn=update_task_fn or _no_update_task,
+        send_mail_fn=send_mail_fn or _no_send_mail,
         debug=settings.agent_debug,
     )
     runner = build_agent_runner(

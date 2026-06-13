@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from eventbuddy.agent.wiring import build_orchestrator
+from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
 
 router = APIRouter()
 
@@ -33,6 +34,18 @@ class HandleRequest(BaseModel):
     reset: bool = False
 
 
+class ConfirmRequest(BaseModel):
+    """Simulates an Adaptive Card `Action.Submit` click without the Emulator (which, against
+    a remote/deployed bot, would need ngrok for the async reply). `pending_id` comes from the
+    card emitted by a prior `/api/dev/handle` turn; `user_id` must match that turn's user
+    (the confirm re-auth requires clicker == preparer)."""
+
+    pending_id: str
+    action: str = "remind"
+    channel: str | None = "outlook"
+    user_id: str = "dev-user"
+
+
 @router.post("/api/dev/handle")
 async def dev_handle(
     body: HandleRequest, orch: Annotated[object, Depends(get_orchestrator)]
@@ -40,12 +53,37 @@ async def dev_handle(
     try:
         if body.reset:
             orch.reset_dm(body.user_id)
-        reply = orch.handle(
-            user_id=body.user_id, channel_id=None, text=body.text, scope="personal",
-            sent_at=datetime.now(UTC),  # dev turns are stamped "now" so L2 carries a send-time
-        )
-        return {"reply": reply}
+        # Collect any Adaptive Cards the turn emits (HITL flows) so they're testable over HTTP.
+        artifacts, token = begin_artifacts()
+        try:
+            reply = orch.handle(
+                user_id=body.user_id, channel_id=None, text=body.text, scope="personal",
+                sent_at=datetime.now(UTC),  # dev turns stamped "now" so L2 carries a send-time
+            )
+        finally:
+            end_artifacts(token)
+        result = {"reply": reply}
+        if artifacts.cards:  # only when a HITL flow emitted one — keeps the plain shape stable
+            result["cards"] = artifacts.cards
+        return result
     except Exception as e:
         # Data-backed intents need Postgres/Redis/Graph creds; surface the cause plainly
         # instead of a 500 so the route stays useful for probing what's wired up.
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@router.post("/api/dev/confirm")
+async def dev_confirm(
+    body: ConfirmRequest, orch: Annotated[object, Depends(get_orchestrator)]
+) -> dict:
+    confirm = getattr(orch, "confirm_handler", None)
+    if confirm is None:
+        return {"error": "confirm handler not wired (LLM/Graph path unavailable)"}
+    try:
+        reply = confirm.resolve(
+            action=body.action, pending_id=body.pending_id,
+            channel=body.channel, clicker=body.user_id,
+        )
+        return {"reply": reply}
+    except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}

@@ -11,7 +11,9 @@ def event_overview_card(*, name: str, objective: str, members: list[str], status
     }
 
 
-def reminder_channel_card(*, task_name: str, recipients: list[str]) -> dict:
+def reminder_channel_card(*, task_name: str, recipients: list[str], pending_id: str = "") -> dict:
+    # `pending_id` is the opaque token the confirm handler resolves server-side; the card
+    # carries it (+ the channel) but NEVER recipients/identity (cross-cutting rule 2).
     return {
         "type": "AdaptiveCard",
         "version": "1.4",
@@ -22,8 +24,28 @@ def reminder_channel_card(*, task_name: str, recipients: list[str]) -> dict:
         ],
         "actions": [
             {"type": "Action.Submit", "title": "💬 Send via Teams",
-             "data": {"action": "remind", "channel": "teams", "task": task_name}},
+             "data": {"action": "remind", "channel": "teams", "pending_id": pending_id}},
             {"type": "Action.Submit", "title": "📧 Send via Outlook",
-             "data": {"action": "remind", "channel": "outlook", "task": task_name}},
+             "data": {"action": "remind", "channel": "outlook", "pending_id": pending_id}},
+        ],
+    }
+
+
+def confirm_card(*, title: str, summary: str, pending_id: str, action: str,
+                 channel: str | None = None) -> dict:
+    """A generic single-button HITL confirmation card (e.g. for `send_outlook_mail`). The
+    button data carries only the action type + opaque `pending_id` (+ optional channel)."""
+    data = {"action": action, "pending_id": pending_id}
+    if channel:
+        data["channel"] = channel
+    return {
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {"type": "TextBlock", "weight": "Bolder", "text": title, "wrap": True},
+            {"type": "TextBlock", "text": summary, "wrap": True},
+        ],
+        "actions": [
+            {"type": "Action.Submit", "title": "✅ Confirm & send", "data": data},
         ],
     }
