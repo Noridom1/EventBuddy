@@ -2,6 +2,7 @@ from langchain_core.messages import HumanMessage
 
 from eventbuddy.agent.orchestrator import Orchestrator, _default_role
 from eventbuddy.agent.pending import PendingActionStore
+from eventbuddy.agent.roster_store import RosterStore
 from eventbuddy.agent.session import SessionStore
 from eventbuddy.bot.auth import ROLE_RANK
 from eventbuddy.bot.cards.builders import confirm_card, reminder_channel_card
@@ -65,6 +66,19 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
             )
         return True, f"✅ Sent {len(recipients)} Outlook reminder(s)."
     if action == "mail":
+        # Impl 4 — a participant-reminder mail can also be broadcast to the event channel
+        # (the Teams choice on the channel-choice card). Note: that reaches *channel members*,
+        # not the file's standalone addresses, so it's a "also nudge the channel" path.
+        if channel == "teams":
+            channel_id = payload.get("channel_id")
+            if not channel_id:
+                return False, "This event has no Teams channel to post to."
+            team_id = payload.get("team_id") or _team_id_for(None)
+            notice = payload.get("notice_text") or payload.get("subject", "")
+            graph.send_channel_message(
+                team_id, channel_id, f"📢 {payload.get('subject', 'Reminder')}\n\n{notice}",
+            )
+            return True, "✅ Posted the reminder to the event channel."
         for email in recipients:
             graph.send_mail(
                 subject=payload.get("subject", ""),
@@ -72,6 +86,72 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
             )
         return True, f"✅ Sent the email to {len(recipients)} recipient(s)."
     return False, "I don't know how to perform that action."
+
+
+# --- Impl 4: participant-roster helpers (module-level → unit-testable) ----------------------
+
+def _filter_emails_by_status(rows: list[dict], only_status: str) -> list[str]:
+    """Select participant emails from the roster rows by the file's own status value. With no
+    `only_status`, return every row's email. Otherwise keep rows whose status matches (case-
+    insensitive substring either way) — the model passes a value it saw in the file breakdown
+    (e.g. 'pending', 'no') to chase those who haven't registered."""
+    want = (only_status or "").strip().lower()
+    if not want:
+        return [r["email"] for r in rows if r.get("email")]
+    out = []
+    for r in rows:
+        if not r.get("email"):
+            continue
+        st = str(r.get("status", "")).strip().lower()
+        if st and (st == want or want in st or st in want):
+            out.append(r["email"])
+    return out
+
+
+def _summarize_roster(filename: str, reading, token: str) -> str:
+    """A compact, bounded description of a read roster for the model to relay (counts + ≤3
+    sample rows + the token) — never the full address list (window discipline)."""
+    lines = [
+        f"Read '{filename}': {reading.total_rows} row(s), "
+        f"{len(reading.emails)} unique participant email address(es)."
+    ]
+    if reading.headers:
+        lines.append(f"Columns: {', '.join(str(h) for h in reading.headers)}.")
+    if reading.status_column:
+        bd = ", ".join(f"{k}: {v}" for k, v in reading.status_breakdown.items())
+        lines.append(
+            f"The file has its own status column '{reading.status_column}' — {bd}. "
+            "(This is the organizer's tracking, not EventBuddy registration.)"
+        )
+    sample = reading.rows[:3]
+    if sample:
+        lines.append("Sample:")
+        for r in sample:
+            bits = [r.get("email", "")]
+            if r.get("name"):
+                bits.append(f"name={r['name']}")
+            if r.get("status"):
+                bits.append(f"status={r['status']}")
+            lines.append("  - " + ", ".join(bits))
+    lines.append(f"\nfile_token: {token}")
+    lines.append(
+        "Describe this to the user and confirm who to contact, then call "
+        "send_participant_reminders with this file_token (and only_status to limit who)."
+    )
+    return "\n".join(lines)
+
+
+_ROSTER_EXTS = (".xlsx", ".csv", ".tsv")
+_PARSE_EXTS = _ROSTER_EXTS + (".docx", ".pdf")
+
+
+def _pick_roster_attachment(attachments: list[dict]) -> dict | None:
+    """Choose the file to read: a spreadsheet/CSV first, then any other parseable doc."""
+    for exts in (_ROSTER_EXTS, _PARSE_EXTS):
+        for a in attachments:
+            if (a.get("name") or "").lower().endswith(exts):
+                return a
+    return None
 
 # A DM-injected event snapshot competes with the user's own turns for the 4096-token DM
 # window, so keep the cross-context read compact (Phase 1.9, Part B).
@@ -224,6 +304,7 @@ def build_orchestrator() -> Orchestrator:
     credentials; until then create-event persists locally."""
     session_store = SessionStore(get_redis())
     pending_store = PendingActionStore(get_redis(), ttl=settings.pending_action_ttl)
+    roster_store = RosterStore(get_redis(), ttl=settings.pending_action_ttl)
 
     def provision_fn(**kw):
         from eventbuddy.capabilities.provisioning import ProvisioningService
@@ -531,6 +612,108 @@ def build_orchestrator() -> Orchestrator:
             bits.append("responses workbook link")
         return f"Saved the {' and '.join(bits)} for this event."
 
+    def read_participant_file_fn(*, user_id, event_id, attachments=None, link=""):
+        """Impl 4: read a participant-roster file (an uploaded attachment or a SharePoint/
+        OneDrive link), extract the participant email addresses, stash the reading in the
+        transient RosterStore, and return a bounded summary for the agent to relay + confirm.
+        Stateless — the roster is never persisted to the DB and never becomes EventMembers."""
+        from eventbuddy.agent.tools import wrap_untrusted
+        from eventbuddy.capabilities.attachments import fetch_attachment_bytes
+        from eventbuddy.ingestion.parsers import parse
+        from eventbuddy.ingestion.roster import extract_roster
+
+        attachments = attachments or []
+        descriptor = _pick_roster_attachment(attachments)
+        if descriptor is None and link:
+            descriptor = {"name": "", "content_type": "", "download_url": None,
+                          "content_url": link}
+        if descriptor is None:
+            return ("Upload a participant list (.xlsx or .csv) here, or paste a SharePoint/"
+                    "OneDrive share link, and I'll read it.")
+        graph = None
+        if not descriptor.get("download_url"):  # a link/SharePoint ref → needs Graph
+            if not _graph_creds():
+                return ("I can't open that link — Microsoft Graph isn't configured. Upload the "
+                        "file directly in the chat instead.")
+            graph = _default_graph()
+        try:
+            fetched = fetch_attachment_bytes(descriptor, graph=graph)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"participant file download failed ({type(e).__name__}: {e})")
+            fetched = None
+        if not fetched:
+            return "I couldn't download that file — please re-send it or check the link."
+        filename, content = fetched
+        parsed = parse(filename, content)
+        if parsed.kind == "unsupported":
+            return (f"I couldn't read '{filename or 'that file'}' — please send an .xlsx or "
+                    ".csv participant list.")
+        reading = extract_roster(parsed)
+        if not reading.emails:
+            return (f"I read '{filename}' but found no email addresses in it — make sure it has "
+                    "a column with participant emails.")
+        try:
+            token = roster_store.put({**reading.to_dict(), "filename": filename})
+        except Exception as e:  # noqa: BLE001 — Redis down: don't hand back a dead token
+            log.warning(f"roster store unavailable ({type(e).__name__}: {e})")
+            return "I read the file but can't stage it right now — please try again shortly."
+        return wrap_untrusted(
+            f"participant file: {filename}", _summarize_roster(filename, reading, token)
+        )
+
+    def send_participant_reminders_fn(*, user_id, event_id, subject, body, file_token,
+                                      only_status=""):
+        """Impl 4: resolve participant recipients from a previously-read roster (server-side,
+        via `file_token`), stash a pending mail action, and emit the Teams-vs-Outlook channel-
+        choice card. Nothing sends until the EO confirms. Recipients come from the transient
+        roster stash — never the DB, never EventMembers."""
+        if not file_token:
+            return ("Read a participant file first with read_participant_file — then I'll have "
+                    "a token to send to.")
+        try:
+            reading = roster_store.get(file_token)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"roster store unavailable ({type(e).__name__}: {e})")
+            return "I can't reach the staged file right now — please try again shortly."
+        if not reading:
+            return ("That file reading expired or I don't have it — please re-send the "
+                    "participant file and I'll read it again.")
+        rows = reading.get("rows") or []
+        emails = _filter_emails_by_status(rows, only_status) if only_status else (
+            reading.get("emails") or [])
+        emails = list(dict.fromkeys(e.lower() for e in emails if e))  # dedupe, keep order
+        if not emails:
+            return ("No participants matched that filter — check the status value, or leave it "
+                    "empty to contact everyone in the file.")
+        event_name = channel_id = team_id = None
+        if event_id:
+            from eventbuddy.data.db import session_scope
+            from eventbuddy.data.repositories.events import EventRepository
+            try:
+                with session_scope() as s:
+                    ev = EventRepository(s).get(event_id)
+                    if ev is not None:
+                        event_name, channel_id = ev.event_name, ev.teams_channel_id
+                        team_id = _team_id_for(ev)
+            except Exception as e:  # noqa: BLE001 — Outlook still works without event context
+                log.warning(f"event lookup for participant send failed ({type(e).__name__}: {e})")
+        payload = {
+            "type": "mail", "event_id": event_id, "event_name": event_name,
+            "requested_by": user_id, "subject": subject, "body_html": f"<p>{body}</p>",
+            "recipient_emails": emails, "channel_id": channel_id, "team_id": team_id,
+            "notice_text": body,
+        }
+        try:
+            pending_id = pending_store.put(payload)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            return "Reminder confirmation is temporarily unavailable — please try again."
+        emit_card(reminder_channel_card(
+            task_name=subject, recipients=emails, pending_id=pending_id, body=body,
+        ))
+        return (f"Drafted a reminder to {len(emails)} participant(s) — choose Teams or Outlook "
+                "on the card to send.")
+
     def list_events_fn(*, user_id, current_event_id=None):
         """Impl 3: list the caller's events (member or host) with status + role, marking the
         focused one. Read-only; scoped to the caller's own membership."""
@@ -637,6 +820,8 @@ def build_orchestrator() -> Orchestrator:
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
         list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
+        read_participant_file_fn=read_participant_file_fn,
+        send_participant_reminders_fn=send_participant_reminders_fn,
     )
 
     orch = Orchestrator(
@@ -669,6 +854,7 @@ def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
+    read_participant_file_fn=None, send_participant_reminders_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -700,7 +886,9 @@ def _build_runner_and_summarizer(
         _no_ingest,
         _no_list_events,
         _no_read_channel,
+        _no_read_participant_file,
         _no_send_mail,
+        _no_send_participant_reminders,
         _no_set_feedback,
         _no_update_task,
     )
@@ -716,6 +904,9 @@ def _build_runner_and_summarizer(
         set_feedback_fn=set_feedback_fn or _no_set_feedback,
         list_events_fn=list_events_fn or _no_list_events,
         read_channel_fn=read_channel_fn or _no_read_channel,
+        read_participant_file_fn=read_participant_file_fn or _no_read_participant_file,
+        send_participant_reminders_fn=(
+            send_participant_reminders_fn or _no_send_participant_reminders),
         web_search_fn=web_search_fn,
         web_fetch_fn=web_fetch_fn,
         debug=settings.agent_debug,

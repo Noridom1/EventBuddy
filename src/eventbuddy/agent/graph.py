@@ -13,6 +13,9 @@ class AgentState(TypedDict, total=False):
     # inbound activity (Impl 3). Both default-safe: a missing scope is treated as "personal".
     scope: str
     team_id: str | None
+    # Impl 4 — descriptors for files attached to this turn; forwarded to the orchestrator so a
+    # tool can read them. Default-safe: a turn with no files carries an empty list.
+    attachments: list[dict]
     reply: str
 
 
@@ -25,6 +28,7 @@ def build_agent_graph(orchestrator):
             scope=state.get("scope", "personal"),
             sent_at=state.get("sent_at"),
             team_id=state.get("team_id"),
+            attachments=state.get("attachments"),
         )
         return {"reply": reply}
 

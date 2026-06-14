@@ -133,6 +133,16 @@ def _no_read_channel(**_kw) -> str:
     return "Reading channel messages isn't available right now."
 
 
+def _no_read_participant_file(**_kw) -> str:
+    """Default `read_participant_file_fn` — roster intake not wired (no Graph/Redis path)."""
+    return "Reading participant files isn't available right now."
+
+
+def _no_send_participant_reminders(**_kw) -> str:
+    """Default `send_participant_reminders_fn` — roster send not wired (no Graph/HITL path)."""
+    return "Sending participant reminders isn't available right now."
+
+
 def wrap_untrusted(source: str, content: str) -> str:
     """Frame external/untrusted text (web pages, channel messages) so the model treats it as
     reference data, never as instructions (Impl 3 — prompt-injection guard). Capability
@@ -175,6 +185,10 @@ class AgentDeps:
     # (brainstorm). Default no-ops so the no-DB / no-Graph path still builds the tool set.
     list_events_fn: Callable = _no_list_events
     read_channel_fn: Callable = _no_read_channel
+    # Impl 4 — read an uploaded/linked participant roster + send reminders to its addresses
+    # (HITL). Default no-ops so the no-Graph / no-Redis path still builds the tool set.
+    read_participant_file_fn: Callable = _no_read_participant_file
+    send_participant_reminders_fn: Callable = _no_send_participant_reminders
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise to the runner's
     # ToolNode error handler for classification.
@@ -196,7 +210,9 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     ) -> str:
         """Create a new event with the given name and member email addresses.
         Use only when the user explicitly asks to create/set up/start an event.
-        `member_emails` is the roster of participant email addresses."""
+        `member_emails` are the **organizing-team** addresses (organizers/hosts who run the
+        event) — NOT the attendee/participant list. To invite or remind attendees, read a
+        participant roster file with read_participant_file instead."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to create events (needs host or moderator)."
         ev = deps.provision_fn(
@@ -346,11 +362,48 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             user_id=ctx.user_id, event_id=ctx.current_event_id, limit=limit
         )
 
+    @tool
+    @traced
+    def read_participant_file(link: str = "") -> str:
+        """Read a participant roster the organizer attached to this chat (or a SharePoint/
+        OneDrive `link` if given): an .xlsx or .csv list of participants (attendees) to invite
+        or remind. Extracts the email addresses and summarizes what the file contains, including
+        any registration-status column the file itself carries. ALWAYS describe the file back to
+        the user and confirm who to contact before sending. Then pass the returned file_token to
+        send_participant_reminders. Participants are attendees — NOT organizing-team members,
+        and reading the file does not add them to the event. Requires host or moderator."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to read participant files (needs host or moderator)."
+        return deps.read_participant_file_fn(
+            user_id=ctx.user_id, event_id=ctx.current_event_id,
+            attachments=ctx.attachments, link=link or "",
+        )
+
+    @tool
+    @traced
+    def send_participant_reminders(
+        subject: str, body: str, file_token: str, only_status: str = ""
+    ) -> str:
+        """Send a reminder/invitation email to the participants from a roster you read with
+        read_participant_file. `file_token` is the token that tool returned. `subject` and
+        `body` are the message text. `only_status` optionally limits recipients to rows whose
+        status (from the file's own status column) matches the given value — e.g. 'pending' or
+        'no' to chase those who haven't registered; leave empty to contact everyone in the file.
+        Sending is gated by a Teams-vs-Outlook confirmation card — this only drafts it. Requires
+        host or moderator."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to send reminders (needs host or moderator)."
+        return deps.send_participant_reminders_fn(
+            user_id=ctx.user_id, event_id=ctx.current_event_id,
+            subject=subject, body=body, file_token=file_token, only_status=only_status or "",
+        )
+
     tools: list[BaseTool] = [
         create_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion,
+        read_participant_file, send_participant_reminders,
     ]
 
     # Web tools are registered only when Tavily is configured (Impl 3) — the model shouldn't

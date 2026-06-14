@@ -37,6 +37,9 @@ class HandleRequest(BaseModel):
     scope: str = "personal"
     channel_id: str | None = None
     team_id: str | None = None
+    # Impl 4: exercise file intake over HTTP without Teams. Each item is a descriptor like
+    # {"name": "roster.csv", "download_url": "http://..."} (or "content_url" for a link).
+    attachments: list[dict] = []
 
 
 class ConfirmRequest(BaseModel):
@@ -63,7 +66,7 @@ async def dev_handle(
         try:
             reply = orch.handle(
                 user_id=body.user_id, channel_id=body.channel_id, text=body.text,
-                scope=body.scope, team_id=body.team_id,
+                scope=body.scope, team_id=body.team_id, attachments=body.attachments,
                 sent_at=datetime.now(UTC),  # dev turns stamped "now" so L2 carries a send-time
             )
         finally:

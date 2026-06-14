@@ -4,7 +4,7 @@
 carries identity, role, scope and the focused event. It is supplied to the tools via a
 factory closure, never as model-settable tool arguments, so the model can neither spoof
 *who* the caller is nor *whether* it is allowed (cross-cutting rule 2)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from langchain_core.messages import HumanMessage
@@ -32,6 +32,11 @@ class RequestContext:
     # captured at ingress (Phase 1.9). Rides in the human turn's `additional_kwargs`; the
     # transcript persists it (the L2 `sent_at` column) so the agent can reason about recency.
     sent_at: datetime | None = None
+    # Lightweight descriptors of files the user attached this turn (Impl 4) —
+    # `{name, content_type, download_url, content_url}`, never bytes. Server-built from the
+    # inbound activity, so the model can't fabricate a file (rule 2). A tool
+    # (`read_participant_file`) downloads + parses on demand.
+    attachments: list[dict] = field(default_factory=list)
 
     @property
     def thread_id(self) -> str:

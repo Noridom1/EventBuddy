@@ -57,3 +57,34 @@ def test_parse_unsupported_extension():
 def test_parse_pdf_garbage_degrades_to_unsupported():
     # Not a real PDF — the guarded parser must degrade, not raise.
     assert parse("broken.pdf", b"not a pdf").kind == "unsupported"
+
+
+# --- Impl 4: CSV / TSV ---------------------------------------------------------------------
+
+def test_parse_csv_headers_to_rows():
+    content = b"Name,Email,Registered\nAlice,a@x.com,Yes\nBob,b@x.com,No\n"
+    doc = parse("roster.csv", content)
+    assert doc.kind == "csv"
+    assert len(doc.rows) == 2
+    assert doc.rows[0] == {"Name": "Alice", "Email": "a@x.com", "Registered": "Yes"}
+    assert "b@x.com" in doc.text
+
+
+def test_parse_csv_handles_bom_and_semicolon_delimiter():
+    content = "﻿Name;Email\nAlice;a@x.com\n".encode()
+    doc = parse("roster.csv", content)
+    assert doc.kind == "csv"
+    assert doc.rows[0]["Email"] == "a@x.com"  # BOM stripped, ';' sniffed
+
+
+def test_parse_tsv_forces_tab_delimiter():
+    content = b"Name\tEmail\nAlice\ta@x.com\n"
+    doc = parse("roster.tsv", content)
+    assert doc.kind == "csv"
+    assert doc.rows[0] == {"Name": "Alice", "Email": "a@x.com"}
+
+
+def test_parse_csv_skips_blank_rows():
+    content = b"A,B\n,\nx,y\n"
+    doc = parse("f.csv", content)
+    assert len(doc.rows) == 1

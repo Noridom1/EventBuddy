@@ -46,7 +46,8 @@ class Orchestrator:
         self._regex_fallback_on_error = regex_fallback_on_error
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
-                   sent_at: datetime | None, team_id: str | None = None) -> RequestContext:
+                   sent_at: datetime | None, team_id: str | None = None,
+                   attachments: list[dict] | None = None) -> RequestContext:
         # In a channel the focused event is whatever is bound to this channel (and we backfill
         # its real team id on the way); in a DM it's the caller's session focus.
         if scope == "channel" and channel_id and self._channel_event_fn is not None:
@@ -62,17 +63,31 @@ class Orchestrator:
             ),
             current_event_id=event_id,
             sent_at=sent_at,
+            attachments=attachments or [],
         )
+
+    @staticmethod
+    def _with_attachment_note(text: str, attachments: list[dict]) -> str:
+        """Surface attached file names to the model so it knows to read them (Impl 4). The
+        note is server-built (rule 2) — the model can't fake an attachment, and the tool still
+        re-derives the real file from `RequestContext.attachments`, not from this text."""
+        if not attachments:
+            return text
+        names = ", ".join(a.get("name") or "a file" for a in attachments)
+        note = (f"[The user attached the following file(s): {names}. If this is a participant "
+                "roster, call read_participant_file to read it, then confirm who to contact.]")
+        return f"{text}\n\n{note}" if text else note
 
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
                scope: str = "personal", sent_at: datetime | None = None,
-               team_id: str | None = None) -> str:
-        # `sent_at` (Phase 1.9) + `team_id` (Impl 3) are additive + keyword-defaulted so
-        # existing callers that don't pass them keep working (the stable-signature rule).
+               team_id: str | None = None, attachments: list[dict] | None = None) -> str:
+        # `sent_at` (Phase 1.9), `team_id` (Impl 3) + `attachments` (Impl 4) are additive +
+        # keyword-defaulted so existing callers that don't pass them keep working.
+        attachments = attachments or []
         if self.agent_mode == "llm" and self.runner is not None:
             try:
-                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id)
-                return self.runner.run(text, ctx)
+                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments)
+                return self.runner.run(self._with_attachment_note(text, attachments), ctx)
             except Exception as e:  # noqa: BLE001
                 if not self._regex_fallback_on_error:
                     log.warning(f"LLM agent failed ({type(e).__name__}: {e}); surfacing (debug)")
