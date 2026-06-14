@@ -455,7 +455,7 @@ def build_orchestrator() -> Orchestrator:
             return "Mail confirmation is temporarily unavailable — please try again."
         emit_card(confirm_card(
             title=f"Send email: {subject}", summary=f"To {len(emails)} recipient(s).",
-            pending_id=pending_id, action="mail",
+            pending_id=pending_id, action="mail", recipients=emails, body=body,
         ))
         return "Drafted the email — confirm on the card to send."
 
