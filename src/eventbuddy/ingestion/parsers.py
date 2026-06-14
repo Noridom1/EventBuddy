@@ -16,10 +16,22 @@ log = get_logger("ingestion.parsers")
 
 @dataclass
 class ParsedDoc:
-    kind: str                            # "xlsx" | "csv" | "docx" | "pdf" | "unsupported"
+    # "xlsx" | "csv" | "docx" | "pdf" | "image" | "image_pdf" | "unsupported"
+    kind: str
     filename: str
     text: str = ""
     rows: list[dict] = field(default_factory=list)  # tabular rows (xlsx/csv), header-keyed
+    # Image kinds (Impl 5) carry the raw bytes + mime for a vision model to read; text kinds
+    # leave these empty. `image_pdf` is a PDF that yielded ~no extractable text (likely scanned).
+    raw_bytes: bytes | None = None
+    mime: str = ""
+
+
+# Image extensions → mime, for routing uploads to the vision model (Impl 5).
+_IMAGE_MIMES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+}
 
 
 def parse(filename: str, content: bytes) -> ParsedDoc:
@@ -34,6 +46,9 @@ def parse(filename: str, content: bytes) -> ParsedDoc:
         return _parse_docx(filename, content)
     if name.endswith(".pdf"):
         return _parse_pdf(filename, content)
+    for ext, mime in _IMAGE_MIMES.items():
+        if name.endswith(ext):
+            return ParsedDoc(kind="image", filename=filename, raw_bytes=content, mime=mime)
     return ParsedDoc(kind="unsupported", filename=filename)
 
 
@@ -103,6 +118,29 @@ def _parse_csv(filename: str, content: bytes, delimiter: str | None = None) -> P
     return ParsedDoc(kind="csv", filename=filename, text=text, rows=rows)
 
 
+def render_pdf_first_page(content: bytes) -> tuple[bytes, str] | None:
+    """Render a PDF's first page to a PNG for the vision model (Impl 5, image-PDF path).
+    Guarded on PyMuPDF — if it's not installed (or rendering fails) returns None and the
+    caller degrades to a clean 'couldn't render this PDF' message. Keeps the text-PDF path
+    dependency-free."""
+    try:
+        import fitz  # PyMuPDF — optional dependency
+    except ImportError:
+        log.warning("PyMuPDF not installed — image-PDF rendering unavailable")
+        return None
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        if doc.page_count == 0:
+            return None
+        pix = doc.load_page(0).get_pixmap(dpi=150)
+        png = pix.tobytes("png")
+        doc.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"pdf render failed ({type(e).__name__}: {e})")
+        return None
+    return png, "image/png"
+
+
 def _parse_docx(filename: str, content: bytes) -> ParsedDoc:
     try:
         import docx  # python-docx
@@ -130,4 +168,9 @@ def _parse_pdf(filename: str, content: bytes) -> ParsedDoc:
     except Exception as e:  # noqa: BLE001
         log.warning(f"pdf parse failed for {filename} ({type(e).__name__}: {e})")
         return ParsedDoc(kind="unsupported", filename=filename)
+    # A PDF that yields ~no text is likely scanned/image-only — flag it so the vision path
+    # can render + read it (Impl 5). Keep the original bytes for rendering.
+    if not text.strip():
+        return ParsedDoc(kind="image_pdf", filename=filename,
+                         raw_bytes=content, mime="application/pdf")
     return ParsedDoc(kind="pdf", filename=filename, text=text)
