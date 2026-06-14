@@ -47,7 +47,7 @@ class _LLM:
         self._doc_type = doc_type
 
     def chat(self, messages, model=None):
-        return '{"summary": "a file", "doc_type": "%s"}' % self._doc_type
+        return f'{{"summary": "a file", "doc_type": "{self._doc_type}"}}'
 
 
 class _Extractor:

@@ -296,6 +296,206 @@ def _build_read_channel_fn(graph_factory=None):
     return read_channel_discussion_fn
 
 
+# --- Impl 5: generic file browse + on-demand read (membership-gated, read-only) ------------
+
+READ_FILE_BUDGET = 6000  # chars of file content returned to the model (window discipline)
+
+
+def _resolve_channel_access(event_id, user_id):
+    """Shared guard for the file tools: resolve the focused event's channel + verify the
+    caller is a member/host. Returns `(ok, payload)` — `payload` is an error string when
+    `ok` is False, else a dict `{team_id, channel_id, event_name}`. Mirrors the read_channel
+    guard chain; lazy `session_scope` import so tests can sqlite-redirect."""
+    if not event_id:
+        return False, ("Focus on the event whose files you want me to look at first "
+                       "(e.g. 'focus on AI Workshop').")
+    if not _graph_creds():
+        return False, "I can't read files yet — Microsoft Graph isn't configured."
+    from eventbuddy.data.db import session_scope
+    from eventbuddy.data.repositories.events import EventRepository
+    from eventbuddy.data.repositories.members import MemberRepository
+    try:
+        with session_scope() as s:
+            ev = EventRepository(s).get(event_id)
+            if ev is None:
+                return False, "I couldn't find that event anymore."
+            team_id, channel_id, event_name = (
+                ev.teams_team_id, ev.teams_channel_id, ev.event_name)
+            is_member = MemberRepository(s).get_by_user(event_id, user_id) is not None
+            is_host = ev.host_user_id == user_id
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"file access prep failed ({type(e).__name__}: {e})")
+        return False, "I couldn't read the files right now — please try again shortly."
+    if not channel_id:
+        return False, "This event has no Teams channel bound, so there are no files to read."
+    if not team_id:
+        return False, ("I can't read this channel's files yet — I haven't seen its Teams team "
+                       "id. Post once in the channel and try again.")
+    if not (is_member or is_host):
+        return False, "You're not a member of this event, so I can't share its files."
+    return True, {"team_id": team_id, "channel_id": channel_id, "event_name": event_name}
+
+
+def _build_list_event_files_fn(graph_factory=None):
+    """List the focused event channel's files live, enriched with each file's stored catalog
+    summary + doc_type (Impl 5). Read-only, membership-gated; wraps the list as untrusted."""
+    graph_factory = graph_factory or _default_graph
+
+    def list_event_files_fn(*, user_id, event_id):
+        from eventbuddy.agent.tools import wrap_untrusted
+        ok, info = _resolve_channel_access(event_id, user_id)
+        if not ok:
+            return info
+        # Catalog enrichment: drive_item_id -> (summary, doc_type) from prior ingestion.
+        catalog: dict[str, tuple] = {}
+        try:
+            from eventbuddy.data.db import session_scope
+            from eventbuddy.data.repositories.documents import DocumentRepository
+            with session_scope() as s:
+                for d in DocumentRepository(s).list(event_id):
+                    if d.drive_item_id:
+                        catalog[d.drive_item_id] = (d.summary, d.doc_type)
+        except Exception as e:  # noqa: BLE001 — enrichment is best-effort
+            log.warning(f"file catalog read failed ({type(e).__name__}: {e})")
+        try:
+            graph = graph_factory()
+            drive_id, folder_id = graph.get_channel_files_folder(
+                info["team_id"], info["channel_id"])
+            children = graph.list_children(drive_id, folder_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"list files failed ({type(e).__name__}: {e})")
+            return "I couldn't list the files right now — please try again shortly."
+        lines = []
+        for c in children:
+            if c.get("folder") is not None:
+                continue  # skip subfolders (flat listing for v1)
+            name = c.get("name", "(unnamed)")
+            summary, doc_type = catalog.get(c.get("id"), (None, None))
+            label = f"• {name}"
+            if doc_type:
+                label += f" — {doc_type}"
+            if summary:
+                label += f" — {summary}"
+            label += f" (id: {c.get('id')})"
+            lines.append(label)
+        if not lines:
+            return f"There are no files in the channel for '{info['event_name']}' yet."
+        body = "\n".join(lines)
+        return wrap_untrusted(f"files in '{info['event_name']}'", body)
+
+    return list_event_files_fn
+
+
+def _build_read_event_file_fn(graph_factory=None):
+    """Read ONE file's content on demand (Impl 5). Resolves `file_id` against the focused
+    event's channel folder (or a pasted `link`), downloads it LIVE, and returns its content:
+    text via the parsers, images/image-PDFs via the vision model. Read-only, membership-gated;
+    lazily backfills the catalog summary; wraps the content as untrusted and bounds its size."""
+    graph_factory = graph_factory or _default_graph
+
+    def read_event_file_fn(*, user_id, event_id, file_id="", link=""):
+        from eventbuddy.agent.tools import wrap_untrusted
+        from eventbuddy.ingestion.parsers import parse, render_pdf_first_page
+
+        if not file_id and not link:
+            return ("Tell me which file to read — use the id from list_event_files, or paste a "
+                    "SharePoint/OneDrive link.")
+        # A focused-event file_id is membership-gated; a pasted link still needs Graph creds.
+        drive_id = item_id = None
+        if file_id:
+            ok, info = _resolve_channel_access(event_id, user_id)
+            if not ok:
+                return info
+            try:
+                graph = graph_factory()
+                drive_id, _folder_id = graph.get_channel_files_folder(
+                    info["team_id"], info["channel_id"])
+                item_id = file_id
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"resolve channel folder failed ({type(e).__name__}: {e})")
+                return "I couldn't open that file right now — please try again shortly."
+        else:
+            if not _graph_creds():
+                return "I can't open links yet — Microsoft Graph isn't configured."
+            try:
+                graph = graph_factory()
+                drive_id, item_id = graph.resolve_share_url(link)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"resolve share link failed ({type(e).__name__}: {e})")
+                return "I couldn't open that link — check it's a valid SharePoint/OneDrive link."
+        try:
+            content, filename, _mime = graph.get_drive_item_content(drive_id, item_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"file download failed ({type(e).__name__}: {e})")
+            return "I couldn't download that file — please try again shortly."
+
+        parsed = parse(filename, content)
+        if parsed.kind == "unsupported":
+            return f"I can't read '{filename}' — it's not a format I can open."
+
+        if parsed.kind in ("image", "image_pdf"):
+            body, doc_type = _read_image_file(parsed, render_pdf_first_page), "image"
+            if body is None:
+                return ("I found the file but can't read images right now "
+                        "(vision isn't configured).")
+        else:
+            body = (parsed.text or "").strip()
+            if not body:
+                return f"I read '{filename}' but it had no readable text."
+            doc_type = None
+
+        truncated = body[:READ_FILE_BUDGET]
+        if len(body) > READ_FILE_BUDGET:
+            truncated += "\n…(truncated)"
+
+        # Lazily backfill the catalog summary/type for a known channel file.
+        if file_id:
+            _backfill_understanding(event_id, item_id, truncated, doc_type)
+        return wrap_untrusted(f"file: {filename}", truncated)
+
+    return read_event_file_fn
+
+
+def _read_image_file(parsed, render_pdf_first_page):
+    """Vision read for an image / image-PDF ParsedDoc. Returns the description text, or None
+    when vision is unavailable (caller emits a clean message)."""
+    if not settings.llm_vision_enabled:
+        return None
+    image_bytes, mime = parsed.raw_bytes, parsed.mime
+    if parsed.kind == "image_pdf":
+        rendered = render_pdf_first_page(parsed.raw_bytes or b"")
+        if rendered is None:
+            return "(scanned PDF — I couldn't render it to read.)"
+        image_bytes, mime = rendered
+    if not image_bytes:
+        return "(image — nothing to read.)"
+    from eventbuddy.integrations.llm.client import LLMGateway
+    try:
+        return LLMGateway().describe_image(
+            image_bytes, mime,
+            "Describe this image in detail: what it shows and any text it contains.",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"vision read failed ({type(e).__name__}: {e})")
+        return "(image — I couldn't read it right now.)"
+
+
+def _backfill_understanding(event_id, drive_item_id, body, doc_type):
+    """Best-effort: store a catalog summary for a file read that wasn't ingested before."""
+    try:
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.documents import DocumentRepository
+        with session_scope() as s:
+            repo = DocumentRepository(s)
+            doc = repo.get_by_drive_item(drive_item_id)
+            if doc is None or doc.summary:
+                return  # unknown to the catalog, or already summarized — leave it
+            repo.set_understanding(
+                drive_item_id, summary=body[:300], doc_type=doc_type or doc.doc_type)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"catalog backfill skipped ({type(e).__name__}: {e})")
+
+
 def build_orchestrator() -> Orchestrator:
     """Compose the production orchestrator. Phase 1.7 routes the conversation through an
     LLM tool-calling runner (create_react_agent + layered memory); the same capability
@@ -824,6 +1024,8 @@ def build_orchestrator() -> Orchestrator:
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
         read_participant_file_fn=read_participant_file_fn,
         send_participant_reminders_fn=send_participant_reminders_fn,
+        list_event_files_fn=_build_list_event_files_fn(),
+        read_event_file_fn=_build_read_event_file_fn(),
     )
 
     orch = Orchestrator(
@@ -857,6 +1059,7 @@ def _build_runner_and_summarizer(
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
+    list_event_files_fn=None, read_event_file_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -886,8 +1089,10 @@ def _build_runner_and_summarizer(
 
     from eventbuddy.agent.tools import (
         _no_ingest,
+        _no_list_event_files,
         _no_list_events,
         _no_read_channel,
+        _no_read_event_file,
         _no_read_participant_file,
         _no_send_mail,
         _no_send_participant_reminders,
@@ -909,6 +1114,8 @@ def _build_runner_and_summarizer(
         read_participant_file_fn=read_participant_file_fn or _no_read_participant_file,
         send_participant_reminders_fn=(
             send_participant_reminders_fn or _no_send_participant_reminders),
+        list_event_files_fn=list_event_files_fn or _no_list_event_files,
+        read_event_file_fn=read_event_file_fn or _no_read_event_file,
         web_search_fn=web_search_fn,
         web_fetch_fn=web_fetch_fn,
         debug=settings.agent_debug,
