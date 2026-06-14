@@ -197,3 +197,36 @@ def test_read_non_member_refused(monkeypatch):
     monkeypatch.setattr("eventbuddy.data.db.session_scope", factory)
     fn = wiring._build_read_event_file_fn(graph_factory=lambda: _Graph())
     assert "not a member" in fn(user_id="u1", event_id="ev1", file_id="f1").lower()
+
+
+# --- read_event_file: uploaded attachment (the dev-route / chat-upload path) ----------------
+
+def _data_uri(text, name="notes.txt"):
+    import base64
+    b64 = base64.b64encode(text.encode()).decode()
+    return {"name": name, "content_url": f"data:text/plain;base64,{b64}"}
+
+
+def test_read_uploaded_text_attachment_offline(monkeypatch):
+    # No Graph creds, no channel — an uploaded data: URI is read directly (offline).
+    fn = wiring._build_read_event_file_fn(graph_factory=lambda: _Graph())
+    out = fn(user_id="u1", event_id=None,
+             attachments=[_data_uri("Agenda: 1) keynote 2) lunch")])
+    assert "Agenda: 1) keynote 2) lunch" in out
+    assert "external_untrusted_content" in out
+
+
+def test_read_uploaded_image_uses_vision(monkeypatch):
+    monkeypatch.setattr(wiring.settings, "llm_vision_enabled", True)
+    monkeypatch.setattr(
+        "eventbuddy.ingestion.parsers.parse",
+        lambda f, c: ParsedDoc(kind="image", filename=f, raw_bytes=b"img", mime="image/png"))
+
+    class _Vision:
+        def describe_image(self, b, m, instr, *, model=None):
+            return "A conference poster."
+    monkeypatch.setattr("eventbuddy.integrations.llm.client.LLMGateway", lambda: _Vision())
+    fn = wiring._build_read_event_file_fn(graph_factory=lambda: _Graph())
+    out = fn(user_id="u1", event_id=None, attachments=[
+        {"name": "poster.png", "content_url": "data:image/png;base64,aW1n"}])  # b"img"
+    assert "A conference poster." in out

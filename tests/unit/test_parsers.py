@@ -72,6 +72,12 @@ def test_parse_jpeg_maps_mime():
     assert parse("photo.JPG", b"jpegbytes").mime == "image/jpeg"
 
 
+def test_parse_plaintext():
+    doc = parse("notes.txt", b"Hello\nWorld")
+    assert doc.kind == "txt"
+    assert doc.text == "Hello\nWorld"
+
+
 def test_empty_text_pdf_flagged_image_pdf():
     import pypdf
 

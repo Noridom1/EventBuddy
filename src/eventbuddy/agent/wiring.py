@@ -143,6 +143,9 @@ def _summarize_roster(filename: str, reading, token: str) -> str:
 
 _ROSTER_EXTS = (".xlsx", ".csv", ".tsv")
 _PARSE_EXTS = _ROSTER_EXTS + (".docx", ".pdf")
+# Everything read_event_file can open (Impl 5): docs + images + plain text.
+_READABLE_EXTS = _PARSE_EXTS + (
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".txt", ".md", ".text")
 
 
 def _pick_roster_attachment(attachments: list[dict]) -> dict | None:
@@ -152,6 +155,15 @@ def _pick_roster_attachment(attachments: list[dict]) -> dict | None:
             if (a.get("name") or "").lower().endswith(exts):
                 return a
     return None
+
+
+def _pick_readable_attachment(attachments: list[dict]) -> dict | None:
+    """Choose an uploaded file for read_event_file: first one with a readable extension, else
+    the first attachment (let the parser decide)."""
+    for a in attachments:
+        if (a.get("name") or "").lower().endswith(_READABLE_EXTS):
+            return a
+    return attachments[0] if attachments else None
 
 # A DM-injected event snapshot competes with the user's own turns for the 4096-token DM
 # window, so keep the cross-context read compact (Phase 1.9, Part B).
@@ -393,16 +405,25 @@ def _build_read_event_file_fn(graph_factory=None):
     lazily backfills the catalog summary; wraps the content as untrusted and bounds its size."""
     graph_factory = graph_factory or _default_graph
 
-    def read_event_file_fn(*, user_id, event_id, file_id="", link=""):
+    def read_event_file_fn(*, user_id, event_id, attachments=None, file_id="", link=""):
         from eventbuddy.agent.tools import wrap_untrusted
         from eventbuddy.ingestion.parsers import parse, render_pdf_first_page
 
-        if not file_id and not link:
-            return ("Tell me which file to read — use the id from list_event_files, or paste a "
-                    "SharePoint/OneDrive link.")
-        # A focused-event file_id is membership-gated; a pasted link still needs Graph creds.
-        drive_id = item_id = None
-        if file_id:
+        attachments = attachments or []
+        if not file_id and not link and not attachments:
+            return ("Tell me which file to read — upload it here, use the id from "
+                    "list_event_files, or paste a SharePoint/OneDrive link.")
+
+        # Source resolution → (filename, content, drive_item_id|None). An uploaded attachment
+        # (file_id/link not given) is read directly — works offline (no Graph for a Teams
+        # downloadUrl / data: URI), the natural path for "upload a file and ask about it".
+        item_id = None
+        if not file_id and not link and attachments:
+            fetched = _download_uploaded_file(attachments)
+            if isinstance(fetched, str):  # a degradation message
+                return fetched
+            filename, content = fetched
+        elif file_id:
             ok, info = _resolve_channel_access(event_id, user_id)
             if not ok:
                 return info
@@ -411,8 +432,9 @@ def _build_read_event_file_fn(graph_factory=None):
                 drive_id, _folder_id = graph.get_channel_files_folder(
                     info["team_id"], info["channel_id"])
                 item_id = file_id
+                content, filename, _mime = graph.get_drive_item_content(drive_id, item_id)
             except Exception as e:  # noqa: BLE001
-                log.warning(f"resolve channel folder failed ({type(e).__name__}: {e})")
+                log.warning(f"channel file read failed ({type(e).__name__}: {e})")
                 return "I couldn't open that file right now — please try again shortly."
         else:
             if not _graph_creds():
@@ -420,14 +442,10 @@ def _build_read_event_file_fn(graph_factory=None):
             try:
                 graph = graph_factory()
                 drive_id, item_id = graph.resolve_share_url(link)
+                content, filename, _mime = graph.get_drive_item_content(drive_id, item_id)
             except Exception as e:  # noqa: BLE001
-                log.warning(f"resolve share link failed ({type(e).__name__}: {e})")
+                log.warning(f"share-link file read failed ({type(e).__name__}: {e})")
                 return "I couldn't open that link — check it's a valid SharePoint/OneDrive link."
-        try:
-            content, filename, _mime = graph.get_drive_item_content(drive_id, item_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"file download failed ({type(e).__name__}: {e})")
-            return "I couldn't download that file — please try again shortly."
 
         parsed = parse(filename, content)
         if parsed.kind == "unsupported":
@@ -449,11 +467,33 @@ def _build_read_event_file_fn(graph_factory=None):
             truncated += "\n…(truncated)"
 
         # Lazily backfill the catalog summary/type for a known channel file.
-        if file_id:
+        if item_id:
             _backfill_understanding(event_id, item_id, truncated, doc_type)
         return wrap_untrusted(f"file: {filename}", truncated)
 
     return read_event_file_fn
+
+
+def _download_uploaded_file(attachments):
+    """Download an uploaded chat attachment for read_event_file (Impl 5). Picks the first
+    parseable file, then reuses the Impl 4 `fetch_attachment_bytes` helper — which handles a
+    Teams `downloadUrl`, a `data:` URI, a localhost URL (all offline, no Graph), and a
+    SharePoint share link (via Graph, when creds exist). Returns `(filename, bytes)` or a
+    degradation string."""
+    from eventbuddy.capabilities.attachments import fetch_attachment_bytes
+
+    descriptor = _pick_readable_attachment(attachments)
+    if descriptor is None:
+        return "I don't see a file I can read in what you sent."
+    graph = _default_graph() if (not descriptor.get("download_url") and _graph_creds()) else None
+    try:
+        fetched = fetch_attachment_bytes(descriptor, graph=graph)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"uploaded file download failed ({type(e).__name__}: {e})")
+        fetched = None
+    if not fetched:
+        return "I couldn't download that file — please re-send it or check the link."
+    return fetched
 
 
 def _read_image_file(parsed, render_pdf_first_page):

@@ -46,6 +46,8 @@ def parse(filename: str, content: bytes) -> ParsedDoc:
         return _parse_docx(filename, content)
     if name.endswith(".pdf"):
         return _parse_pdf(filename, content)
+    if name.endswith((".txt", ".md", ".text")):
+        return _parse_text(filename, content)
     for ext, mime in _IMAGE_MIMES.items():
         if name.endswith(ext):
             return ParsedDoc(kind="image", filename=filename, raw_bytes=content, mime=mime)
@@ -116,6 +118,18 @@ def _parse_csv(filename: str, content: bytes, delimiter: str | None = None) -> P
         rows.append({headers[i]: raw[i] for i in range(min(len(headers), len(raw)))})
     text = "\n".join(", ".join(f"{k}={v}" for k, v in r.items()) for r in rows)
     return ParsedDoc(kind="csv", filename=filename, text=text, rows=rows)
+
+
+def _parse_text(filename: str, content: bytes) -> ParsedDoc:
+    """Plain text / Markdown (Impl 5). Decode with a few common encodings; a decode error
+    degrades to `unsupported` rather than raising."""
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return ParsedDoc(kind="txt", filename=filename, text=content.decode(enc))
+        except (UnicodeDecodeError, AttributeError):
+            continue
+    log.warning(f"text decode failed for {filename}")
+    return ParsedDoc(kind="unsupported", filename=filename)
 
 
 def render_pdf_first_page(content: bytes) -> tuple[bytes, str] | None:
