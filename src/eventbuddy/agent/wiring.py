@@ -567,9 +567,11 @@ def build_orchestrator() -> Orchestrator:
             def post_card(channel_id, card):
                 graph.send_channel_card(team_id, channel_id, card)
 
+            llm = LLMGateway()
             pipeline = IngestionPipeline(
-                graph, Extractor(LLMGateway()),
+                graph, Extractor(llm),
                 pending_store=pending_store, post_card=post_card,
+                llm=llm, vision=llm if settings.llm_vision_enabled else None,
             )
             svc = ChannelFilesService(graph, pipeline, team_id=team_id)
             if url:

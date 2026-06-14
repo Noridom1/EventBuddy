@@ -1,10 +1,18 @@
-"""Document ingestion pipeline (architecture §5.5, §7.2).
+"""Document ingestion pipeline (architecture §5.5, §7.2; generalized in Impl 5).
 
-download → parse → LLM-structure → upsert `documents` + extracted members/tasks → propose a
-proactive HITL bulk-invite (a `mail` pending action + a confirm card posted to the channel via
-Graph). Idempotent by `drive_item_id`. Everything degrades: no parser → unsupported; no LLM →
-no structure; no pending-store/post-card → upsert only, propose nothing. Never raises into the
-webhook/agent path — failures are logged and returned as a `skipped` reason."""
+Ingestion is **generic** — its job is to *understand + catalog* a file, then stop:
+
+    download → parse → understand (summary + doc_type) → upsert `documents` (catalog)
+
+What (if anything) to do with an understood file is a separate, OPTIONAL layer keyed on
+`doc_type`. Today the one consumer is the member/task extraction + proactive bulk-invite —
+it runs only when the file looks like a roster/planning doc. Every other file (a template,
+agenda, budget, flyer, image) is simply catalogued and becomes readable on demand via the
+list/read tools; it triggers no invite flow.
+
+Idempotent by `drive_item_id`. Everything degrades: no parser → unsupported; no LLM/vision →
+no summary/structure; no pending-store/post-card → catalog only, propose nothing. Never raises
+into the webhook/agent path — failures are logged and returned as a `skipped` reason."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,8 +20,12 @@ from dataclasses import dataclass
 from eventbuddy.bot.cards.builders import confirm_card
 from eventbuddy.common.logging import get_logger
 from eventbuddy.ingestion.parsers import parse as _parse
+from eventbuddy.ingestion.understand import understand as _understand
 
 log = get_logger("ingestion.pipeline")
+
+# doc_types whose files warrant the (optional) member/task extraction + invite proposal.
+_ACTIONABLE_TYPES = {"roster", "planning"}
 
 
 @dataclass
@@ -22,23 +34,36 @@ class IngestResult:
     members_added: int = 0
     tasks_added: int = 0
     invited_proposed: int = 0
+    summary: str | None = None
+    doc_type: str | None = None
     skipped: str | None = None
 
 
 class IngestionPipeline:
-    def __init__(self, graph, extractor, *, pending_store=None, post_card=None, parse=None):
+    def __init__(self, graph, extractor, *, pending_store=None, post_card=None, parse=None,
+                 llm=None, vision=None):
         self.graph = graph
         self.extractor = extractor
         self.pending_store = pending_store
         self.post_card = post_card        # (channel_id, card_dict) -> None
         self._parse = parse or _parse
+        # The understand step uses the extractor's LLM by default (same MaaS gateway); vision
+        # is optional (image files). Either being absent degrades that path, never crashes.
+        self.llm = llm or getattr(extractor, "llm", None)
+        self.vision = vision
+
+    def _understand(self, parsed) -> dict:
+        if self.llm is None:
+            return {"summary": "", "doc_type": "other"}
+        try:
+            return _understand(parsed, llm=self.llm, vision=self.vision)
+        except Exception as e:  # noqa: BLE001 — catalog the file even if understanding fails
+            log.warning(f"understand failed for {parsed.filename} ({type(e).__name__}: {e})")
+            return {"summary": "", "doc_type": "other"}
 
     def ingest(self, *, drive_id: str, item_id: str, event_id: str) -> IngestResult:
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.documents import DocumentRepository
-        from eventbuddy.data.repositories.events import EventRepository
-        from eventbuddy.data.repositories.members import MemberRepository
-        from eventbuddy.data.repositories.tasks import TaskRepository
 
         # Skip a drive item we've already ingested (idempotent re-delivery / re-sync).
         try:
@@ -55,14 +80,11 @@ class IngestionPipeline:
             return IngestResult(skipped="download_failed")
 
         parsed = self._parse(filename, content)
-        try:
-            structured = self.extractor.structure(parsed)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"structuring failed for {filename} ({type(e).__name__}: {e})")
-            structured = {"members": [], "tasks": []}
-
+        understanding = self._understand(parsed)
+        summary, doc_type = understanding["summary"], understanding["doc_type"]
         status = "parsed" if parsed.kind != "unsupported" else "failed"
-        result = IngestResult()
+
+        result = IngestResult(summary=summary, doc_type=doc_type)
         invite_payload = None
         channel_id = None
         try:
@@ -70,54 +92,17 @@ class IngestionPipeline:
                 doc_repo = DocumentRepository(s)
                 _doc, created = doc_repo.upsert(
                     event_id, filename=filename, drive_item_id=item_id,
-                    mime_type=mime, parse_status=status,
+                    mime_type=mime, parse_status=status, summary=summary, doc_type=doc_type,
                 )
                 if not created:
                     return IngestResult(skipped="already_ingested")
                 result.documents = 1
 
-                ev = EventRepository(s).get(event_id)
-                channel_id = ev.teams_channel_id if ev else None
-                event_name = ev.event_name if ev else "the event"
-                host_user_id = ev.host_user_id if ev else None
-                reg_link = ev.registration_link if ev else None
-
-                m_repo = MemberRepository(s)
-                existing_emails = {m.email.lower() for m in m_repo.list(event_id) if m.email}
-                new_members = [
-                    {"email": m["email"], "display_name": m.get("display_name"),
-                     "role": m.get("role", "member")}
-                    for m in structured["members"]
-                    if m["email"].lower() not in existing_emails
-                ]
-                if new_members:
-                    m_repo.add_many(event_id, new_members)
-                    result.members_added = len(new_members)
-
-                t_repo = TaskRepository(s)
-                existing_tasks = {t.task_name.lower() for t in t_repo.list(event_id)}
-                for t in structured["tasks"]:
-                    if t["task_name"].lower() in existing_tasks:
-                        continue
-                    t_repo.create(
-                        event_id, t["task_name"], assignee_email=t.get("assignee_email"),
-                        source_document=filename,
-                    )
-                    existing_tasks.add(t["task_name"].lower())
-                    result.tasks_added += 1
-                s.flush()
-
-                # Proactive opportunity: members still pending registration → propose invites.
-                pending = [m.email for m in m_repo.pending(event_id) if m.email]
-                if pending and self.pending_store is not None and self.post_card is not None:
-                    invite_payload = {
-                        "type": "mail", "event_id": event_id, "event_name": event_name,
-                        "channel_id": channel_id, "requested_by": host_user_id,
-                        "subject": f"[Invitation] {event_name}",
-                        "body_html": (f"<p>You're invited to <b>{event_name}</b>.</p>"
-                                      + (f"<p>Register: {reg_link}</p>" if reg_link else "")),
-                        "recipient_emails": pending,
-                    }
+                # OPTIONAL consumer — only roster/planning docs feed member/task extraction +
+                # the invite proposal. Every other file is now just catalogued.
+                if doc_type in _ACTIONABLE_TYPES:
+                    invite_payload, channel_id = self._maybe_propose_invites(
+                        s, event_id, parsed, filename, result)
         except Exception as e:  # noqa: BLE001
             log.warning(f"ingest upsert failed for {filename} ({type(e).__name__}: {e})")
             return IngestResult(skipped="upsert_failed")
@@ -137,3 +122,61 @@ class IngestionPipeline:
             except Exception as e:  # noqa: BLE001
                 log.warning(f"invite proposal not posted ({type(e).__name__}: {e})")
         return result
+
+    def _maybe_propose_invites(self, s, event_id, parsed, filename, result):
+        """Optional roster/planning consumer: extract members/tasks from the file and, if
+        members are still pending registration, build a bulk-invite payload. Returns
+        `(invite_payload | None, channel_id | None)`. This is one use of an understood file —
+        NOT the reason ingestion runs (Impl 5)."""
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.tasks import TaskRepository
+
+        try:
+            structured = self.extractor.structure(parsed)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"structuring failed for {filename} ({type(e).__name__}: {e})")
+            structured = {"members": [], "tasks": []}
+
+        ev = EventRepository(s).get(event_id)
+        channel_id = ev.teams_channel_id if ev else None
+        event_name = ev.event_name if ev else "the event"
+        host_user_id = ev.host_user_id if ev else None
+        reg_link = ev.registration_link if ev else None
+
+        m_repo = MemberRepository(s)
+        existing_emails = {m.email.lower() for m in m_repo.list(event_id) if m.email}
+        new_members = [
+            {"email": m["email"], "display_name": m.get("display_name"),
+             "role": m.get("role", "member")}
+            for m in structured["members"]
+            if m["email"].lower() not in existing_emails
+        ]
+        if new_members:
+            m_repo.add_many(event_id, new_members)
+            result.members_added = len(new_members)
+
+        t_repo = TaskRepository(s)
+        existing_tasks = {t.task_name.lower() for t in t_repo.list(event_id)}
+        for t in structured["tasks"]:
+            if t["task_name"].lower() in existing_tasks:
+                continue
+            t_repo.create(
+                event_id, t["task_name"], assignee_email=t.get("assignee_email"),
+                source_document=filename,
+            )
+            existing_tasks.add(t["task_name"].lower())
+            result.tasks_added += 1
+        s.flush()
+
+        pending = [m.email for m in m_repo.pending(event_id) if m.email]
+        if pending and self.pending_store is not None and self.post_card is not None:
+            return {
+                "type": "mail", "event_id": event_id, "event_name": event_name,
+                "channel_id": channel_id, "requested_by": host_user_id,
+                "subject": f"[Invitation] {event_name}",
+                "body_html": (f"<p>You're invited to <b>{event_name}</b>.</p>"
+                              + (f"<p>Register: {reg_link}</p>" if reg_link else "")),
+                "recipient_emails": pending,
+            }, channel_id
+        return None, channel_id
