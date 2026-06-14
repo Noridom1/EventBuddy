@@ -5,6 +5,7 @@ from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.session import SessionStore
 from eventbuddy.bot.auth import ROLE_RANK
 from eventbuddy.bot.cards.builders import confirm_card, reminder_channel_card
+from eventbuddy.bot.cards.report_card import report_card
 from eventbuddy.bot.confirm import ConfirmHandler
 from eventbuddy.bot.turn_artifacts import emit_card
 from eventbuddy.common.logging import get_logger
@@ -192,8 +193,100 @@ def build_orchestrator() -> Orchestrator:
         ))
         return None
 
-    def report_fn(*, event_id):
-        return "Report generation is available in Phase 1.5."
+    def report_fn(*, event_id, user_id=None):
+        """Impl 2: aggregate metrics + LLM summary + next-event suggestions, persist a Report,
+        emit a read-only report card, and draft the manager-summary email behind a HITL confirm
+        card (reuses the Impl 1 pending-action + confirm machinery). When a responses-workbook
+        is configured, fetch fresh MS Forms responses first. Degrades to a friendly message on
+        any failure — never raises into the agent loop."""
+        if not event_id:
+            return ("Focus on an event first (e.g. 'focus on AI Workshop'), then ask for "
+                    "the report.")
+        from eventbuddy.capabilities.forms_sync import FormsResponseSync
+        from eventbuddy.capabilities.reporting import ReportingService
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.audit import AuditRepository
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.data.repositories.feedback import FeedbackRepository
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.reports import ReportRepository
+        from eventbuddy.domain.feedback import FeedbackAnalyzer
+        from eventbuddy.integrations.llm.client import LLMGateway
+
+        try:
+            with session_scope() as s:
+                ev = EventRepository(s).get(event_id)
+                if ev is None:
+                    return "I couldn't find that event anymore."
+                event_name = ev.event_name
+                channel_id = ev.teams_channel_id
+                # Per-event workbook (Option 1) wins; fall back to the global setting.
+                workbook_url = ev.feedback_workbook_url or settings.feedback_workbook_url
+                members = MemberRepository(s).list(event_id)
+                manager_emails = [
+                    m.email for m in members
+                    if m.email and m.role in ("host", "moderator")
+                ] or [m.email for m in members if m.email][:1]
+                feedback_repo = FeedbackRepository(s)
+                llm = LLMGateway()
+                # Fetch fresh Form responses from the responses workbook (the chosen path).
+                if _graph_creds():
+                    try:
+                        from eventbuddy.capabilities.forms_sync import discover_workbook
+                        from eventbuddy.integrations.graph.client import GraphClient
+                        from eventbuddy.integrations.graph.token import MsalTokenProvider
+                        graph = GraphClient(MsalTokenProvider())
+                        syncer = FormsResponseSync(graph, feedback_repo, FeedbackAnalyzer(llm))
+                        if workbook_url:
+                            syncer.sync(event_id=event_id, workbook_url=workbook_url)
+                        elif channel_id:
+                            # Option 2: best-effort discovery from the channel's SharePoint.
+                            found = discover_workbook(
+                                graph, settings.microsoft_app_tenant_id, channel_id)
+                            if found:
+                                syncer.sync_drive_item(
+                                    event_id=event_id, drive_id=found[0], item_id=found[1])
+                        s.flush()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(f"forms sync skipped ({type(e).__name__}: {e})")
+                report = ReportingService(
+                    MemberRepository(s), feedback_repo, ReportRepository(s), llm,
+                ).generate(event_id=event_id)
+                s.flush()
+                metrics, summary = report.metrics_json, report.summary_md
+                suggestions, report_id = report.suggestions_md, report.report_id
+                AuditRepository(s).record(
+                    event_id=event_id, actor_user_id=user_id, action="report",
+                    tool_name="generate_report", payload={"report_id": report_id},
+                    result="generated",
+                )
+        except Exception as e:  # noqa: BLE001 — LLM/DB down: degrade, don't crash the turn
+            log.warning(f"report generation failed ({type(e).__name__}: {e})")
+            return "I couldn't generate the report right now — please try again shortly."
+
+        emit_card(report_card(metrics=metrics, summary_md=summary, suggestions_md=suggestions))
+
+        # Draft the manager-summary email behind the HITL gate (nothing sends until confirmed).
+        tail = "📊 Report ready — posted the card above."
+        if manager_emails:
+            body_html = (f"<h3>Report — {event_name}</h3><p><b>Summary</b><br>{summary}</p>"
+                         f"<p><b>Suggestions</b><br>{suggestions}</p>")
+            payload = {
+                "type": "mail", "event_id": event_id, "event_name": event_name,
+                "requested_by": user_id, "subject": f"[Report] {event_name}",
+                "body_html": body_html, "recipient_emails": manager_emails,
+            }
+            try:
+                pending_id = pending_store.put(payload)
+                emit_card(confirm_card(
+                    title=f"Email the report to the manager? ({len(manager_emails)})",
+                    summary=f"Sends the summary + suggestions for '{event_name}'.",
+                    pending_id=pending_id, action="mail",
+                ))
+                tail += " Confirm on the card to email the summary to the manager."
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"report email draft skipped ({type(e).__name__}: {e})")
+        return tail
 
     def query_tasks_fn(*, user_id, event_id):
         from eventbuddy.data.db import session_scope
@@ -270,6 +363,76 @@ def build_orchestrator() -> Orchestrator:
         ))
         return "Drafted the email — confirm on the card to send."
 
+    def ingest_fn(*, event_id, user_id, url=""):
+        """Impl 2: pull the focused event's channel SharePoint files (or a pasted link)
+        through the parse→structure→upsert pipeline, proposing invites via a HITL card posted
+        to the channel. Degrades cleanly without Graph creds / a bound channel."""
+        if not _graph_creds():
+            return "I can't read files yet — Microsoft Graph isn't configured."
+        from eventbuddy.capabilities.channel_files import ChannelFilesService
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.ingestion.extractor import Extractor
+        from eventbuddy.ingestion.pipeline import IngestionPipeline
+        from eventbuddy.integrations.graph.client import GraphClient
+        from eventbuddy.integrations.graph.token import MsalTokenProvider
+        from eventbuddy.integrations.llm.client import LLMGateway
+
+        try:
+            graph = GraphClient(MsalTokenProvider())
+            team_id = settings.microsoft_app_tenant_id
+
+            def post_card(channel_id, card):
+                graph.send_channel_card(team_id, channel_id, card)
+
+            pipeline = IngestionPipeline(
+                graph, Extractor(LLMGateway()),
+                pending_store=pending_store, post_card=post_card,
+            )
+            svc = ChannelFilesService(graph, pipeline, team_id=team_id)
+            if url:
+                summary = svc.ingest_link(event_id=event_id, url=url)
+            else:
+                with session_scope() as s:
+                    ev = EventRepository(s).get(event_id)
+                    channel_id = ev.teams_channel_id if ev else None
+                if not channel_id:
+                    return "This event has no Teams channel bound, so I can't read its files."
+                summary = svc.sync_channel(event_id=event_id, channel_id=channel_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"file ingestion failed ({type(e).__name__}: {e})")
+            return "I couldn't read the files right now — please try again shortly."
+
+        parts = [f"📎 Ingested {summary['files_ingested']} file(s)"]
+        if summary["members_added"]:
+            parts.append(f"added {summary['members_added']} member(s)")
+        if summary["tasks_added"]:
+            parts.append(f"found {summary['tasks_added']} task(s)")
+        msg = ", ".join(parts) + "."
+        if summary["invited_proposed"]:
+            msg += (f" I posted a card to the channel to invite "
+                    f"{summary['invited_proposed']} member(s) — confirm to send.")
+        return msg
+
+    def set_feedback_fn(*, event_id, form_url=None, workbook_url=None):
+        """Impl 2: store the per-event feedback Form / responses-workbook links so each event
+        (with its own SharePoint site) reads/sends from its own sources."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        try:
+            with session_scope() as s:
+                EventRepository(s).set_feedback_sources(
+                    event_id, form_url=form_url, workbook_url=workbook_url)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"set feedback sources failed ({type(e).__name__}: {e})")
+            return "Couldn't save the feedback sources right now."
+        bits = []
+        if form_url:
+            bits.append("feedback form link")
+        if workbook_url:
+            bits.append("responses workbook link")
+        return f"Saved the {' and '.join(bits)} for this event."
+
     def role_resolver(*, user_id, scope, channel_id, event_id=None):
         """Membership-backed role (defense in depth). When an event is focused, the caller's
         real `EventMember.role` overrides the DM-host default — so the in-tool moderator gate
@@ -329,7 +492,7 @@ def build_orchestrator() -> Orchestrator:
 
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
-        update_task_fn, send_mail_fn,
+        update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
     )
 
     orch = Orchestrator(
@@ -360,7 +523,7 @@ def build_summarizer():
 
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
-    update_task_fn=None, send_mail_fn=None,
+    update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -388,7 +551,12 @@ def _build_runner_and_summarizer(
     # close over them — same DRY composition-root pattern as the other capability closures.
     event_context_fn = _build_event_context_fn(transcript, summarizer)
 
-    from eventbuddy.agent.tools import _no_send_mail, _no_update_task
+    from eventbuddy.agent.tools import (
+        _no_ingest,
+        _no_send_mail,
+        _no_set_feedback,
+        _no_update_task,
+    )
 
     deps = AgentDeps(
         session_store=session_store, provision_fn=provision_fn,
@@ -397,6 +565,8 @@ def _build_runner_and_summarizer(
         event_context_fn=event_context_fn,
         update_task_fn=update_task_fn or _no_update_task,
         send_mail_fn=send_mail_fn or _no_send_mail,
+        ingest_fn=ingest_fn or _no_ingest,
+        set_feedback_fn=set_feedback_fn or _no_set_feedback,
         debug=settings.agent_debug,
     )
     runner = build_agent_runner(

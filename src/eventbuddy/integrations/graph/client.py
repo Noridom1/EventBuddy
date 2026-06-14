@@ -1,6 +1,14 @@
+import base64
+
 import httpx
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _share_token(url: str) -> str:
+    """Encode a sharing URL into the Graph `shares/{token}` form (base64url, 'u!' prefix)."""
+    b64 = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    return "u!" + b64
 
 
 class GraphClient:
@@ -40,6 +48,66 @@ class GraphClient:
         }
         r = self._http.post(url, json=payload, headers=self._headers())
         r.raise_for_status()
+
+    def send_channel_card(self, team_id: str, channel_id: str, card: dict) -> dict:
+        """Post an Adaptive Card to a channel (used for proactive HITL proposals — e.g. the
+        ingestion bulk-invite). The card rides as a message attachment referenced from the
+        message body."""
+        import json
+
+        url = f"/teams/{team_id}/channels/{channel_id}/messages"
+        attachment_id = "1"
+        payload = {
+            "body": {
+                "contentType": "html",
+                "content": f'<attachment id="{attachment_id}"></attachment>',
+            },
+            "attachments": [{
+                "id": attachment_id,
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": json.dumps(card),
+            }],
+        }
+        r = self._http.post(url, json=payload, headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def get_channel_files_folder(self, team_id: str, channel_id: str) -> tuple[str, str]:
+        """Resolve a Teams channel's backing SharePoint folder → (drive_id, item_id)."""
+        url = f"/teams/{team_id}/channels/{channel_id}/filesFolder"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        return data["parentReference"]["driveId"], data["id"]
+
+    def list_children(self, drive_id: str, item_id: str) -> list[dict]:
+        """List the children (files + folders) of a drive item."""
+        url = f"/drives/{drive_id}/items/{item_id}/children"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        return r.json().get("value", [])
+
+    def resolve_share_url(self, url: str) -> tuple[str, str]:
+        """Resolve a SharePoint/OneDrive sharing URL → (drive_id, item_id) via /shares."""
+        api = f"/shares/{_share_token(url)}/driveItem"
+        r = self._http.get(api, headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        return data["parentReference"]["driveId"], data["id"]
+
+    def get_drive_item_content(self, drive_id: str, item_id: str) -> tuple[bytes, str, str]:
+        """Download a drive item → (bytes, filename, mime_type)."""
+        meta = self._http.get(f"/drives/{drive_id}/items/{item_id}", headers=self._headers())
+        meta.raise_for_status()
+        m = meta.json()
+        filename = m.get("name", "")
+        mime = (m.get("file") or {}).get("mimeType", "")
+        content = self._http.get(
+            f"/drives/{drive_id}/items/{item_id}/content",
+            headers=self._headers(), follow_redirects=True,
+        )
+        content.raise_for_status()
+        return content.content, filename, mime
 
     def create_channel(self, team_id: str, display_name: str, description: str = "") -> dict:
         url = f"/teams/{team_id}/channels"

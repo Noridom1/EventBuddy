@@ -81,6 +81,7 @@ def _runner_and_checkpointer():
 def test_create_event_tool_fires_and_persists():
     runner, _ = _runner_and_checkpointer()
     ctx = RequestContext(user_id="smoke-user", role="host", scope="personal")
+    runner.reset(ctx.thread_id)  # the conftest truncates Postgres but not the Redis window
     runner.run("create an event called Smoke Test with members a@x.com", ctx)
 
     with session_scope() as s:
@@ -92,6 +93,7 @@ def test_create_event_tool_fires_and_persists():
 def test_memory_carries_across_turns():
     runner, checkpointer = _runner_and_checkpointer()
     ctx = RequestContext(user_id="smoke-mem", role="host", scope="personal")
+    runner.reset(ctx.thread_id)  # start from a clean Redis working window
     runner.run("My favourite colour is teal. Remember it.", ctx)
     runner.run("What is my favourite colour?", ctx)
 

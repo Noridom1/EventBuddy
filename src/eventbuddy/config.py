@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # enough for the user to confirm the Adaptive Card, short enough to bound replay.
     pending_action_ttl: int = 60 * 60
 
+    # Feedback / report plane (Impl 2). FEEDBACK_FORM_URL is the templated *send* link the
+    # post-event jobs mail out ({event_id} is interpolated). FEEDBACK_WORKBOOK_URL is the
+    # SharePoint share link to the Form's *responses* Excel workbook — the chosen fetch path
+    # (MS Forms has no supported response API). Empty → that path degrades to "not configured".
+    feedback_form_url: str = ""
+    feedback_workbook_url: str = ""
+
     # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
     dev_routes_enabled: bool = False
 

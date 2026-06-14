@@ -19,6 +19,10 @@ class Event(Base):
     end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     registration_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Per-event feedback sources (Impl 2). Each event has its own Form + responses workbook
+    # (different SharePoint site per channel), so these override the global settings defaults.
+    feedback_form_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    feedback_workbook_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     host_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

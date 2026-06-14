@@ -110,6 +110,16 @@ def _no_send_mail(**_kw) -> str:
     return "Sending mail isn't available right now."
 
 
+def _no_ingest(**_kw) -> str:
+    """Default `ingest_fn` — document/SharePoint ingestion not wired (no Graph path)."""
+    return "File access isn't available right now."
+
+
+def _no_set_feedback(**_kw) -> str:
+    """Default `set_feedback_fn` — per-event feedback sources not wired (no DB path)."""
+    return "Setting feedback sources isn't available right now."
+
+
 @dataclass
 class AgentDeps:
     """The capability callables + app-state store the tools delegate to."""
@@ -127,6 +137,11 @@ class AgentDeps:
     # no-ops so the existing tests/no-DB path still build the tool set.
     update_task_fn: Callable = _no_update_task
     send_mail_fn: Callable = _no_send_mail
+    # Impl 2 (intelligence plane) — `ingest_event_files` pulls the channel's SharePoint files
+    # (or a pasted link) through the parse→structure→upsert pipeline. Default no-op.
+    ingest_fn: Callable = _no_ingest
+    # Impl 2 — `set_feedback_sources` stores the per-event Form / responses-workbook links.
+    set_feedback_fn: Callable = _no_set_feedback
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise (regex fallback).
     debug: bool = False
@@ -227,7 +242,37 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     def generate_report() -> str:
         """Generate the AI summary report for the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.user_id)
-        return deps.report_fn(event_id=event_id)
+        return deps.report_fn(event_id=event_id, user_id=ctx.user_id)
+
+    @tool
+    @traced
+    def ingest_event_files(link: str = "") -> str:
+        """Read the focused event's channel SharePoint files (or a specific SharePoint/OneDrive
+        `link` if given), extract members and tasks from them, and propose inviting anyone not
+        yet registered. Requires host or moderator and a focused event."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to ingest files (needs host or moderator)."
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.ingest_fn(event_id=event_id, user_id=ctx.user_id, url=link or "")
+
+    @tool
+    @traced
+    def set_feedback_sources(form_url: str = "", workbook_url: str = "") -> str:
+        """Set the focused event's feedback links: `form_url` is the MS Forms link sent to
+        attendees; `workbook_url` is the SharePoint link to that Form's *responses* Excel
+        workbook (used to read responses back for the report). Set either or both. Requires
+        host or moderator and a focused event."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to set feedback sources (needs host or moderator)."
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        if not (form_url or workbook_url):
+            return "Give me a Form link and/or a responses-workbook link to set."
+        return deps.set_feedback_fn(
+            event_id=event_id, form_url=form_url or None, workbook_url=workbook_url or None)
 
     @tool
     @traced
@@ -244,5 +289,5 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     return [
         create_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
-        generate_report, get_event_context,
+        generate_report, ingest_event_files, set_feedback_sources, get_event_context,
     ]
