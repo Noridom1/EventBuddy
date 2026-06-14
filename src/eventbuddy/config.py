@@ -14,8 +14,24 @@ class Settings(BaseSettings):
     # LLM (GreenNode MaaS, OpenAI-compatible)
     agentbase_llm_base_url: str = ""
     agentbase_llm_api_key: str = ""
-    llm_chat_model: str = "gemma-4-31b-it"
-    llm_summary_model: str = "qwen-3-27b"
+    # Model IDs are namespaced on the MaaS endpoint (verified 2026-06-12 — bare
+    # "gemma-4-31b-it"/"qwen-3-27b" return 404). qwen3-5-27b returns clean OpenAI
+    # tool_calls, so it's the chat brain for the Phase 1.7 tool-calling agent.
+    llm_chat_model: str = "qwen/qwen3-5-27b"
+    llm_summary_model: str = "qwen/qwen3-5-27b"
+
+    # Phase 1.7 conversational agent. "llm" = LLM tool-calling brain (requires the MaaS
+    # creds above); "regex" forces the deterministic Phase 1 router. Without LLM creds the
+    # chat path auto-degrades to regex regardless of this flag.
+    agent_mode: str = "llm"
+
+    # Phase 1.8 debug surfacing. When True (default this phase), the LLM agent never
+    # silently degrades to the regex router on a *runtime* error: instead the reply carries
+    # a debug footer listing every tool call this turn (name + params) with the full
+    # exception + traceback for any that failed. Set False to restore the silent regex
+    # fallback (and drop the footer). The no-creds / agent_mode=regex degradation is decided
+    # at wiring time and is unaffected by this flag.
+    agent_debug: bool = True
 
     # Microsoft Bot Framework
     microsoft_app_id: str = ""
@@ -28,6 +44,20 @@ class Settings(BaseSettings):
     graph_client_secret: str = ""
 
     log_level: str = "INFO"
+
+    # HITL action plane (Impl 1). TTL (seconds) of a prepared pending action in Redis: long
+    # enough for the user to confirm the Adaptive Card, short enough to bound replay.
+    pending_action_ttl: int = 60 * 60
+
+    # Feedback / report plane (Impl 2). FEEDBACK_FORM_URL is the templated *send* link the
+    # post-event jobs mail out ({event_id} is interpolated). FEEDBACK_WORKBOOK_URL is the
+    # SharePoint share link to the Form's *responses* Excel workbook — the chosen fetch path
+    # (MS Forms has no supported response API). Empty → that path degrades to "not configured".
+    feedback_form_url: str = ""
+    feedback_workbook_url: str = ""
+
+    # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
+    dev_routes_enabled: bool = False
 
 
 settings = Settings()

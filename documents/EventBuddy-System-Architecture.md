@@ -115,10 +115,11 @@ Each component has one purpose, a defined interface, and explicit dependencies.
 - **Key rule:** No event data is read or mutated until the gatekeeper confirms the `teams_user_id` exists in `event_members` for that `event_id` with sufficient role.
 
 ### 5.2 Agent Orchestration (`agent/`)
-- **Does:** Classifies intent, manages dialog/session state, resolves the active event context (explicit channel `event_id` or personal-scope `current_event_id`), and drives a LangGraph state machine that decides which tools to call.
+- **Does:** Holds a normal conversation and *invokes* event capabilities as **tools** via a LangGraph `create_react_agent` loop (LLM extracts the args); resolves the active event context (explicit channel `event_id` or personal-scope `current_event_id`); degrades to the deterministic regex router when LLM creds are absent or `agent_mode=regex`. *(See Phase 1.7 — `__plans__/05-phase1.7-conversational-agent.md`.)*
 - **Interface:** `agent.run(turn_context, session) -> AgentResult`.
-- **Depends on:** LLM gateway, Tool layer, Redis session store.
-- **Sub-parts:** `graph.py` (the state graph), `intents.py` (intent classification), `session.py` (Redis-backed `UserSession`), `prompts/` (system/templated prompts).
+- **Depends on:** `ChatOpenAI` → MaaS, Tool layer, the layered memory (Redis + Postgres).
+- **Sub-parts:** `runner.py` (`create_react_agent` behind a factory), `tools.py` (`@tool` wrappers, identity injected server-side), `memory.py` (Redis checkpointer + per-thread lock), `transcript.py` / `summarizer.py` (Postgres transcript + rolling summary), `intents.py` (regex fallback), `session.py` (Redis-backed `UserSession` app-state), `prompts/`.
+- **Layered memory (session-scoped):** each request binds to a `thread_id` — `event:{event_id}` for a **shared** channel/event session, `dm:{user_id}` for a **private** 1-1. Three layers: (1) **Redis working window** = LangGraph checkpointer holding the live message graph *with tool-call/result pairs intact*, trimmed to **≤4096 tokens** on user/assistant boundaries, 24h TTL; (2) **Postgres `conversation_messages`** = durable user/assistant transcript (tool noise dropped), the overflow + rehydration source — Redis-first, then Postgres; (3) **Postgres `session_summaries`** = rolling per-session summary of older turns, refreshed by a background APScheduler job, injected so long events keep early context within the 4096 budget. Shared `event:` threads tag each turn with the speaker and serialize concurrent runs with a per-thread Redis lock.
 
 ### 5.3 Tool / MCP Layer (`agent/tools/`)
 - **Does:** Exposes every agent action as a **typed tool** with a JSON schema. Tools are registered as targets behind the **AgentBase Resource Gateway**, which enforces inbound auth and per-action **Policy** (e.g. only `host`/`moderator` may trigger bulk mail).
@@ -270,10 +271,16 @@ All event-scoped tables carry `event_id` (FK → `events.event_id`) as a **manda
 
 **`audit_log`** — `log_id`, `event_id`, `actor_user_id`, `action`, `tool_name`, `payload_hash`, `result`, `created_at`. Records every HITL-confirmed action for traceability.
 
+**`conversation_messages`** — `id`, `thread_id` (`event:{event_id}` \| `dm:{user_id}`), `event_id?`, `role` (`user`\|`assistant`), `speaker_name?`, `content`, `created_at`. Durable transcript layer (layer 2): user/assistant turns only — tool calls/results are **not** stored. Overflow target when the Redis working window is trimmed, and the rehydration source on a Redis miss. Indexed by `(thread_id, created_at)`.
+
+**`session_summaries`** — `thread_id` (pk), `summary`, `covered_through`, `updated_at`. Rolling long-term memory (layer 3): a compact running summary of turns older than the rehydration tail, refreshed by the background `summarize_session` job and injected as context so long-running event sessions retain early context within the 4096-token budget.
+
 ### 6.3 Redis (ephemeral state)
 | Key pattern | Purpose | TTL |
 |-------------|---------|-----|
 | `session:{teams_user_id}` | `UserSession`: `current_event_id`, dialog state, last intent | 24h sliding |
+| `checkpoint:{thread_id}` | LangGraph working window (live message graph + tool pairs, ≤4096 tok); `thread_id` = `event:{event_id}` \| `dm:{user_id}` | 24h |
+| `lock:{thread_id}` | Per-session lock serializing concurrent runs on a shared `event:` thread | seconds |
 | `turn:{conversation_id}` | Bot Framework per-turn state | minutes |
 | `webhook:dedup:{notification_id}` | Drop duplicate Graph notifications | 1h |
 | `ratelimit:{user}:{action}` | Throttle reminders/mail | window |
@@ -289,15 +296,27 @@ All event-scoped tables carry `event_id` (FK → `events.event_id`) as a **manda
 ## 7. Key Flows
 
 ### 7.1 Event creation & channel provisioning
+
+The team leader creates an event **from their private 1-1 chat** with EventBuddy (not from inside a channel). They name the event and supply the member roster as a list of emails and/or whole domains to include.
+
 ```
-EO: "@EventBuddy create event 'AI Workshop' members: a@x.com, b@x.com"
- → Gatekeeper: caller is an EO        → allow
+(1-1 DM) Leader: "create event 'AI Workshop' members: a@x.com, b@x.com, @team.com"
+ → Gatekeeper: caller may create events → allow
  → Agent intent: CREATE_EVENT          → tool: provision_channel
  → Event service: INSERT events(status=ideation)
- → Graph: create Teams channel, add members, pin overview card
+ → Graph: create Teams channel, add the EventBuddy app + members, pin overview card
  → Member service: INSERT event_members(role=host/member, registration=pending)
- → Reply: pinned overview (name, objective, members, status=Ideation)
+ → Reply (in the DM): "Channel created — here's the overview" + deep link to the channel
 ```
+
+**Two entry paths to a channel↔event binding:**
+
+| Path | How | History |
+|------|-----|---------|
+| **A — agent-provisioned (primary)** | Leader runs the DM command above; the agent calls `create_channel` and adds itself + members. | No gap: the app is present from message #1. |
+| **B — manually-created channel** | A human makes the channel and adds the EventBuddy app via Teams' *Add an app*, then runs `bind this channel to <event>` (or the leader created it via path A). | ⚠ **A bot only receives messages sent *after* it was added.** Prior history is not delivered through the Activity feed. To backfill it, the app needs Graph `ChannelMessage.Read.All` via **RSC** (`channel.getAllMessages`) — a *protected* API requiring E5 / metered billing. Default stance: **add the app at channel creation** (path A) so there is no gap; treat history backfill as an optional, license-gated enhancement. |
+
+`events.teams_channel_id` (unique, nullable) is the binding key for both paths.
 
 ### 7.2 Document ingestion → proactive suggestion (HITL)
 ```
@@ -342,24 +361,30 @@ Event end_at passes → job feedback_send → Forms link to attendees
 
 ### 7.6 Personal-scope context switching
 ```
+DM: "create event 'AI Workshop' members: a@x.com, @team.com"  → provisions channel (§7.1 path A)
 DM: "focus on AI Workshop"   → session.current_event_id = <id>  (Redis)
 DM: "what tasks are due soon?"
  → all task queries + RAG implicitly filtered WHERE event_id = current_event_id
 DM (no focus set): "my tasks?" → aggregate across all events the user belongs to
+DM (no event match): general assistant / small talk
 ```
+The private 1-1 chat is both the **control plane** (leaders provision events and switch focus here) and a **general-purpose assistant** (everyday questions, plus event/task queries scoped to the focused event).
 
 ---
 
 ## 8. Agent Orchestration (LangGraph)
 
-The agent is a **state graph**, not a single prompt call. Nodes:
+The agent is an **LLM tool-calling loop** (`create_react_agent`, Phase 1.7), not a fixed
+classifier. Per request:
 
-1. **Authenticate/Gatekeep** — resolve user + event context; deny early if unauthorized.
-2. **Classify intent** — `CREATE_EVENT`, `SYNTHESIZE_IDEAS`, `REMIND`, `QUERY_TASKS`, `UPDATE_TASK`, `GENERATE_REPORT`, `INGEST_ACK`, `CONTEXT_SWITCH`, `SMALL_TALK`.
-3. **Resolve context** — explicit channel `event_id` vs personal `current_event_id` vs cross-event.
-4. **Plan & call tools** — function-calling loop; tools run through the Resource Gateway.
-5. **HITL gate** — for bulk/destructive tools, emit an Adaptive Card and *pause*; resume on the confirm activity.
-6. **Respond** — compose the Teams reply (text or Adaptive Card).
+1. **Build server context** — the orchestrator resolves identity/role/scope/focused-event into a `RequestContext` and the scope-aware `thread_id`. Identity is **never** a model-settable tool arg.
+2. **Run the ReAct loop** — the model chats normally and emits `tool_calls` only when the user wants an event action, extracting the arguments itself (replacing the old regex `classify()`, which remains the graceful fallback). The `pre_model_hook` trims the working window to ≤4096 tokens on user/assistant boundaries before each LLM call.
+3. **Enforce permissions in code** — mutating tools (`create_event`, `prepare_reminders`) run the `Gatekeeper`/role check *inside the tool body*; the model never decides authorization.
+4. **Ground & respond** — the reply is built on real tool results (no fabricated event names/ids); on LLM failure or `agent_mode=regex` the orchestrator degrades to the deterministic Phase 1 router.
+
+> HITL bulk/destructive flows (Adaptive Card propose → confirm activity) remain handled by the activity router, unchanged by Phase 1.7.
+
+**Conversation memory** is session-scoped and layered — Redis working window (≤4096 tok, tool pairs intact, 24h TTL) → Postgres `conversation_messages` transcript (user/assistant only; overflow + rehydration) → Postgres `session_summaries` rolling summary (background job). `thread_id` = `event:{event_id}` for a shared channel session, `dm:{user_id}` for a private 1-1. See §5.2 and `__plans__/05-phase1.7-conversational-agent.md`.
 
 **Session & context-switching:** `UserSession` (Redis) holds `current_event_id` + dialog state. Per the design rule:
 
@@ -640,8 +665,12 @@ Event creation + channel provisioning, Broadcast (Outlook+Teams), Registration d
 **Phase 1.5 — Auto Report + Suggestions (Day 5–6) [the differentiator]**
 Feedback sentiment/themes, metrics aggregation, Qwen summary + suggestions, report card + draft email. *Milestone: end-to-end demo (broadcast + reminder + report).*
 
-**Phase 2 — Proactive intelligence (post-hackathon)**
-Document ingestion pipeline + proactive Adaptive Cards (data-to-action), pgvector RAG, brainstorm synthesis, personal-scope assistant with context-switching, cross-event learning.
+**Phase 1.6 — Document ingestion (pulled into hackathon scope)**
+> Originally Phase 2; **pulled forward** because the flagship demo ("read the uploaded participant list + guide, then email everyone the doc link") depends on it. See `__plans__/04-amendments.md`.
+Graph file webhook → download → parse (xlsx/docx/pdf) → LLM-structure → upsert `documents` + extracted members/tasks → proactive HITL card → bulk send. *Milestone: upload a participant xlsx in the channel → agent offers to email the roster a guide link → one click sends.*
+
+**Phase 2 — Remaining proactive intelligence (post-hackathon)**
+pgvector RAG over docs + chat, brainstorm synthesis, full personal-scope memory, cross-event learning, passive channel-history awareness (RSC `getAllMessages`).
 
 **Phase 3 — Hardening**
 Resource Gateway + Policy rollout, full audit, subscription renewal robustness, observability dashboards, scale testing.

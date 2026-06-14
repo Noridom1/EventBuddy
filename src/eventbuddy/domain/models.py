@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,10 @@ class Event(Base):
     end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     registration_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Per-event feedback sources (Impl 2). Each event has its own Form + responses workbook
+    # (different SharePoint site per channel), so these override the global settings defaults.
+    feedback_form_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    feedback_workbook_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     host_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -105,6 +109,43 @@ class Report(Base):
     suggestions_md: Mapped[str | None] = mapped_column(Text, nullable=True)
     generated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ConversationMessage(Base):
+    """Durable transcript layer (Phase 1.7). User/assistant turns only — tool calls/results
+    are never persisted here. Overflow target when the Redis working window evicts turns,
+    and the rehydration source when the window is empty. `thread_id` is the scope-aware
+    session key (`event:{channel_id}` | `dm:{user_id}`)."""
+
+    __tablename__ = "conversation_messages"
+    __table_args__ = (Index("ix_conversation_thread_created", "thread_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    thread_id: Mapped[str] = mapped_column(String(200))
+    event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    role: Mapped[str] = mapped_column(String(20))  # "user" | "assistant"
+    speaker_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content: Mapped[str] = mapped_column(Text)
+    # Write/ordering field — synthetic per-flush time (strictly increasing within a flush).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Real send-time (Phase 1.9): from `activity.timestamp` for user turns, generation-time
+    # for assistant turns. Distinct from `created_at` (which is flush-ordering, not send-time).
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SessionSummary(Base):
+    """Rolling long-term summary (Phase 1.7) — a compact running gist of everything older
+    than the rehydration tail, so a long event keeps early context inside the 4096 budget.
+    `covered_through` is the watermark (last covered message's created_at)."""
+
+    __tablename__ = "session_summaries"
+    thread_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    covered_through: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
