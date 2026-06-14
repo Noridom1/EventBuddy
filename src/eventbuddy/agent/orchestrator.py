@@ -101,6 +101,6 @@ class Orchestrator:
 
         if c.intent == Intent.GENERATE_REPORT:
             event_id = self.session.get_current_event(user_id)
-            return self.report(event_id=event_id)
+            return self.report(event_id=event_id, user_id=user_id)
 
         return "Hi! Try: create event '<name>' members: a@x.com, or 'focus on <event>'."

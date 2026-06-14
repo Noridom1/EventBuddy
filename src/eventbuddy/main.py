@@ -36,6 +36,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(messages.router)
     app.include_router(webhooks.router)
+    from eventbuddy.api import forms
+    app.include_router(forms.router)
     if settings.dev_routes_enabled:
         from eventbuddy.api import dev
         app.include_router(dev.router)

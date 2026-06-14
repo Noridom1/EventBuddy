@@ -120,7 +120,14 @@ class AgentRunner:
         self._checkpointer = checkpointer
         self._prompt_fn = prompt_fn
         self._recursion_limit = recursion_limit
-        self._pre_model_hook = make_trimmer(token_counter or model, max_tokens)
+        if token_counter is None:
+            # Default to the model-agnostic approximate counter, NOT the chat model itself:
+            # langchain-openai's `get_num_tokens_from_messages` routes through tiktoken keyed
+            # on the model NAME and raises NotImplementedError for vendor-namespaced MaaS
+            # models (e.g. 'google/gemma-4-31b-it'). See model.make_token_counter.
+            from eventbuddy.agent.model import make_token_counter
+            token_counter = make_token_counter()
+        self._pre_model_hook = make_trimmer(token_counter, max_tokens)
         self._transcript = transcript
         self._summarizer = summarizer
         self._debug = debug

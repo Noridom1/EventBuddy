@@ -11,6 +11,10 @@ class EventRepository:
     def create(self, **kwargs) -> Event:
         ev = Event(**kwargs)
         self.s.add(ev)
+        # Flush so the `new_id` primary-key default fires now: callers (e.g. ProvisioningService)
+        # use `ev.event_id` immediately — for set_channel / add_many — within the same session,
+        # before the outer session_scope commit.
+        self.s.flush()
         return ev
 
     def get(self, event_id: str) -> Event | None:

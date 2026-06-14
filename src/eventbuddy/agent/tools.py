@@ -110,6 +110,11 @@ def _no_send_mail(**_kw) -> str:
     return "Sending mail isn't available right now."
 
 
+def _no_ingest(**_kw) -> str:
+    """Default `ingest_fn` — document/SharePoint ingestion not wired (no Graph path)."""
+    return "File access isn't available right now."
+
+
 @dataclass
 class AgentDeps:
     """The capability callables + app-state store the tools delegate to."""
@@ -127,6 +132,9 @@ class AgentDeps:
     # no-ops so the existing tests/no-DB path still build the tool set.
     update_task_fn: Callable = _no_update_task
     send_mail_fn: Callable = _no_send_mail
+    # Impl 2 (intelligence plane) — `ingest_event_files` pulls the channel's SharePoint files
+    # (or a pasted link) through the parse→structure→upsert pipeline. Default no-op.
+    ingest_fn: Callable = _no_ingest
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise (regex fallback).
     debug: bool = False
@@ -227,7 +235,20 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     def generate_report() -> str:
         """Generate the AI summary report for the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.user_id)
-        return deps.report_fn(event_id=event_id)
+        return deps.report_fn(event_id=event_id, user_id=ctx.user_id)
+
+    @tool
+    @traced
+    def ingest_event_files(link: str = "") -> str:
+        """Read the focused event's channel SharePoint files (or a specific SharePoint/OneDrive
+        `link` if given), extract members and tasks from them, and propose inviting anyone not
+        yet registered. Requires host or moderator and a focused event."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to ingest files (needs host or moderator)."
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.ingest_fn(event_id=event_id, user_id=ctx.user_id, url=link or "")
 
     @tool
     @traced
@@ -244,5 +265,5 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     return [
         create_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
-        generate_report, get_event_context,
+        generate_report, ingest_event_files, get_event_context,
     ]

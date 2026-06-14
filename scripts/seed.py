@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 
 from eventbuddy.data.db import session_scope
-from eventbuddy.domain.models import Event, EventMember, Task
+from eventbuddy.domain.models import Event, EventMember, FeedbackResponse, Task
 
 DEMO_EVENT_NAME = "Demo Workshop"
 
@@ -52,11 +52,26 @@ def seed(host_user_id: str, clean_only: bool = False) -> None:
 
         s.add_all([
             EventMember(event_id=ev.event_id, teams_user_id=host_user_id,
-                        email="lead@example.com", display_name="Demo Lead", role="host"),
+                        email="lead@example.com", display_name="Demo Lead", role="host",
+                        registration_status="registered"),
             EventMember(event_id=ev.event_id, email="huy@example.com",
-                        display_name="Huy", role="member"),
+                        display_name="Huy", role="member", registration_status="registered"),
             EventMember(event_id=ev.event_id, email="mai@example.com",
-                        display_name="Mai", role="member"),
+                        display_name="Mai", role="member", registration_status="pending"),
+        ])
+        # A few analyzed feedback responses so `generate report` has real data to aggregate
+        # (Implementation 2). respondent emails feed the feedback_followup non-responder logic.
+        s.add_all([
+            FeedbackResponse(
+                event_id=ev.event_id, respondent_id="lead@example.com",
+                raw_payload={"rating": 5, "comment": "Very practical content", "email":
+                             "lead@example.com"},
+                sentiment="positive", themes={"tags": ["content"]}),
+            FeedbackResponse(
+                event_id=ev.event_id, respondent_id="huy@example.com",
+                raw_payload={"rating": 2, "comment": "Sessions ran too long", "email":
+                             "huy@example.com"},
+                sentiment="negative", themes={"tags": ["timing"]}),
         ])
         s.add_all([
             Task(event_id=ev.event_id, task_name="Prepare slides", assignee_id=host_user_id,
@@ -68,7 +83,9 @@ def seed(host_user_id: str, clean_only: bool = False) -> None:
                  assignee_email="huy@example.com", status="todo"),
         ])
         print(f"Seeded '{DEMO_EVENT_NAME}' (id {ev.event_id}) — host={host_user_id}, "
-              f"3 members, 3 tasks. Focus it with: \"focus on {DEMO_EVENT_NAME}\".")
+              f"3 members, 3 tasks, 2 feedback responses. "
+              f"Focus it with: \"focus on {DEMO_EVENT_NAME}\", then try "
+              f"\"generate the report\".")
 
 
 if __name__ == "__main__":
