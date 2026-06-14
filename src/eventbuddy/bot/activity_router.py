@@ -23,6 +23,34 @@ def _scope_and_team(activity) -> tuple[str, str | None]:
     return "channel", team_id
 
 
+_CARD_PREFIX = "application/vnd.microsoft.card"
+
+
+def _attachments(activity) -> list[dict]:
+    """Lightweight descriptors for incoming file attachments (Impl 4). A file uploaded in
+    Teams arrives as `application/vnd.microsoft.teams.file.download.info` with a
+    pre-authenticated `content.downloadUrl`; a file dragged from SharePoint/OneDrive carries a
+    `contentUrl`. Adaptive-card and HTML (the message body) attachments are skipped. We carry
+    no bytes — a tool downloads on demand — so the model can't fabricate a file (rule 2)."""
+    out: list[dict] = []
+    for att in getattr(activity, "attachments", None) or []:
+        content_type = getattr(att, "content_type", None) or ""
+        if content_type.startswith(_CARD_PREFIX) or content_type == "text/html":
+            continue
+        content = att.content if isinstance(getattr(att, "content", None), dict) else {}
+        download_url = content.get("downloadUrl")
+        content_url = getattr(att, "content_url", None)
+        if not (download_url or content_url):
+            continue
+        out.append({
+            "name": getattr(att, "name", None) or content.get("fileName") or "",
+            "content_type": content_type,
+            "download_url": download_url,
+            "content_url": content_url,
+        })
+    return out
+
+
 class EventBuddyBot(ActivityHandler):
     def __init__(self):
         orchestrator = build_orchestrator()
@@ -59,6 +87,7 @@ class EventBuddyBot(ActivityHandler):
                     "scope": scope,
                     "team_id": team_id,
                     "sent_at": activity.timestamp,
+                    "attachments": _attachments(activity),
                 }
             )
         finally:
