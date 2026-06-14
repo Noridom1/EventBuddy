@@ -76,6 +76,12 @@ class Document(Base):
     drive_item_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     parse_status: Mapped[str] = mapped_column(String(20), default="pending")
+    # Generic file catalog (Impl 5): a short "what is this file / what's it for" summary and a
+    # coarse type classification, so the agent can browse files (list_event_files) and decide
+    # which to read. Filled at ingestion (text → chat LLM; image → vision model) or lazily on
+    # first read. Nullable — a file not yet understood lists by name/mime only.
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

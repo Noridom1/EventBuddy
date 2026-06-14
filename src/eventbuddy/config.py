@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     # tool_calls, so it's the chat brain for the Phase 1.7 tool-calling agent.
     llm_chat_model: str = "qwen/qwen3-5-27b"
     llm_summary_model: str = "qwen/qwen3-5-27b"
+    # Vision model for reading images / image-only PDFs (Impl 5). A SEPARATE model from the
+    # text chat brain — the agent's reasoning loop stays text-only; `read_event_file` makes an
+    # isolated multimodal call here and hands the resulting text back. `google/gemma-4-31b-it`
+    # is verified on the MaaS endpoint (accepts OpenAI image_url content; scripts/probe_vision.py,
+    # 2026-06-14). Empty model or LLM_VISION_ENABLED=false → image reading degrades cleanly while
+    # text files still read.
+    llm_vision_model: str = "google/gemma-4-31b-it"
+    llm_vision_enabled: bool = True
 
     # Phase 1.7 conversational agent. "llm" = LLM tool-calling brain (requires the MaaS
     # creds above); "regex" forces the deterministic Phase 1 router. Without LLM creds the

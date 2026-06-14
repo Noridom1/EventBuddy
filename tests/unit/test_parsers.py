@@ -51,12 +51,44 @@ def test_parse_docx_extracts_text():
 
 
 def test_parse_unsupported_extension():
-    assert parse("image.png", b"\x89PNG").kind == "unsupported"
+    assert parse("notes.rtf", b"junk").kind == "unsupported"
 
 
 def test_parse_pdf_garbage_degrades_to_unsupported():
     # Not a real PDF — the guarded parser must degrade, not raise.
     assert parse("broken.pdf", b"not a pdf").kind == "unsupported"
+
+
+# --- Impl 5: image / image-PDF -------------------------------------------------------------
+
+def test_parse_image_returns_image_kind_with_bytes():
+    doc = parse("flyer.png", b"\x89PNG-bytes")
+    assert doc.kind == "image"
+    assert doc.raw_bytes == b"\x89PNG-bytes"
+    assert doc.mime == "image/png"
+
+
+def test_parse_jpeg_maps_mime():
+    assert parse("photo.JPG", b"jpegbytes").mime == "image/jpeg"
+
+
+def test_parse_plaintext():
+    doc = parse("notes.txt", b"Hello\nWorld")
+    assert doc.kind == "txt"
+    assert doc.text == "Hello\nWorld"
+
+
+def test_empty_text_pdf_flagged_image_pdf():
+    import pypdf
+
+    buf = BytesIO()
+    w = pypdf.PdfWriter()
+    w.add_blank_page(width=200, height=200)  # a page with no extractable text
+    w.write(buf)
+    doc = parse("scan.pdf", buf.getvalue())
+    assert doc.kind == "image_pdf"
+    assert doc.raw_bytes is not None
+    assert doc.mime == "application/pdf"
 
 
 # --- Impl 4: CSV / TSV ---------------------------------------------------------------------

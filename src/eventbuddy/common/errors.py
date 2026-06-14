@@ -8,3 +8,7 @@ class NotAuthorizedError(EventBuddyError):
 
 class NotFoundError(EventBuddyError):
     """Requested entity does not exist."""
+
+
+class LLMError(EventBuddyError):
+    """An LLM call failed (chat/summarize/vision). Callers degrade gracefully."""

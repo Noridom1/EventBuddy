@@ -24,6 +24,12 @@ class _Extractor:
         }
 
 
+class _LLM:
+    """Understand step (Impl 5) — classify the file so the optional roster consumer runs."""
+    def chat(self, messages, model=None):
+        return '{"summary": "guest list", "doc_type": "roster"}'
+
+
 class _PendingStore:
     def __init__(self):
         self.payloads = []
@@ -49,6 +55,7 @@ def test_pipeline_upserts_members_tasks_and_proposes_invites():
         _Graph(), _Extractor(), pending_store=store,
         post_card=lambda channel_id, card: posted.append((channel_id, card)),
         parse=lambda f, c: ParsedDoc(kind="xlsx", filename=f, text="rows"),
+        llm=_LLM(),
     )
     res = pipe.ingest(drive_id="drv1", item_id="item-1", event_id=event_id)
 
@@ -74,6 +81,7 @@ def test_pipeline_skips_already_ingested_drive_item():
         _Graph(), _Extractor(), pending_store=_PendingStore(),
         post_card=lambda *a: None,
         parse=lambda f, c: ParsedDoc(kind="xlsx", filename=f, text="rows"),
+        llm=_LLM(),
     )
     first = pipe.ingest(drive_id="drv1", item_id="dup-1", event_id=event_id)
     second = pipe.ingest(drive_id="drv1", item_id="dup-1", event_id=event_id)
