@@ -1,8 +1,24 @@
 import base64
+import re
+from urllib.parse import quote
 
 import httpx
 
+from eventbuddy.config import settings
+
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(html: str) -> str:
+    """Collapse Teams message HTML to plain text (drop tags, unescape a few entities).
+    Good enough for feeding channel discussion to the model — not a full HTML parser."""
+    text = _TAG_RE.sub(" ", html or "")
+    for ent, ch in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                    ("&quot;", '"'), ("&#39;", "'")):
+        text = text.replace(ent, ch)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _share_token(url: str) -> str:
@@ -14,9 +30,11 @@ def _share_token(url: str) -> str:
 class GraphClient:
     """Thin typed wrapper over Microsoft Graph. All Microsoft writes go through here."""
 
-    def __init__(self, token_provider, http=None):
+    def __init__(self, token_provider, http=None, sender=None):
         self._token = token_provider
         self._http = http or httpx.Client(base_url=GRAPH_BASE, timeout=30)
+        # Mailbox to send as. Defaults to settings; overridable for tests.
+        self._sender = sender if sender is not None else settings.graph_sender_upn
 
     def _headers(self) -> dict:
         return {
@@ -37,8 +55,14 @@ class GraphClient:
         return r.json()
 
     def send_mail(self, subject: str, body_html: str, to: list[str]) -> None:
-        # ⚠ verify SDK: /me/sendMail vs /users/{id}/sendMail depending on app vs delegated perms.
-        url = "/me/sendMail"
+        # App (client-credentials) tokens have no "me" — send as the configured mailbox via
+        # /users/{upn}/sendMail. Mail.Send (application) should be scoped to this mailbox with
+        # an Application Access Policy. Missing sender → fail loud, not a confusing Graph 400.
+        if not self._sender:
+            raise ValueError(
+                "send_mail: no sender mailbox configured (set GRAPH_SENDER_UPN)"
+            )
+        url = f"/users/{quote(self._sender)}/sendMail"
         payload = {
             "message": {
                 "subject": subject,
@@ -71,6 +95,27 @@ class GraphClient:
         r = self._http.post(url, json=payload, headers=self._headers())
         r.raise_for_status()
         return r.json()
+
+    def list_channel_messages(
+        self, team_id: str, channel_id: str, limit: int = 30
+    ) -> list[dict]:
+        """Read a channel's recent top-level messages (Impl 3 — brainstorm). Returns
+        `[{author, text, created}]` newest-first as Graph returns them, HTML stripped to
+        plain text. Needs the `ChannelMessage.Read.Group` RSC permission. System messages and
+        empty bodies are dropped. Requires the real `team_id` (not the tenant id)."""
+        url = f"/teams/{team_id}/channels/{channel_id}/messages?$top={int(limit)}"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        out: list[dict] = []
+        for m in r.json().get("value", []):
+            if m.get("messageType") and m["messageType"] != "message":
+                continue  # skip systemEventMessage et al.
+            text = _strip_html((m.get("body") or {}).get("content", "")).strip()
+            if not text:
+                continue
+            author = (((m.get("from") or {}).get("user") or {}).get("displayName")) or "Unknown"
+            out.append({"author": author, "text": text, "created": m.get("createdDateTime")})
+        return out
 
     def get_channel_files_folder(self, team_id: str, channel_id: str) -> tuple[str, str]:
         """Resolve a Teams channel's backing SharePoint folder → (drive_id, item_id)."""

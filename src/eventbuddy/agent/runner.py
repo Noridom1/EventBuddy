@@ -18,6 +18,7 @@ from langchain_core.messages import (
 from langgraph.prebuilt import ToolNode, create_react_agent
 
 from eventbuddy.agent.context import RequestContext
+from eventbuddy.agent.errors import RETRYABLE, caused_by
 from eventbuddy.agent.prompts import system_prompt
 from eventbuddy.agent.tools import ToolCallRecord, begin_trace, end_trace
 from eventbuddy.agent.transcript import sent_at_prefix
@@ -27,6 +28,27 @@ log = get_logger("agent.runner")
 
 MAX_TOKENS = 4096
 RECURSION_LIMIT = 8
+
+# Model-facing guidance returned (as a ToolMessage) when a tool fails for a reason the model
+# can't fix by retrying — a system or configuration problem. The model relays a clean apology
+# to the user instead of looping. Tool-usage errors (the model's own fault) are handled
+# separately so the loop *can* retry them. Phase 1.8.
+_SYSTEM_ERROR_GUIDANCE = (
+    "That action couldn't be completed because of a system or configuration problem on the "
+    "server — not because of your tool arguments. Do NOT retry the tool. Briefly apologize to "
+    "the user and tell them the feature is currently unavailable; offer to try again later."
+)
+
+
+def _handle_tool_error(exc: Exception) -> str:
+    """ToolNode error policy. A tool-usage error (bad args/values — the model's fault) is
+    handed back so the model can correct the call and retry. Anything else is a system/config
+    failure a retry won't fix, so we return clean guidance the model relays to the user — no
+    retry, no regex fallback (the loop keeps ownership of the reply)."""
+    if caused_by(exc, RETRYABLE):
+        return f"That tool call was invalid: {exc}\nFix the arguments and call the tool again."
+    log.warning(f"tool system error ({type(exc).__name__}: {exc})")
+    return _SYSTEM_ERROR_GUIDANCE
 
 
 def _stamp(m: BaseMessage) -> BaseMessage:
@@ -182,12 +204,13 @@ class AgentRunner:
                 pass
 
     def run(self, text: str, ctx: RequestContext) -> str:
-        # `handle_tool_errors=False` so a raising tool body propagates instead of being
-        # swallowed by the ToolNode — our `_traced` wrapper already owns error behavior
-        # (soft-string + record in debug, re-raise otherwise). Phase 1.8.
+        # `handle_tool_errors=_handle_tool_error` classifies failures: tool-usage errors go
+        # back to the loop for a corrected retry; system/config errors return clean guidance
+        # the model relays to the user. `_traced` still records every failure for the debug
+        # footer (it re-raises in prod, which this handler then catches). Phase 1.8.
         agent = create_react_agent(
             self._model,
-            ToolNode(self._tools_factory(ctx), handle_tool_errors=False),
+            ToolNode(self._tools_factory(ctx), handle_tool_errors=_handle_tool_error),
             prompt=self._prompt_fn(ctx),
             checkpointer=self._checkpointer,
             pre_model_hook=self._pre_model_hook,

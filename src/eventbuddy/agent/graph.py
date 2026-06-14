@@ -9,6 +9,10 @@ class AgentState(TypedDict, total=False):
     channel_id: str | None
     text: str
     sent_at: datetime | None
+    # Conversation scope ("personal" | "channel") and the real Teams team id, derived from the
+    # inbound activity (Impl 3). Both default-safe: a missing scope is treated as "personal".
+    scope: str
+    team_id: str | None
     reply: str
 
 
@@ -18,7 +22,9 @@ def build_agent_graph(orchestrator):
             user_id=state["user_id"],
             channel_id=state.get("channel_id"),
             text=state["text"],
+            scope=state.get("scope", "personal"),
             sent_at=state.get("sent_at"),
+            team_id=state.get("team_id"),
         )
         return {"reply": reply}
 

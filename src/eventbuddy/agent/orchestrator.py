@@ -26,7 +26,7 @@ class Orchestrator:
     def __init__(self, *, session_store, provision_fn, resolve_event_fn,
                  remind_fn, report_fn, query_tasks_fn,
                  runner=None, agent_mode: str = "llm", role_resolver=None,
-                 regex_fallback_on_error: bool = True):
+                 channel_event_fn=None, regex_fallback_on_error: bool = True):
         self.session = session_store
         self.provision = provision_fn
         self.resolve_event = resolve_event_fn
@@ -36,14 +36,23 @@ class Orchestrator:
         self.runner = runner
         self.agent_mode = agent_mode
         self._role_resolver = role_resolver or _default_role
+        # Impl 3: in a channel, the focused event is the one bound to that channel (not the
+        # caller's DM focus); this closure resolves it and backfills the real team id. None →
+        # channel scope has no bound event (tests that build the orchestrator directly).
+        self._channel_event_fn = channel_event_fn
         # Phase 1.8: when False, a *runtime* LLM error is surfaced (debug) instead of
         # degrading to regex. The no-creds path (runner is None / agent_mode=regex) is
         # decided at wiring time and is unaffected by this flag.
         self._regex_fallback_on_error = regex_fallback_on_error
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
-                   sent_at: datetime | None) -> RequestContext:
-        event_id = self.session.get_current_event(user_id)
+                   sent_at: datetime | None, team_id: str | None = None) -> RequestContext:
+        # In a channel the focused event is whatever is bound to this channel (and we backfill
+        # its real team id on the way); in a DM it's the caller's session focus.
+        if scope == "channel" and channel_id and self._channel_event_fn is not None:
+            event_id = self._channel_event_fn(channel_id=channel_id, team_id=team_id)
+        else:
+            event_id = self.session.get_current_event(user_id)
         return RequestContext(
             user_id=user_id,
             channel_id=channel_id,
@@ -56,12 +65,13 @@ class Orchestrator:
         )
 
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
-               scope: str = "personal", sent_at: datetime | None = None) -> str:
-        # `sent_at` (Phase 1.9) is additive + keyword-defaulted so existing callers that
-        # don't pass the ingress timestamp keep working (the stable-signature rule).
+               scope: str = "personal", sent_at: datetime | None = None,
+               team_id: str | None = None) -> str:
+        # `sent_at` (Phase 1.9) + `team_id` (Impl 3) are additive + keyword-defaulted so
+        # existing callers that don't pass them keep working (the stable-signature rule).
         if self.agent_mode == "llm" and self.runner is not None:
             try:
-                ctx = self._build_ctx(user_id, channel_id, scope, sent_at)
+                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id)
                 return self.runner.run(text, ctx)
             except Exception as e:  # noqa: BLE001
                 if not self._regex_fallback_on_error:

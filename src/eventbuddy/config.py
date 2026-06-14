@@ -37,11 +37,20 @@ class Settings(BaseSettings):
     microsoft_app_id: str = ""
     microsoft_app_password: str = ""
     microsoft_app_tenant_id: str = ""
+    # The Teams team/group id to create event channels under, and the fallback for channel
+    # Graph calls before an event's real `teams_team_id` is observed (Impl 3). Distinct from
+    # the tenant id; empty → fall back to the tenant id for back-compat (single-team demo).
+    microsoft_team_id: str = ""
 
     # Microsoft Graph (client-credentials baseline; AgentBase Identity later)
     graph_tenant_id: str = ""
     graph_client_id: str = ""
     graph_client_secret: str = ""
+    # Sender mailbox for outbound mail. With *application* Graph permissions there is no "me",
+    # so `send_mail` posts as /users/{graph_sender_upn}/sendMail. This is the mailbox an
+    # Application Access Policy should scope Mail.Send to (UPN or email, e.g. eventbuddy@corp).
+    # Empty → the mail capability raises a clear "sender not configured" error (degrades visibly).
+    graph_sender_upn: str = ""
 
     log_level: str = "INFO"
 
@@ -55,6 +64,13 @@ class Settings(BaseSettings):
     # (MS Forms has no supported response API). Empty → that path degrades to "not configured".
     feedback_form_url: str = ""
     feedback_workbook_url: str = ""
+
+    # Agentic web tools (Impl 3). Tavily powers both `web_search` (ranked snippets) and
+    # `web_fetch` (clean page extraction). Empty key → the web tools are not registered, so
+    # the agent simply doesn't advertise a capability it can't fulfil (graceful degradation).
+    tavily_api_key: str = ""
+    web_search_max_results: int = 5
+    web_search_timeout: int = 15
 
     # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
     dev_routes_enabled: bool = False

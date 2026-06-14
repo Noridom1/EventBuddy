@@ -5,6 +5,24 @@ from eventbuddy.agent.wiring import build_orchestrator
 from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
 
 
+def _scope_and_team(activity) -> tuple[str, str | None]:
+    """Derive conversation scope + the real Teams team id from a Bot Framework activity
+    (Impl 3). A channel message has `conversation.conversation_type == "channel"` and carries
+    the team id in `channel_data.team.id`; everything else is treated as a 1-1 "personal"
+    chat. Group chats are not channels (no team/SharePoint backing), so they stay personal."""
+    conv = activity.conversation
+    conv_type = getattr(conv, "conversation_type", None) if conv else None
+    if conv_type != "channel":
+        return "personal", None
+    team_id = None
+    data = activity.channel_data
+    if isinstance(data, dict):
+        team = data.get("team")
+        if isinstance(team, dict):
+            team_id = team.get("id")
+    return "channel", team_id
+
+
 class EventBuddyBot(ActivityHandler):
     def __init__(self):
         orchestrator = build_orchestrator()
@@ -26,6 +44,9 @@ class EventBuddyBot(ActivityHandler):
 
         user_id = activity.from_property.id if activity.from_property else "unknown"
         channel_id = activity.conversation.id if activity.conversation else None
+        # Scope + team id (Impl 3). Without this, every message — even one in a channel — was
+        # treated as a DM, and channel Graph calls used the tenant id instead of the team id.
+        scope, team_id = _scope_and_team(activity)
         # `activity.timestamp` is the channel-set send-time (UTC) — Phase 1.9 keeps it
         # instead of discarding it, so the agent can reason about when messages were sent.
         artifacts, token = begin_artifacts()
@@ -35,6 +56,8 @@ class EventBuddyBot(ActivityHandler):
                     "user_id": user_id,
                     "channel_id": channel_id,
                     "text": activity.text or "",
+                    "scope": scope,
+                    "team_id": team_id,
                     "sent_at": activity.timestamp,
                 }
             )

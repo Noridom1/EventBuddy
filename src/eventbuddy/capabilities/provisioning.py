@@ -14,6 +14,10 @@ class ProvisioningService:
         channel = self.graph.create_channel(self.team_id, display_name=name,
                                              description=objective)
         self.events.set_channel(event.event_id, channel["id"])
+        # Persist the real team id now (Impl 3) so later channel sends/reads use it instead of
+        # the tenant id. `self.team_id` is the team the channel was just created under.
+        if self.team_id:
+            self.events.set_team_id(event.event_id, self.team_id)
         roster = [{"email": e, "role": "member"} for e in member_emails]
         roster.append({"email": host_user_id, "role": "host", "teams_user_id": host_user_id})
         self.members.add_many(event.event_id, roster)
