@@ -27,7 +27,7 @@
     {
       "botId": "REPLACE_WITH_ENTRA_APP_ID",
       "scopes": ["personal", "team"],
-      "supportsFiles": false,
+      "supportsFiles": true,
       "isNotificationOnly": false,
       "commandLists": [
         {
