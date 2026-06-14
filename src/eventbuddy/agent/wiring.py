@@ -219,6 +219,9 @@ def build_orchestrator() -> Orchestrator:
                 if ev is None:
                     return "I couldn't find that event anymore."
                 event_name = ev.event_name
+                channel_id = ev.teams_channel_id
+                # Per-event workbook (Option 1) wins; fall back to the global setting.
+                workbook_url = ev.feedback_workbook_url or settings.feedback_workbook_url
                 members = MemberRepository(s).list(event_id)
                 manager_emails = [
                     m.email for m in members
@@ -227,14 +230,22 @@ def build_orchestrator() -> Orchestrator:
                 feedback_repo = FeedbackRepository(s)
                 llm = LLMGateway()
                 # Fetch fresh Form responses from the responses workbook (the chosen path).
-                if settings.feedback_workbook_url and _graph_creds():
+                if _graph_creds():
                     try:
+                        from eventbuddy.capabilities.forms_sync import discover_workbook
                         from eventbuddy.integrations.graph.client import GraphClient
                         from eventbuddy.integrations.graph.token import MsalTokenProvider
-                        FormsResponseSync(
-                            GraphClient(MsalTokenProvider()), feedback_repo,
-                            FeedbackAnalyzer(llm),
-                        ).sync(event_id=event_id, workbook_url=settings.feedback_workbook_url)
+                        graph = GraphClient(MsalTokenProvider())
+                        syncer = FormsResponseSync(graph, feedback_repo, FeedbackAnalyzer(llm))
+                        if workbook_url:
+                            syncer.sync(event_id=event_id, workbook_url=workbook_url)
+                        elif channel_id:
+                            # Option 2: best-effort discovery from the channel's SharePoint.
+                            found = discover_workbook(
+                                graph, settings.microsoft_app_tenant_id, channel_id)
+                            if found:
+                                syncer.sync_drive_item(
+                                    event_id=event_id, drive_id=found[0], item_id=found[1])
                         s.flush()
                     except Exception as e:  # noqa: BLE001
                         log.warning(f"forms sync skipped ({type(e).__name__}: {e})")
@@ -403,6 +414,25 @@ def build_orchestrator() -> Orchestrator:
                     f"{summary['invited_proposed']} member(s) — confirm to send.")
         return msg
 
+    def set_feedback_fn(*, event_id, form_url=None, workbook_url=None):
+        """Impl 2: store the per-event feedback Form / responses-workbook links so each event
+        (with its own SharePoint site) reads/sends from its own sources."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        try:
+            with session_scope() as s:
+                EventRepository(s).set_feedback_sources(
+                    event_id, form_url=form_url, workbook_url=workbook_url)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"set feedback sources failed ({type(e).__name__}: {e})")
+            return "Couldn't save the feedback sources right now."
+        bits = []
+        if form_url:
+            bits.append("feedback form link")
+        if workbook_url:
+            bits.append("responses workbook link")
+        return f"Saved the {' and '.join(bits)} for this event."
+
     def role_resolver(*, user_id, scope, channel_id, event_id=None):
         """Membership-backed role (defense in depth). When an event is focused, the caller's
         real `EventMember.role` overrides the DM-host default — so the in-tool moderator gate
@@ -462,7 +492,7 @@ def build_orchestrator() -> Orchestrator:
 
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
-        update_task_fn, send_mail_fn, ingest_fn,
+        update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
     )
 
     orch = Orchestrator(
@@ -493,7 +523,7 @@ def build_summarizer():
 
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
-    update_task_fn=None, send_mail_fn=None, ingest_fn=None,
+    update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -521,7 +551,12 @@ def _build_runner_and_summarizer(
     # close over them — same DRY composition-root pattern as the other capability closures.
     event_context_fn = _build_event_context_fn(transcript, summarizer)
 
-    from eventbuddy.agent.tools import _no_ingest, _no_send_mail, _no_update_task
+    from eventbuddy.agent.tools import (
+        _no_ingest,
+        _no_send_mail,
+        _no_set_feedback,
+        _no_update_task,
+    )
 
     deps = AgentDeps(
         session_store=session_store, provision_fn=provision_fn,
@@ -531,6 +566,7 @@ def _build_runner_and_summarizer(
         update_task_fn=update_task_fn or _no_update_task,
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
+        set_feedback_fn=set_feedback_fn or _no_set_feedback,
         debug=settings.agent_debug,
     )
     runner = build_agent_runner(

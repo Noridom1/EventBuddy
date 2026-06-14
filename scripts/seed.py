@@ -46,6 +46,9 @@ def seed(host_user_id: str, clean_only: bool = False) -> None:
             host_user_id=host_user_id,
             start_at=now + timedelta(days=3, hours=2),
             end_at=now + timedelta(days=3, hours=5),
+            # Per-event feedback sources (Impl 2). Form link is a demo placeholder; set the
+            # responses-workbook link live via "set the feedback workbook to <SharePoint link>".
+            feedback_form_url="https://forms.office.com/r/demo-feedback",
         )
         s.add(ev)
         s.flush()  # assign ev.event_id

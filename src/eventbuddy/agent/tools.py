@@ -115,6 +115,11 @@ def _no_ingest(**_kw) -> str:
     return "File access isn't available right now."
 
 
+def _no_set_feedback(**_kw) -> str:
+    """Default `set_feedback_fn` — per-event feedback sources not wired (no DB path)."""
+    return "Setting feedback sources isn't available right now."
+
+
 @dataclass
 class AgentDeps:
     """The capability callables + app-state store the tools delegate to."""
@@ -135,6 +140,8 @@ class AgentDeps:
     # Impl 2 (intelligence plane) — `ingest_event_files` pulls the channel's SharePoint files
     # (or a pasted link) through the parse→structure→upsert pipeline. Default no-op.
     ingest_fn: Callable = _no_ingest
+    # Impl 2 — `set_feedback_sources` stores the per-event Form / responses-workbook links.
+    set_feedback_fn: Callable = _no_set_feedback
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise (regex fallback).
     debug: bool = False
@@ -252,6 +259,23 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
+    def set_feedback_sources(form_url: str = "", workbook_url: str = "") -> str:
+        """Set the focused event's feedback links: `form_url` is the MS Forms link sent to
+        attendees; `workbook_url` is the SharePoint link to that Form's *responses* Excel
+        workbook (used to read responses back for the report). Set either or both. Requires
+        host or moderator and a focused event."""
+        if not _role_allows(ctx, "moderator"):
+            return "You don't have permission to set feedback sources (needs host or moderator)."
+        event_id = deps.session_store.get_current_event(ctx.user_id)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        if not (form_url or workbook_url):
+            return "Give me a Form link and/or a responses-workbook link to set."
+        return deps.set_feedback_fn(
+            event_id=event_id, form_url=form_url or None, workbook_url=workbook_url or None)
+
+    @tool
+    @traced
     def get_event_context() -> str:
         """Fetch the latest shared discussion, decisions, and open questions from the
         currently focused event. Use when you need up-to-date context about the event the
@@ -265,5 +289,5 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     return [
         create_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
-        generate_report, ingest_event_files, get_event_context,
+        generate_report, ingest_event_files, set_feedback_sources, get_event_context,
     ]

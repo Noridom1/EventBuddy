@@ -99,9 +99,10 @@ def _default_feedback_sender(event_id: str) -> int:
         if ev is None:
             return 0
         event_name = ev.event_name
+        event_form_url = ev.feedback_form_url  # per-event link (Option 1) wins
         emails = [m.email for m in MemberRepository(s).list(event_id) if m.email]
 
-    form_link = _feedback_form_link(event_id)
+    form_link = event_form_url or _feedback_form_link(event_id)
     if not form_link or not _graph_creds():
         with session_scope() as s:
             ScheduledJobRepository(s).set_status(
@@ -136,11 +137,12 @@ def _default_followup_sender(event_id: str) -> int:
         if ev is None:
             return 0
         event_name = ev.event_name
+        event_form_url = ev.feedback_form_url  # per-event link (Option 1) wins
         member_emails = [m.email for m in MemberRepository(s).list(event_id) if m.email]
         responded = FeedbackRepository(s).respondent_emails(event_id)
     non_responders = _non_responders(member_emails, responded)
 
-    form_link = _feedback_form_link(event_id)
+    form_link = event_form_url or _feedback_form_link(event_id)
     if not form_link or not _graph_creds():
         with session_scope() as s:
             ScheduledJobRepository(s).set_status(
