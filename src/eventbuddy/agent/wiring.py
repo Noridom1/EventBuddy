@@ -23,6 +23,19 @@ def _graph_creds() -> bool:
     )
 
 
+def _team_id_for(ev) -> str | None:
+    """The Teams team id to use for a channel Graph call (Impl 3 — the "wide" tenant→team
+    fix). Prefer the event's stored `teams_team_id`; fall back to the configured team id, then
+    the tenant id for back-compat. `ev=None` yields just the configured fallback. Never returns
+    the tenant id when the event already has its real team id."""
+    return (
+        getattr(ev, "teams_team_id", None)
+        or settings.microsoft_team_id
+        or settings.microsoft_app_tenant_id
+        or None
+    )
+
+
 def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, str]:
     """Pure dispatch for a confirmed HITL action: perform the Microsoft Graph send and return
     `(ok, summary)`. Module-level (not a closure) so it's unit-testable with a fake Graph.
@@ -36,8 +49,10 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
         channel_id = payload.get("channel_id")
         if not channel_id:
             return False, "This event has no Teams channel to post to."
+        # Use the event's real team id (carried on the payload), not the tenant id (Impl 3).
+        team_id = payload.get("team_id") or _team_id_for(None)
         graph.send_channel_message(
-            settings.microsoft_app_tenant_id, channel_id,
+            team_id, channel_id,
             f"⏰ Reminder: '{payload.get('task_name')}' for {event_name} is due soon.",
         )
         return True, "✅ Posted the reminder to the event channel."
@@ -121,6 +136,86 @@ def _build_event_context_fn(transcript, summarizer):
     return event_context_fn
 
 
+def _build_channel_event_fn():
+    """The channel-scope event resolver (Impl 3). In a channel the focused event is the one
+    bound to that channel — resolve it and backfill its real Teams team id on first sight.
+    Module-level + lazy session import so tests can redirect `session_scope` to sqlite (same
+    pattern as `_build_event_context_fn`)."""
+    def channel_event_fn(*, channel_id, team_id=None):
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        try:
+            with session_scope() as s:
+                repo = EventRepository(s)
+                ev = repo.by_channel(channel_id)
+                if ev is None:
+                    return None
+                if team_id and not ev.teams_team_id:
+                    repo.set_team_id(ev.event_id, team_id)  # backfill, idempotent
+                return ev.event_id
+        except Exception as e:  # noqa: BLE001 — never break the turn over a lookup
+            log.warning(f"channel event resolve failed ({type(e).__name__}: {e})")
+            return None
+
+    return channel_event_fn
+
+
+def _default_graph():
+    from eventbuddy.integrations.graph.client import GraphClient
+    from eventbuddy.integrations.graph.token import MsalTokenProvider
+    return GraphClient(MsalTokenProvider())
+
+
+def _build_read_channel_fn(graph_factory=None):
+    """The brainstorm channel read (Impl 3, Part 3). Reads the focused event channel's recent
+    messages, membership-guarded, wrapping the result as untrusted external content. Degrades
+    to a clean message (never raises). `graph_factory` is injectable for tests; defaults to a
+    real Graph client. Module-level + lazy `session_scope` import so tests can sqlite-redirect."""
+    graph_factory = graph_factory or _default_graph
+
+    def read_channel_discussion_fn(*, user_id, event_id, limit=30):
+        from eventbuddy.agent.tools import wrap_untrusted
+        if not event_id:
+            return ("Focus on the event whose channel you want me to read first "
+                    "(e.g. 'focus on AI Workshop').")
+        if not _graph_creds():
+            return "I can't read channel messages yet — Microsoft Graph isn't configured."
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.data.repositories.members import MemberRepository
+        try:
+            with session_scope() as s:
+                ev = EventRepository(s).get(event_id)
+                if ev is None:
+                    return "I couldn't find that event anymore."
+                team_id, channel_id, event_name = (
+                    ev.teams_team_id, ev.teams_channel_id, ev.event_name)
+                is_member = MemberRepository(s).get_by_user(event_id, user_id) is not None
+                is_host = ev.host_user_id == user_id
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"channel read prep failed ({type(e).__name__}: {e})")
+            return "I couldn't read the channel right now — please try again shortly."
+        if not channel_id:
+            return "This event has no Teams channel bound, so there's no discussion to read."
+        if not team_id:
+            return ("I can't read this channel's messages yet — I haven't seen its Teams team "
+                    "id. Post once in the channel and try again.")
+        if not (is_member or is_host):
+            return "You're not a member of this event, so I can't share its channel discussion."
+        try:
+            msgs = graph_factory().list_channel_messages(team_id, channel_id, limit)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"channel read failed ({type(e).__name__}: {e})")
+            return "I couldn't read the channel right now — please try again shortly."
+        if not msgs:
+            return f"There are no recent messages in the channel for '{event_name}'."
+        # Graph returns newest-first; show oldest-first so the discussion reads naturally.
+        body = "\n".join(f"{m['author']}: {m['text']}" for m in reversed(msgs))
+        return wrap_untrusted(f"Teams channel discussion for '{event_name}'", body)
+
+    return read_channel_discussion_fn
+
+
 def build_orchestrator() -> Orchestrator:
     """Compose the production orchestrator. Phase 1.7 routes the conversation through an
     LLM tool-calling runner (create_react_agent + layered memory); the same capability
@@ -140,7 +235,7 @@ def build_orchestrator() -> Orchestrator:
         with session_scope() as s:
             svc = ProvisioningService(
                 EventRepository(s), MemberRepository(s),
-                GraphClient(MsalTokenProvider()), team_id=settings.microsoft_app_tenant_id,
+                GraphClient(MsalTokenProvider()), team_id=_team_id_for(None),
             )
             ev = svc.create_event(**kw)
             s.flush()
@@ -172,6 +267,7 @@ def build_orchestrator() -> Orchestrator:
                     return "I couldn't find that event anymore."
                 recipients = [m.email for m in MemberRepository(s).list(event_id) if m.email]
                 event_name, channel_id = ev.event_name, ev.teams_channel_id
+                team_id = _team_id_for(ev)
         except Exception as e:  # noqa: BLE001
             log.warning(f"reminder prep failed ({type(e).__name__}: {e})")
             return "Reminders are temporarily unavailable — please try again."
@@ -180,7 +276,7 @@ def build_orchestrator() -> Orchestrator:
         task_name = (raw or "").strip() or "your tasks"
         payload = {
             "type": "remind", "event_id": event_id, "event_name": event_name,
-            "channel_id": channel_id, "requested_by": user_id,
+            "channel_id": channel_id, "team_id": team_id, "requested_by": user_id,
             "task_name": task_name, "recipient_emails": recipients, "note": raw,
         }
         try:
@@ -242,7 +338,7 @@ def build_orchestrator() -> Orchestrator:
                         elif channel_id:
                             # Option 2: best-effort discovery from the channel's SharePoint.
                             found = discover_workbook(
-                                graph, settings.microsoft_app_tenant_id, channel_id)
+                                graph, _team_id_for(ev), channel_id)
                             if found:
                                 syncer.sync_drive_item(
                                     event_id=event_id, drive_id=found[0], item_id=found[1])
@@ -379,8 +475,13 @@ def build_orchestrator() -> Orchestrator:
         from eventbuddy.integrations.llm.client import LLMGateway
 
         try:
+            # Resolve the event's real team id + channel up front (Impl 3 — channel Graph
+            # calls need the team id, not the tenant id).
+            with session_scope() as s:
+                ev = EventRepository(s).get(event_id)
+                channel_id = ev.teams_channel_id if ev else None
+                team_id = _team_id_for(ev) if ev else _team_id_for(None)
             graph = GraphClient(MsalTokenProvider())
-            team_id = settings.microsoft_app_tenant_id
 
             def post_card(channel_id, card):
                 graph.send_channel_card(team_id, channel_id, card)
@@ -393,9 +494,6 @@ def build_orchestrator() -> Orchestrator:
             if url:
                 summary = svc.ingest_link(event_id=event_id, url=url)
             else:
-                with session_scope() as s:
-                    ev = EventRepository(s).get(event_id)
-                    channel_id = ev.teams_channel_id if ev else None
                 if not channel_id:
                     return "This event has no Teams channel bound, so I can't read its files."
                 summary = svc.sync_channel(event_id=event_id, channel_id=channel_id)
@@ -432,6 +530,25 @@ def build_orchestrator() -> Orchestrator:
         if workbook_url:
             bits.append("responses workbook link")
         return f"Saved the {' and '.join(bits)} for this event."
+
+    def list_events_fn(*, user_id, current_event_id=None):
+        """Impl 3: list the caller's events (member or host) with status + role, marking the
+        focused one. Read-only; scoped to the caller's own membership."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        try:
+            with session_scope() as s:
+                rows = EventRepository(s).list_for_user(user_id)
+                lines = []
+                for ev, role in rows:
+                    star = " ⭐ focused" if ev.event_id == current_event_id else ""
+                    lines.append(f"• {ev.event_name} — {ev.status} (your role: {role}){star}")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"list events failed ({type(e).__name__}: {e})")
+            return "I couldn't look up your events right now — please try again."
+        if not lines:
+            return "You're not part of any events yet."
+        return "Your events:\n" + "\n".join(lines)
 
     def role_resolver(*, user_id, scope, channel_id, event_id=None):
         """Membership-backed role (defense in depth). When an event is focused, the caller's
@@ -490,9 +607,36 @@ def build_orchestrator() -> Orchestrator:
         _audit("sent" if ok else "failed")
         return ok, summary
 
+    # Agentic web tools (Impl 3) — only when Tavily is configured; otherwise the closures stay
+    # None and the tools aren't registered (graceful degradation).
+    web_search_fn = web_fetch_fn = None
+    if settings.tavily_api_key:
+        from eventbuddy.agent.tools import wrap_untrusted
+        from eventbuddy.integrations.web.client import WebSearchClient
+        web_client = WebSearchClient()
+
+        def web_search_fn(*, query):
+            results = web_client.search(query)
+            if not results:
+                return "No web results found (the search returned nothing or is unavailable)."
+            body = "\n\n".join(
+                f"[{i + 1}] {r['title']}\n{r['url']}\n{r['snippet']}"
+                for i, r in enumerate(results)
+            )
+            return wrap_untrusted(f"web search: {query}", body)
+
+        def web_fetch_fn(*, url):
+            page = web_client.fetch(url)
+            if not page or not page.get("content"):
+                return f"Couldn't fetch readable content from {url}."
+            return wrap_untrusted(f"web page: {url}", page["content"])
+
+    channel_event_fn = _build_channel_event_fn()
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
+        list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
+        web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
     )
 
     orch = Orchestrator(
@@ -500,7 +644,7 @@ def build_orchestrator() -> Orchestrator:
         resolve_event_fn=resolve_event_fn, remind_fn=remind_fn,
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         runner=runner, agent_mode=settings.agent_mode if runner else "regex",
-        role_resolver=role_resolver,
+        role_resolver=role_resolver, channel_event_fn=channel_event_fn,
         regex_fallback_on_error=not settings.agent_debug,
     )
     orch.summarizer = summarizer  # exposed so main.py can schedule the consolidation job
@@ -524,6 +668,7 @@ def build_summarizer():
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
+    list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -553,6 +698,8 @@ def _build_runner_and_summarizer(
 
     from eventbuddy.agent.tools import (
         _no_ingest,
+        _no_list_events,
+        _no_read_channel,
         _no_send_mail,
         _no_set_feedback,
         _no_update_task,
@@ -567,6 +714,10 @@ def _build_runner_and_summarizer(
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
         set_feedback_fn=set_feedback_fn or _no_set_feedback,
+        list_events_fn=list_events_fn or _no_list_events,
+        read_channel_fn=read_channel_fn or _no_read_channel,
+        web_search_fn=web_search_fn,
+        web_fetch_fn=web_fetch_fn,
         debug=settings.agent_debug,
     )
     runner = build_agent_runner(

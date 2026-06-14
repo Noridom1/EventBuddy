@@ -32,6 +32,11 @@ class HandleRequest(BaseModel):
     text: str
     user_id: str = "dev-user"
     reset: bool = False
+    # Impl 3: exercise channel scope (brainstorm) over HTTP without the Emulator. Defaults
+    # keep the route DM-scoped as before.
+    scope: str = "personal"
+    channel_id: str | None = None
+    team_id: str | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -57,7 +62,8 @@ async def dev_handle(
         artifacts, token = begin_artifacts()
         try:
             reply = orch.handle(
-                user_id=body.user_id, channel_id=None, text=body.text, scope="personal",
+                user_id=body.user_id, channel_id=body.channel_id, text=body.text,
+                scope=body.scope, team_id=body.team_id,
                 sent_at=datetime.now(UTC),  # dev turns stamped "now" so L2 carries a send-time
             )
         finally:

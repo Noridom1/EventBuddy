@@ -13,6 +13,11 @@ class Event(Base):
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     event_name: Mapped[str] = mapped_column(String(255))
     teams_channel_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    # The real Teams team/group id this channel lives under (Impl 3). Distinct from the
+    # tenant id — Graph channel calls need `/teams/{team_id}/channels/{channel_id}`. Captured
+    # from `activity.channel_data.team.id` and backfilled on first channel message; nullable
+    # so events created before it's known still work (channel reads degrade until populated).
+    teams_team_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="ideation")
     objective: Mapped[str | None] = mapped_column(Text, nullable=True)
     start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

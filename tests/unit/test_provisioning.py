@@ -7,6 +7,7 @@ class _EventRepo:
         self.created = type("E", (), {"event_id": "ev1", **kw})()
         return self.created
     def set_channel(self, event_id, channel_id): self.created.teams_channel_id = channel_id
+    def set_team_id(self, event_id, team_id): self.created.teams_team_id = team_id
 
 
 class _MemberRepo:
@@ -26,5 +27,7 @@ def test_create_event_provisions_channel_and_members():
                               member_emails=["a@x.com", "b@x.com"], objective="learn")
     assert result.event_id == "ev1"
     assert erepo.created.teams_channel_id == "ch-1"
+    # Impl 3: the real team id is stored on the event so later channel calls use it, not tenant.
+    assert erepo.created.teams_team_id == "team-1"
     assert len(mrepo.added) == 3  # host + 2 members
     assert any(m["role"] == "host" for m in mrepo.added)
