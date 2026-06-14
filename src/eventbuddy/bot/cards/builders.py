@@ -32,19 +32,28 @@ def reminder_channel_card(*, task_name: str, recipients: list[str], pending_id: 
 
 
 def confirm_card(*, title: str, summary: str, pending_id: str, action: str,
-                 channel: str | None = None) -> dict:
+                 channel: str | None = None, recipients: list[str] | None = None,
+                 body: str | None = None) -> dict:
     """A generic single-button HITL confirmation card (e.g. for `send_outlook_mail`). The
-    button data carries only the action type + opaque `pending_id` (+ optional channel)."""
+    button data carries only the action type + opaque `pending_id` (+ optional channel) — never
+    recipients/identity (cross-cutting rule 2). `recipients`/`body` are *display only*: they let
+    the reviewer see exactly what will be sent before confirming."""
     data = {"action": action, "pending_id": pending_id}
     if channel:
         data["channel"] = channel
+    blocks = [
+        {"type": "TextBlock", "weight": "Bolder", "text": title, "wrap": True},
+        {"type": "TextBlock", "text": summary, "wrap": True},
+    ]
+    if recipients:
+        blocks.append({"type": "TextBlock", "text": f"To: {', '.join(recipients)}",
+                       "wrap": True, "isSubtle": True, "spacing": "Small"})
+    if body:
+        blocks.append({"type": "TextBlock", "text": body, "wrap": True, "separator": True})
     return {
         "type": "AdaptiveCard",
         "version": "1.4",
-        "body": [
-            {"type": "TextBlock", "weight": "Bolder", "text": title, "wrap": True},
-            {"type": "TextBlock", "text": summary, "wrap": True},
-        ],
+        "body": blocks,
         "actions": [
             {"type": "Action.Submit", "title": "✅ Confirm & send", "data": data},
         ],
