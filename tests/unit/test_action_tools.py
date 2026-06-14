@@ -95,6 +95,35 @@ def test_send_outlook_mail_delegates_for_moderator():
     assert calls["mail"]["subject"] == "Hi" and calls["mail"]["event_id"] == "ev-3"
 
 
+def test_send_outlook_mail_coerces_string_recipient_to_list():
+    # Models routinely emit a bare string for a single address — the tool must coerce it so
+    # `send_mail_fn` always receives a list (the Pydantic schema would otherwise reject it).
+    deps, calls = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="h1", role="host")))
+    tools["send_outlook_mail"].invoke(
+        {"subject": "Hi", "body": "x", "recipients": "a@x.com"}
+    )
+    assert calls["mail"]["recipients"] == ["a@x.com"]
+
+
+def test_send_outlook_mail_splits_delimited_recipient_string():
+    deps, calls = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="h1", role="host")))
+    tools["send_outlook_mail"].invoke(
+        {"subject": "Hi", "body": "x", "recipients": "a@x.com, b@y.com; c@z.com"}
+    )
+    assert calls["mail"]["recipients"] == ["a@x.com", "b@y.com", "c@z.com"]
+
+
+def test_send_outlook_mail_passes_list_recipient_unchanged():
+    deps, calls = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="h1", role="host")))
+    tools["send_outlook_mail"].invoke(
+        {"subject": "Hi", "body": "x", "recipients": ["a@x.com", "b@y.com"]}
+    )
+    assert calls["mail"]["recipients"] == ["a@x.com", "b@y.com"]
+
+
 def test_prepare_reminders_passes_through_degraded_message():
     # When remind_fn returns a string (degraded path), the tool surfaces it verbatim.
     deps, _ = _deps(remind_fn=lambda **kw: "There's no one to remind for this event yet.")
