@@ -156,3 +156,35 @@ def test_prepare_reminders_default_message_on_success():
     tools = _by_name(build_tools(deps, RequestContext(user_id="h1", role="moderator")))
     out = tools["prepare_reminders"].invoke({})
     assert "pick a channel" in out.lower()
+
+
+# --- generic send tools (send_email / send_teams_message) ----------------------------------
+
+def test_generic_send_tools_registered_with_identity_absent():
+    deps, _ = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert {"send_email", "send_teams_message"} <= set(tools)
+    assert set(tools["send_email"].args) == {"subject", "body", "recipients"}
+    assert set(tools["send_teams_message"].args) == {"recipient", "message"}
+
+
+def test_send_email_callable_by_member_and_delegates():
+    calls = {}
+    deps, _ = _deps(send_email_fn=lambda **kw: calls.update(kw) or "drafted")
+    # A plain member — no role gate on the generic tools.
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["send_email"].invoke(
+        {"subject": "Hi", "body": "x", "recipients": "phucnlt2, a@x.com"})
+    assert out == "drafted"
+    # The tool coerces a delimited string to a list; alias expansion happens in the closure.
+    assert calls == {"user_id": "u1", "subject": "Hi", "body": "x",
+                     "recipients": ["phucnlt2", "a@x.com"]}
+
+
+def test_send_teams_message_callable_by_member_and_delegates():
+    calls = {}
+    deps, _ = _deps(send_teams_message_fn=lambda **kw: calls.update(kw) or "drafted")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["send_teams_message"].invoke({"recipient": "phucnlt2", "message": "standup at 10"})
+    assert out == "drafted"
+    assert calls == {"user_id": "u1", "recipient": "phucnlt2", "message": "standup at 10"}

@@ -59,6 +59,76 @@ class GraphClient:
         r.raise_for_status()
         return r.json()
 
+    def get_my_id(self) -> str:
+        """The signed-in user's directory id (delegated 'me'). Used to bind the caller as a
+        member when creating a 1-1 chat."""
+        r = self._http.get("/me?$select=id", headers=self._headers())
+        r.raise_for_status()
+        return r.json()["id"]
+
+    @staticmethod
+    def _as_user(d: dict) -> dict:
+        return {
+            "id": d.get("id"),
+            "display_name": d.get("displayName") or d.get("userPrincipalName") or "",
+            "upn": d.get("userPrincipalName") or d.get("mail") or "",
+        }
+
+    def _first_user_match(self, filter_expr: str, select: str) -> dict | None:
+        """Run a `/users?$filter=…` query and return the first match as a user dict, or None."""
+        url = f"/users?$filter={quote(filter_expr)}&$select={select}&$top=1"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        vals = r.json().get("value", [])
+        return self._as_user(vals[0]) if vals else None
+
+    def resolve_user(self, alias_or_email: str) -> dict | None:
+        """Resolve a corporate alias (mailNickname, e.g. 'phucnlt2') or a full email/UPN to a
+        directory user → `{id, display_name, upn}`, or None when not found. Powers the generic
+        `send_teams_message` tool. Needs the delegated `User.ReadBasic.All` scope. A miss returns
+        None rather than raising, so the caller degrades to a clean "couldn't find them" message."""
+        value = (alias_or_email or "").strip()
+        if not value:
+            return None
+        select = "id,displayName,userPrincipalName,mail"
+        if "@" in value:
+            r = self._http.get(
+                f"/users/{quote(value)}?$select={select}", headers=self._headers())
+            if r.status_code == 200:
+                return self._as_user(r.json())
+            return self._first_user_match(f"mail eq '{value}'", select)
+        # Bare alias → match on mailNickname; fall back to a UPN built from the corp domain.
+        match = self._first_user_match(f"mailNickname eq '{value}'", select)
+        if match is not None:
+            return match
+        if settings.corp_email_domain:
+            upn = f"{value}@{settings.corp_email_domain}"
+            r = self._http.get(
+                f"/users/{quote(upn)}?$select={select}", headers=self._headers())
+            if r.status_code == 200:
+                return self._as_user(r.json())
+        return None
+
+    def create_one_on_one_chat(self, target_user_id: str) -> str:
+        """Create (or return the existing) 1-1 chat between the signed-in user and
+        `target_user_id`, returning its chat id. Delegated only — binds 'me' + the target as
+        members. Needs the `Chat.Create` scope. Graph returns the existing chat if one already
+        exists, so this is effectively get-or-create."""
+        def _member(uid: str) -> dict:
+            return {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH_BASE}/users('{uid}')",
+            }
+
+        payload = {
+            "chatType": "oneOnOne",
+            "members": [_member(self.get_my_id()), _member(target_user_id)],
+        }
+        r = self._http.post("/chats", json=payload, headers=self._headers())
+        r.raise_for_status()
+        return r.json()["id"]
+
     def send_mail(self, subject: str, body_html: str, to: list[str]) -> None:
         # Delegated (Plan 13): "me" is the signed-in user → POST /me/sendMail; the mail comes
         # from their own mailbox, no configured sender needed. App-only (legacy fallback): tokens

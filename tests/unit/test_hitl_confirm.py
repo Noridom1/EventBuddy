@@ -80,6 +80,35 @@ def test_role_below_moderator_is_denied():
     assert calls["execute"]["authorized"] is False
 
 
+def test_member_floor_payload_confirmable_by_member_drafter():
+    # Generic send (send_email/send_teams_message) carries min_role=member → the drafting member
+    # can confirm their own send even though the handler defaults to a moderator gate.
+    payload = {"type": "teams_dm", "event_id": None, "requested_by": "u1",
+               "target_user_id": "u-9", "min_role": "member"}
+    h, calls = _handler(payload, role="member")
+    out = h.resolve(action="teams_dm", pending_id="p1", channel=None, clicker="u1")
+    assert out == "✅ done"
+    assert calls["execute"]["authorized"] is True
+
+
+def test_member_floor_still_requires_drafter():
+    # The drafter==clicker check always applies, even with a member floor.
+    payload = {"type": "teams_dm", "event_id": None, "requested_by": "u1",
+               "target_user_id": "u-9", "min_role": "member"}
+    h, calls = _handler(payload, role="member")
+    out = h.resolve(action="teams_dm", pending_id="p1", channel=None, clicker="intruder")
+    assert "not allowed" in out.lower()
+    assert calls["execute"]["authorized"] is False
+
+
+def test_event_payload_without_floor_keeps_moderator_gate():
+    # No min_role key → unchanged: a member is denied on an event action.
+    h, calls = _handler(_PAYLOAD, role="member")
+    out = h.resolve(action="remind", pending_id="p1", channel="outlook", clicker="u1")
+    assert "not allowed" in out.lower()
+    assert calls["execute"]["authorized"] is False
+
+
 def test_redis_failure_degrades_to_expired():
     class _Boom:
         def pop(self, pending_id):

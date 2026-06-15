@@ -7,12 +7,21 @@ class _Graph:
     def __init__(self):
         self.mails = []        # each entry is a `to` list
         self.channel_posts = []
+        self.chats_created = []
+        self.chat_posts = []
 
     def send_mail(self, subject, body_html, to):
         self.mails.append(to)
 
     def send_channel_message(self, team_id, channel_id, text):
         self.channel_posts.append((channel_id, text))
+
+    def create_one_on_one_chat(self, target_user_id):
+        self.chats_created.append(target_user_id)
+        return f"chat-{target_user_id}"
+
+    def send_chat_message(self, chat_id, text):
+        self.chat_posts.append((chat_id, text))
 
 
 def test_remind_outlook_sends_individually():
@@ -78,6 +87,24 @@ def test_mail_outlook_still_sends_individually_with_channel_set():
                "recipient_emails": ["a@x.com", "b@x.com"]}
     ok, summary = _perform_send(graph=g, payload=payload, channel="outlook")
     assert ok and g.mails == [["a@x.com"], ["b@x.com"]]
+
+
+def test_teams_dm_creates_chat_and_posts():
+    g = _Graph()
+    payload = {"type": "teams_dm", "target_user_id": "u-42",
+               "target_display": "Phuc", "text": "standup at 10"}
+    ok, summary = _perform_send(graph=g, payload=payload, channel=None)
+    assert ok and "Phuc" in summary
+    assert g.chats_created == ["u-42"]
+    assert g.chat_posts == [("chat-u-42", "standup at 10")]
+    assert g.mails == [] and g.channel_posts == []
+
+
+def test_teams_dm_without_target_fails_cleanly():
+    g = _Graph()
+    ok, summary = _perform_send(graph=g, payload={"type": "teams_dm", "text": "hi"}, channel=None)
+    assert ok is False
+    assert g.chats_created == [] and g.chat_posts == []
 
 
 def test_unknown_action_fails_without_sending():

@@ -107,14 +107,14 @@ def use_graph_token(token: str | None):
 
 
 def _user_token_client(turn_context):
-    """The CloudAdapter surfaces the token service as a `UserTokenClient` in turn_state. Older
-    BotFrameworkAdapter exposes the calls on the adapter directly — callers fall back to that.
-    Returns the client or None (then use the adapter path)."""
+    """The `CloudAdapter` surfaces the token service as a `UserTokenClient` stored in turn_state
+    under ``CloudAdapterBase.USER_TOKEN_CLIENT_KEY`` (the literal "UserTokenClient"). NOTE: the
+    class lives in `botframework.connector.auth`, not `botbuilder.core` — importing it from the
+    latter (as we once did) raises ImportError and silently nulls this whole path. We key off the
+    string directly to avoid that. Returns the client, or None when it isn't present."""
     try:
-        from botbuilder.core import UserTokenClient
-        state = turn_context.turn_state
-        return state.get(UserTokenClient.__name__) or state.get(UserTokenClient)
-    except Exception:  # noqa: BLE001 — older SDK without UserTokenClient
+        return turn_context.turn_state.get("UserTokenClient")
+    except Exception:  # noqa: BLE001 — no turn_state / older SDK
         return None
 
 
@@ -144,8 +144,13 @@ async def acquire_graph_token(turn_context, magic_code: str | None = None) -> st
         except Exception as e:  # noqa: BLE001 — try the adapter path next
             log.debug(f"UserTokenClient token fetch failed ({type(e).__name__}: {e})")
 
+    # Legacy adapter fallback only — CloudAdapter has no get_user_token (the UserTokenClient
+    # above is the route). Guard so we never AttributeError on the modern adapter.
+    adapter = getattr(turn_context, "adapter", None)
+    if adapter is None or not hasattr(adapter, "get_user_token"):
+        return None
     try:
-        res = await turn_context.adapter.get_user_token(turn_context, connection, magic_code)
+        res = await adapter.get_user_token(turn_context, connection, magic_code)
         token = getattr(res, "token", None) if res else None
         return token or None
     except Exception as e:  # noqa: BLE001 — degrade: treat as "no token", never break the turn
@@ -163,13 +168,36 @@ async def _sign_in_link(turn_context, connection: str) -> str | None:
             link = getattr(resource, "sign_in_link", None)
             if link:
                 return link
+            log.warning(
+                f"UserTokenClient returned no sign_in_link for connection '{connection}' "
+                "— is the OAuth connection configured on the Azure Bot resource?"
+            )
         except Exception as e:  # noqa: BLE001
-            log.debug(f"UserTokenClient sign-in resource failed ({type(e).__name__}: {e})")
+            log.warning(
+                f"UserTokenClient sign-in resource failed for connection '{connection}' "
+                f"({type(e).__name__}: {e})"
+            )
+    else:
+        log.warning("no UserTokenClient in turn_state — cannot resolve an OAuth sign-in link")
+    # Legacy BotFrameworkAdapter exposed get_sign_in_resource directly; CloudAdapter does not.
+    # Only try it when present, so we never AttributeError on the modern adapter.
+    adapter = getattr(turn_context, "adapter", None)
+    if adapter is None or not hasattr(adapter, "get_sign_in_resource"):
+        return None
     try:
-        resource = await turn_context.adapter.get_sign_in_resource(turn_context, connection)
-        return getattr(resource, "sign_in_link", None)
+        resource = await adapter.get_sign_in_resource(turn_context, connection)
+        link = getattr(resource, "sign_in_link", None)
+        if not link:
+            log.warning(
+                f"adapter returned no sign_in_link for connection '{connection}' "
+                "— is the OAuth connection configured on the Azure Bot resource?"
+            )
+        return link
     except Exception as e:  # noqa: BLE001
-        log.debug(f"adapter sign-in resource failed ({type(e).__name__}: {e})")
+        log.warning(
+            f"adapter sign-in resource failed for connection '{connection}' "
+            f"({type(e).__name__}: {e})"
+        )
         return None
 
 
@@ -185,6 +213,14 @@ async def send_signin_prompt(turn_context, text: str | None = None) -> bool:
         from botbuilder.schema import ActionTypes, CardAction, OAuthCard
 
         sign_in_link = await _sign_in_link(turn_context, connection)
+        if sign_in_link:
+            log.info(f"sending OAuth card for connection '{connection}' (sign-in link resolved)")
+        else:
+            log.warning(
+                f"sending OAuth card for connection '{connection}' with NO sign-in link — "
+                "the button will fail in Teams ('Something went wrong'); the OAuth connection "
+                "is likely missing/misconfigured on the Azure Bot resource"
+            )
         card = OAuthCard(
             text=text or "Please sign in so I can act on your behalf in Microsoft 365.",
             connection_name=connection,

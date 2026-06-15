@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Application Access Policy should scope Mail.Send to (UPN or email, e.g. eventbuddy@corp).
     # Empty → the mail capability raises a clear "sender not configured" error (degrades visibly).
     graph_sender_upn: str = ""
+    # Corporate email domain for the generic send tools (`send_email`, `send_teams_message`).
+    # The corp identifies employees by the local part of their address (the alias before "@",
+    # e.g. phucnlt2@vng.com.vn → "phucnlt2"), so the tools accept a bare alias and expand it to
+    # "{alias}@{corp_email_domain}". Empty → aliases without "@" can't be expanded (the email
+    # tool then needs full addresses; Teams resolution still tries mailNickname directly).
+    corp_email_domain: str = ""
 
     log_level: str = "INFO"
 
