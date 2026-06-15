@@ -163,3 +163,80 @@ def test_resolve_host_token_delegated_without_token_needs_reauth(monkeypatch):
         lambda *a, **k: None,
     )
     assert jobs._resolve_host_token("host-1") == (None, "reauth")
+
+
+class _FakeFrom:
+    id = "user-1"
+
+
+class _FakeActivity:
+    from_property = _FakeFrom()
+    channel_id = "msteams"
+
+
+class _FakeUserTokenClient:
+    def __init__(self):
+        self.calls = []
+
+    async def sign_out_user(self, user_id, connection, channel_id):
+        self.calls.append((user_id, connection, channel_id))
+
+
+class _FakeTurn:
+    def __init__(self, client=None, adapter=None):
+        self.activity = _FakeActivity()
+        self.turn_state = {"UserTokenClient": client} if client else {}
+        self.adapter = adapter
+
+
+@pytest.mark.asyncio
+async def test_sign_out_user_noop_when_delegated_disabled(monkeypatch):
+    from eventbuddy.integrations.graph.delegated import sign_out_user
+
+    monkeypatch.setattr(settings, "graph_oauth_connection_name", "")
+    assert await sign_out_user(_FakeTurn(client=_FakeUserTokenClient())) is False
+
+
+@pytest.mark.asyncio
+async def test_sign_out_user_uses_user_token_client(monkeypatch):
+    from eventbuddy.integrations.graph.delegated import sign_out_user
+
+    monkeypatch.setattr(settings, "graph_oauth_connection_name", "EventBuddyGraph")
+    client = _FakeUserTokenClient()
+    assert await sign_out_user(_FakeTurn(client=client)) is True
+    assert client.calls == [("user-1", "EventBuddyGraph", "msteams")]
+
+
+@pytest.mark.asyncio
+async def test_sign_out_user_degrades_when_no_client_or_adapter(monkeypatch):
+    from eventbuddy.integrations.graph.delegated import sign_out_user
+
+    monkeypatch.setattr(settings, "graph_oauth_connection_name", "EventBuddyGraph")
+    assert await sign_out_user(_FakeTurn()) is False
+
+
+def _fake_jwt(claims: dict) -> str:
+    import base64
+    import json
+
+    def seg(d):
+        raw = json.dumps(d).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
+
+
+def test_token_scopes_extracts_scp_claim():
+    from eventbuddy.integrations.graph.delegated import token_scopes
+
+    token = _fake_jwt({"scp": "Chat.Create User.ReadBasic.All openid"})
+    assert token_scopes(token) == "Chat.Create User.ReadBasic.All openid"
+
+
+def test_token_scopes_returns_none_for_missing_or_malformed():
+    from eventbuddy.integrations.graph.delegated import token_scopes
+
+    assert token_scopes(None) is None
+    assert token_scopes("") is None
+    assert token_scopes("not-a-jwt") is None
+    assert token_scopes(_fake_jwt({"aud": "graph"})) is None  # no scp claim

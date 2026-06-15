@@ -75,39 +75,52 @@ class GraphClient:
         }
 
     def _first_user_match(self, filter_expr: str, select: str) -> dict | None:
-        """Run a `/users?$filter=…` query and return the first match as a user dict, or None."""
+        """Run a `/users?$filter=…` query and return the first match as a user dict, or None.
+        This is a directory *enumeration* — some tenants deny it (403 `Authorization_RequestDenied`)
+        for non-admin delegated callers even when the token holds `User.ReadBasic.All`. A 403 here
+        propagates; `resolve_user` prefers the direct-read path below to avoid relying on it."""
         url = f"/users?$filter={quote(filter_expr)}&$select={select}&$top=1"
         r = self._http.get(url, headers=self._headers())
         r.raise_for_status()
         vals = r.json().get("value", [])
         return self._as_user(vals[0]) if vals else None
 
+    def _get_user(self, upn_or_id: str, select: str) -> dict | None:
+        """Direct single-object read of `/users/{upn|id}`. Returns the user dict on 200, else None
+        (a 404 miss or a 403 deny — never raises). A direct read is frequently permitted in
+        tenants that block `/users` list/$filter enumeration, so it's the preferred resolve path."""
+        r = self._http.get(
+            f"/users/{quote(upn_or_id)}?$select={select}", headers=self._headers())
+        return self._as_user(r.json()) if r.status_code == 200 else None
+
     def resolve_user(self, alias_or_email: str) -> dict | None:
         """Resolve a corporate alias (mailNickname, e.g. 'phucnlt2') or a full email/UPN to a
         directory user → `{id, display_name, upn}`, or None when not found. Powers the generic
-        `send_teams_message` tool. Needs the delegated `User.ReadBasic.All` scope. A miss returns
-        None rather than raising, so the caller degrades to a clean "couldn't find them" message."""
+        `send_teams_message` tool. Needs the delegated `User.ReadBasic.All` scope.
+
+        Strategy: try a **direct read** of `/users/{upn}` first (works even where the tenant denies
+        directory *enumeration*), building the UPN from the corp domain for a bare alias. Only when
+        we have no UPN to try, or the direct read misses, do we fall back to the `/users?$filter`
+        enumeration — which may raise 403 in restricted tenants (the caller then surfaces a clear
+        permission message). A plain not-found returns None rather than raising."""
         value = (alias_or_email or "").strip()
         if not value:
             return None
         select = "id,displayName,userPrincipalName,mail"
+        # Prefer a direct read by UPN — bare alias → "{alias}@{corp_email_domain}".
         if "@" in value:
-            r = self._http.get(
-                f"/users/{quote(value)}?$select={select}", headers=self._headers())
-            if r.status_code == 200:
-                return self._as_user(r.json())
-            return self._first_user_match(f"mail eq '{value}'", select)
-        # Bare alias → match on mailNickname; fall back to a UPN built from the corp domain.
-        match = self._first_user_match(f"mailNickname eq '{value}'", select)
-        if match is not None:
-            return match
-        if settings.corp_email_domain:
-            upn = f"{value}@{settings.corp_email_domain}"
-            r = self._http.get(
-                f"/users/{quote(upn)}?$select={select}", headers=self._headers())
-            if r.status_code == 200:
-                return self._as_user(r.json())
-        return None
+            candidate_upn = value
+        elif settings.corp_email_domain:
+            candidate_upn = f"{value}@{settings.corp_email_domain}"
+        else:
+            candidate_upn = None
+        if candidate_upn:
+            match = self._get_user(candidate_upn, select)
+            if match is not None:
+                return match
+        # Fall back to directory enumeration (may be denied by tenant policy → raises 403).
+        filter_expr = f"mail eq '{value}'" if "@" in value else f"mailNickname eq '{value}'"
+        return self._first_user_match(filter_expr, select)
 
     def create_one_on_one_chat(self, target_user_id: str) -> str:
         """Create (or return the existing) 1-1 chat between the signed-in user and

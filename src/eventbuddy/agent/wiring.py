@@ -1079,8 +1079,28 @@ def build_orchestrator() -> Orchestrator:
         try:
             user = graph.resolve_user(recipient)
         except Exception as e:  # noqa: BLE001
+            # A 403 here is an insufficient-scope problem (the delegated token lacks
+            # `User.ReadBasic.All`), not a transient outage — surface it distinctly so it's clear
+            # nothing was sent and a sign-out/sign-in (fresh consent) is the likely fix.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                from eventbuddy.integrations.graph.delegated import (
+                    current_graph_token,
+                    token_scopes,
+                )
+                granted = token_scopes(current_graph_token())
+                log.warning(
+                    f"directory lookup denied (403) resolving '{recipient}' — the signed-in "
+                    "user's Graph token is missing the 'User.ReadBasic.All' scope. Scopes "
+                    f"actually granted on this token: {granted!r}. Sign out and sign in again to "
+                    "re-consent (and ensure the OAuth connection requests User.ReadBasic.All)."
+                )
+                return ("I couldn't send it — I don't have permission to look up '"
+                        f"{recipient}' in your organisation's directory yet. Try typing 'sign "
+                        "out' then 'sign in' to refresh access, and ask me again.")
             log.warning(f"user resolve failed ({type(e).__name__}: {e})")
-            return "I couldn't reach the Teams directory right now — please try again shortly."
+            return (f"I couldn't send it — the Teams directory is unreachable right now, so I "
+                    f"couldn't look up '{recipient}'. Please ask me to try again shortly.")
         if not user or not user.get("id"):
             return (f"I couldn't find '{recipient}' in the directory — check the alias or use "
                     "their full email address.")

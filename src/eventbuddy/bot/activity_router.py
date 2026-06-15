@@ -9,11 +9,15 @@ from eventbuddy.integrations.graph.delegated import (
     clear_signin_needed,
     delegated_enabled,
     send_signin_prompt,
+    sign_out_user,
     signin_needed,
 )
 
 # Words a user can type to start the Microsoft 365 sign-in flow (Plan 13, delegated auth).
 _SIGNIN_COMMANDS = {"sign in", "signin", "sign-in", "log in", "login", "connect", "authenticate"}
+# Words a user can type to clear their cached token (force a fresh sign-in/consent — e.g. after
+# IT grants a new delegated scope, since the token service caches the old grant).
+_SIGNOUT_COMMANDS = {"sign out", "signout", "sign-out", "log out", "logout", "disconnect"}
 
 
 def _scope_and_team(activity) -> tuple[str, str | None]:
@@ -107,6 +111,17 @@ class EventBuddyBot(ActivityHandler):
         # the OAuth card). Only meaningful when delegated auth is configured.
         if delegated_enabled() and text.strip().lower() in _SIGNIN_COMMANDS:
             await send_signin_prompt(turn_context)
+            return
+
+        # Plan 13 — "sign out" clears the cached token so the next sign-in re-consents with the
+        # current scope set (the token service otherwise keeps refreshing the original grant).
+        if delegated_enabled() and text.strip().lower() in _SIGNOUT_COMMANDS:
+            ok = await sign_out_user(turn_context)
+            await turn_context.send_activity(
+                "You're signed out of Microsoft 365. Type 'sign in' to reconnect."
+                if ok else
+                "I couldn't sign you out right now — please try again shortly."
+            )
             return
 
         user_id = activity.from_property.id if activity.from_property else "unknown"
