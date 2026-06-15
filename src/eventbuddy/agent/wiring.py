@@ -129,7 +129,43 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
                 body_html=payload.get("body_html", ""), to=[email],
             )
         return True, f"✅ Sent the email to {len(recipients)} recipient(s)."
+    if action == "teams_dm":
+        # Generic 1-1 Teams message (event-independent). Recipient was resolved to a directory
+        # id at prepare time; create-or-get the 1-1 chat and post the message.
+        target_user_id = payload.get("target_user_id")
+        if not target_user_id:
+            return False, "I don't have a resolved recipient to message."
+        target = payload.get("target_display") or "them"
+        chat_id = graph.create_one_on_one_chat(target_user_id)
+        graph.send_chat_message(chat_id, payload.get("text", ""))
+        return True, f"✅ Sent the Teams message to {target}."
     return False, "I don't know how to perform that action."
+
+
+def _expand_aliases(values) -> list[str]:
+    """Normalize email recipients for the generic send tools. Accepts a single string (split on
+    commas/semicolons) or a list; trims blanks, dedupes (case-insensitive, order-preserving), and
+    expands a bare corporate alias (no '@') to '{alias}@{corp_email_domain}' when that's
+    configured. A bare alias with no configured domain is dropped (we can't address it)."""
+    import re as _re
+    if isinstance(values, str):
+        values = _re.split(r"[,;]", values)
+    domain = settings.corp_email_domain
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        v = (raw or "").strip()
+        if not v:
+            continue
+        if "@" not in v:
+            if not domain:
+                continue
+            v = f"{v}@{domain}"
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
 
 
 # --- Impl 4: participant-roster helpers (module-level → unit-testable) ----------------------
@@ -922,6 +958,70 @@ def build_orchestrator() -> Orchestrator:
         ))
         return "Drafted the email — confirm on the card to send."
 
+    def send_email_fn(*, user_id, subject, body, recipients):
+        """Generic (event-independent) email: expand aliases → addresses, draft behind the HITL
+        confirm card. Reuses the `type: "mail"` send path (per-recipient, §11). `min_role: member`
+        lets any member confirm their own send (the confirm gate keys off this — see confirm.py)."""
+        emails = _expand_aliases(recipients)
+        if not emails:
+            return ("I need at least one recipient — give me an email address, or an alias if a "
+                    "corporate domain is configured.")
+        payload = {
+            "type": "mail", "event_id": None, "requested_by": user_id,
+            "subject": subject, "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+            "min_role": "member",
+        }
+        try:
+            pending_id = pending_store.put(payload)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            return "Mail confirmation is temporarily unavailable — please try again."
+        emit_card(confirm_card(
+            title=f"Send email: {subject}", summary=f"To {len(emails)} recipient(s).",
+            pending_id=pending_id, action="mail", recipients=emails, body=body,
+        ))
+        return f"Drafted the email to {len(emails)} recipient(s) — confirm on the card to send."
+
+    def send_teams_message_fn(*, user_id, recipient, message):
+        """Generic (event-independent) 1-1 Teams message: resolve the recipient from a corporate
+        alias/email to a directory user, then draft behind the HITL confirm card. The directory
+        lookup acts on the caller's behalf (delegated Graph) — degrades cleanly when not signed
+        in or the user can't be found. The send (create chat + post) happens on confirm."""
+        if not (recipient or "").strip():
+            return "Tell me who to message — a corporate alias (e.g. 'phucnlt2') or their email."
+        if not (message or "").strip():
+            return "Tell me what the message should say."
+        if not _graph_creds():
+            return "I can't send Teams messages yet — Microsoft Graph isn't configured."
+        graph = graph_for()
+        if graph is None:
+            return ("I can't send Teams messages yet — please sign in to Microsoft 365 (type "
+                    "'sign in') so I can send it on your behalf.")
+        try:
+            user = graph.resolve_user(recipient)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"user resolve failed ({type(e).__name__}: {e})")
+            return "I couldn't reach the Teams directory right now — please try again shortly."
+        if not user or not user.get("id"):
+            return (f"I couldn't find '{recipient}' in the directory — check the alias or use "
+                    "their full email address.")
+        display = user.get("display_name") or user.get("upn") or recipient
+        payload = {
+            "type": "teams_dm", "event_id": None, "requested_by": user_id,
+            "target_user_id": user["id"], "target_display": display, "text": message,
+            "min_role": "member",
+        }
+        try:
+            pending_id = pending_store.put(payload)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            return "Message confirmation is temporarily unavailable — please try again."
+        emit_card(confirm_card(
+            title=f"Send Teams message to {display}?", summary="A direct 1-1 Teams chat message.",
+            pending_id=pending_id, action="teams_dm", recipients=[display], body=message,
+        ))
+        return f"Drafted a Teams message to {display} — confirm on the card to send."
+
     def ingest_fn(*, event_id, user_id, url=""):
         """Impl 2: pull the focused event's channel SharePoint files (or a pasted link)
         through the parse→structure→upsert pipeline, proposing invites via a HITL card posted
@@ -1220,6 +1320,7 @@ def build_orchestrator() -> Orchestrator:
         list_event_files_fn=_build_list_event_files_fn(),
         read_event_file_fn=_build_read_event_file_fn(),
         setup_event_fn=setup_event_fn,
+        send_email_fn=send_email_fn, send_teams_message_fn=send_teams_message_fn,
     )
 
     orch = Orchestrator(
@@ -1255,6 +1356,7 @@ def _build_runner_and_summarizer(
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
     list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
+    send_email_fn=None, send_teams_message_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -1289,8 +1391,10 @@ def _build_runner_and_summarizer(
         _no_read_channel,
         _no_read_event_file,
         _no_read_participant_file,
+        _no_send_email,
         _no_send_mail,
         _no_send_participant_reminders,
+        _no_send_teams_message,
         _no_set_feedback,
         _no_setup_event,
         _no_update_task,
@@ -1313,6 +1417,8 @@ def _build_runner_and_summarizer(
         list_event_files_fn=list_event_files_fn or _no_list_event_files,
         read_event_file_fn=read_event_file_fn or _no_read_event_file,
         setup_event_fn=setup_event_fn or _no_setup_event,
+        send_email_fn=send_email_fn or _no_send_email,
+        send_teams_message_fn=send_teams_message_fn or _no_send_teams_message,
         web_search_fn=web_search_fn,
         web_fetch_fn=web_fetch_fn,
         debug=settings.agent_debug,

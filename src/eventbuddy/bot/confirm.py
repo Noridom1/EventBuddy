@@ -44,9 +44,13 @@ class ConfirmHandler:
         role = self._role_resolver(
             user_id=clicker, scope=scope, channel_id=channel_id, event_id=event_id
         )
+        # Generic event-less sends (send_email / send_teams_message) carry their own role floor
+        # ("member") so any member can confirm their own draft; event actions omit it and keep
+        # the handler's default moderator gate. The drafter==clicker check always applies.
+        min_role = payload.get("min_role", self._min_role)
         authorized = (
             clicker == payload.get("requested_by")
-            and ROLE_RANK.get(role, 0) >= ROLE_RANK[self._min_role]
+            and ROLE_RANK.get(role, 0) >= ROLE_RANK.get(min_role, ROLE_RANK[self._min_role])
         )
 
         ok, summary = self._execute(

@@ -113,6 +113,16 @@ def _no_send_mail(**_kw) -> str:
     return "Sending mail isn't available right now."
 
 
+def _no_send_email(**_kw) -> str:
+    """Default `send_email_fn` — generic outbound mail not wired (no Graph/HITL path)."""
+    return "Sending email isn't available right now."
+
+
+def _no_send_teams_message(**_kw) -> str:
+    """Default `send_teams_message_fn` — generic Teams messaging not wired (no Graph path)."""
+    return "Sending Teams messages isn't available right now."
+
+
 def _no_ingest(**_kw) -> str:
     """Default `ingest_fn` — document/SharePoint ingestion not wired (no Graph path)."""
     return "File access isn't available right now."
@@ -211,6 +221,11 @@ class AgentDeps:
     # Group-chat onboarding — `setup_event` binds the current group/channel to an event
     # (resolve-or-create) and enrolls the caller as host. Default no-op (no-DB path).
     setup_event_fn: Callable = _no_setup_event
+    # Generic (event-independent) send tools — `send_email` (any recipients/aliases) and
+    # `send_teams_message` (1-1 chat to a resolved colleague). Both HITL-gated, any member.
+    # Default no-ops so the no-Graph / no-DB path still builds the tool set.
+    send_email_fn: Callable = _no_send_email
+    send_teams_message_fn: Callable = _no_send_teams_message
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise to the runner's
     # ToolNode error handler for classification.
@@ -330,6 +345,30 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             user_id=ctx.user_id, event_id=event_id,
             subject=subject, body=body, recipients=recipients,
         )
+
+    @tool
+    @traced
+    def send_email(subject: str, body: str, recipients: str | list[str]) -> str:
+        """Send an email to one or more people, independent of any event. Use this for general
+        email — to colleagues, external addresses, anyone — when it's NOT about emailing a
+        focused event's members (for that, use send_outlook_mail). `recipients` may be full email
+        addresses or corporate aliases (the part before @, e.g. 'phucnlt2'), given as a single
+        value or a list. Sending is gated by a confirmation card — this only drafts it. Any
+        member may use it."""
+        if isinstance(recipients, str):
+            recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
+        return deps.send_email_fn(
+            user_id=ctx.user_id, subject=subject, body=body, recipients=recipients)
+
+    @tool
+    @traced
+    def send_teams_message(recipient: str, message: str) -> str:
+        """Send a direct 1-1 Teams chat message to a colleague, independent of any event.
+        `recipient` is their corporate alias (the part before @, e.g. 'phucnlt2') or full email
+        address; `message` is the text to send. Use this to ping a specific person on Teams.
+        Sending is gated by a confirmation card — this only drafts it. Any member may use it."""
+        return deps.send_teams_message_fn(
+            user_id=ctx.user_id, recipient=recipient, message=message)
 
     @tool
     @traced
@@ -465,6 +504,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     tools: list[BaseTool] = [
         create_event, setup_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
+        send_email, send_teams_message,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion,
         read_participant_file, send_participant_reminders,

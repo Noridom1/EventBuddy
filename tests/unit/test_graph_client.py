@@ -24,3 +24,81 @@ def test_send_channel_message_authenticates_and_posts():
     assert "teams/t/channels/c/messages" in url
     assert headers["Authorization"] == "Bearer tok-123"
     assert body["body"]["content"] == "hi"
+
+
+class _Resp:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"unexpected raise for status {self.status_code}")
+
+
+class _RoutedHttp:
+    """GET/POST stub routed by URL substring → canned _Resp."""
+
+    def __init__(self, get_routes=None, post_routes=None):
+        self.get_routes = get_routes or {}
+        self.post_routes = post_routes or {}
+        self.get_calls = []
+        self.post_calls = []
+
+    def get(self, url, headers=None):
+        self.get_calls.append(url)
+        for frag, resp in self.get_routes.items():
+            if frag in url:
+                return resp
+        return _Resp(404, {})
+
+    def post(self, url, json=None, headers=None):
+        self.post_calls.append((url, json))
+        for frag, resp in self.post_routes.items():
+            if frag in url:
+                return resp
+        return _Resp(404, {})
+
+
+def test_resolve_user_by_alias_uses_mailnickname_filter():
+    http = _RoutedHttp(get_routes={
+        "$filter": _Resp(200, {"value": [
+            {"id": "u-1", "displayName": "Phuc", "userPrincipalName": "phucnlt2@vng.com.vn"}]}),
+    })
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    user = gc.resolve_user("phucnlt2")
+    assert user == {"id": "u-1", "display_name": "Phuc", "upn": "phucnlt2@vng.com.vn"}
+    assert any("mailNickname" in u for u in http.get_calls)
+
+
+def test_resolve_user_by_email_uses_direct_lookup():
+    http = _RoutedHttp(get_routes={
+        "/users/": _Resp(200, {
+            "id": "u-2", "displayName": "Alice", "userPrincipalName": "alice@x.com"}),
+    })
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    user = gc.resolve_user("alice@x.com")
+    assert user == {"id": "u-2", "display_name": "Alice", "upn": "alice@x.com"}
+
+
+def test_resolve_user_miss_returns_none():
+    http = _RoutedHttp(get_routes={"$filter": _Resp(200, {"value": []})})
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    assert gc.resolve_user("ghost") is None
+
+
+def test_create_one_on_one_chat_binds_both_members():
+    http = _RoutedHttp(
+        get_routes={"/me": _Resp(200, {"id": "me-1"})},
+        post_routes={"/chats": _Resp(201, {"id": "chat-9"})},
+    )
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    chat_id = gc.create_one_on_one_chat("u-7")
+    assert chat_id == "chat-9"
+    _url, body = http.post_calls[0]
+    assert body["chatType"] == "oneOnOne"
+    binds = [m["user@odata.bind"] for m in body["members"]]
+    assert any("me-1" in b for b in binds) and any("u-7" in b for b in binds)
