@@ -130,16 +130,106 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
             )
         return True, f"✅ Sent the email to {len(recipients)} recipient(s)."
     if action == "teams_dm":
-        # Generic 1-1 Teams message (event-independent). Recipient was resolved to a directory
-        # id at prepare time; create-or-get the 1-1 chat and post the message.
-        target_user_id = payload.get("target_user_id")
-        if not target_user_id:
+        # Generic 1-1 Teams message (event-independent). Recipients were resolved to directory
+        # ids at prepare time; create-or-get each 1-1 chat and post the message. Accepts the
+        # batch `targets` list; falls back to the legacy single-target shape for old pendings.
+        targets = payload.get("targets")
+        if not targets:
+            tid = payload.get("target_user_id")
+            targets = ([{"user_id": tid, "display": payload.get("target_display") or "them"}]
+                       if tid else [])
+        if not targets:
             return False, "I don't have a resolved recipient to message."
-        target = payload.get("target_display") or "them"
-        chat_id = graph.create_one_on_one_chat(target_user_id)
-        graph.send_chat_message(chat_id, payload.get("text", ""))
-        return True, f"✅ Sent the Teams message to {target}."
+        text = payload.get("text", "")
+        sent = []
+        for t in targets:
+            chat_id = graph.create_one_on_one_chat(t["user_id"])
+            graph.send_chat_message(chat_id, text)
+            sent.append(t.get("display") or "them")
+        if len(sent) == 1:
+            return True, f"✅ Sent the Teams message to {sent[0]}."
+        return True, f"✅ Sent the Teams message to {len(sent)} people ({', '.join(sent)})."
     return False, "I don't know how to perform that action."
+
+
+def _card_action_data(card: dict) -> dict:
+    """The `Action.Submit` data dict of a confirm card (carries `action` + `pending_id`), or {}."""
+    try:
+        return card["actions"][0]["data"] or {}
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+
+def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn) -> list[dict]:
+    """Merge the turn's `teams_dm` confirm cards that share the same message text into ONE card
+    per distinct message — so a model that (against instructions) calls `send_teams_message` once
+    per person still yields a single confirmation card instead of a flood.
+
+    The recipient list lives server-side in the pending store (rule 2 — never on the card button),
+    so merging means: read each card's pending payload, union the `targets` (deduped by user id),
+    store one merged pending, and emit one rebuilt card pointing at it (superseded pendings are
+    popped to free them). Non-`teams_dm` cards, and a message that only produced one card, pass
+    through untouched and in place. Best-effort: any store hiccup returns the cards unchanged so
+    card delivery never breaks."""
+    try:
+        groups: dict[str, dict] = {}  # text -> {targets, pids, payload, first_card}
+        order: list[str] = []
+        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", text)
+        for card in cards:
+            data = _card_action_data(card)
+            pid = data.get("pending_id")
+            payload = (pending_store.get(pid)
+                       if data.get("action") == "teams_dm" and pid else None)
+            if not payload or not payload.get("targets"):
+                plan.append(("pass", card))
+                continue
+            text = payload.get("text", "")
+            g = groups.get(text)
+            if g is None:
+                g = groups[text] = {"targets": [], "pids": [], "payload": payload,
+                                    "first_card": card}
+                order.append(text)
+            seen_ids = {t["user_id"] for t in g["targets"]}
+            for t in payload["targets"]:
+                if t["user_id"] not in seen_ids:
+                    seen_ids.add(t["user_id"])
+                    g["targets"].append(t)
+            g["pids"].append(pid)
+            plan.append(("dm", text))
+
+        if not any(len(g["pids"]) > 1 for g in groups.values()):
+            return cards  # nothing to merge — leave the list (and pendings) exactly as-is
+
+        final: dict[str, dict] = {}
+        for text in order:
+            g = groups[text]
+            if len(g["pids"]) <= 1:
+                final[text] = g["first_card"]
+                continue
+            merged = dict(g["payload"])
+            merged["targets"] = g["targets"]
+            merged["text"] = text
+            new_pid = pending_store.put(merged)
+            for pid in g["pids"]:
+                pending_store.pop(pid)  # supersede the per-recipient pendings
+            displays = [t["display"] for t in g["targets"]]
+            title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                     else f"Send Teams message to {len(displays)} people?")
+            final[text] = confirm_card_fn(
+                title=title, summary="A direct 1-1 Teams chat message.",
+                pending_id=new_pid, action="teams_dm", recipients=displays, body=text)
+
+        out, emitted = [], set()
+        for kind, val in plan:
+            if kind == "pass":
+                out.append(val)
+            elif val not in emitted:
+                out.append(final[val])
+                emitted.add(val)
+        return out
+    except Exception as e:  # noqa: BLE001 — coalescing is best-effort; never drop cards on error
+        log.warning(f"teams_dm card coalescing failed ({type(e).__name__}: {e})")
+        return cards
 
 
 def _expand_aliases(values) -> list[str]:
@@ -1061,12 +1151,22 @@ def build_orchestrator() -> Orchestrator:
         ))
         return f"Drafted the email to {len(emails)} recipient(s) — confirm on the card to send."
 
-    def send_teams_message_fn(*, user_id, recipient, message):
-        """Generic (event-independent) 1-1 Teams message: resolve the recipient from a corporate
-        alias/email to a directory user, then draft behind the HITL confirm card. The directory
-        lookup acts on the caller's behalf (delegated Graph) — degrades cleanly when not signed
-        in or the user can't be found. The send (create chat + post) happens on confirm."""
-        if not (recipient or "").strip():
+    def send_teams_message_fn(*, user_id, recipients, message):
+        """Generic (event-independent) 1-1 Teams message to one or more colleagues: resolve each
+        recipient (corporate alias/email) to a directory user, then draft a SINGLE HITL confirm
+        card covering the whole batch — the same `message` goes to each. The directory lookup
+        acts on the caller's behalf (delegated Graph) and degrades cleanly. The sends (create
+        chat + post, per recipient) happen on confirm."""
+        # Normalize to a deduped list (case-insensitive, order-preserving) — the model may pass a
+        # single string or a list; either way we want one card for the batch.
+        raw = recipients if isinstance(recipients, list) else [recipients]
+        names, seen = [], set()
+        for r in raw:
+            r = (r or "").strip()
+            if r and r.lower() not in seen:
+                seen.add(r.lower())
+                names.append(r)
+        if not names:
             return "Tell me who to message — a corporate alias (e.g. 'phucnlt2') or their email."
         if not (message or "").strip():
             return "Tell me what the message should say."
@@ -1076,50 +1176,66 @@ def build_orchestrator() -> Orchestrator:
         if graph is None:
             return ("I can't send Teams messages yet — please sign in to Microsoft 365 (type "
                     "'sign in') so I can send it on your behalf.")
-        try:
-            user = graph.resolve_user(recipient)
-        except Exception as e:  # noqa: BLE001
-            # A 403 here is an insufficient-scope problem (the delegated token lacks
-            # `User.ReadBasic.All`), not a transient outage — surface it distinctly so it's clear
-            # nothing was sent and a sign-out/sign-in (fresh consent) is the likely fix.
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status == 403:
-                from eventbuddy.integrations.graph.delegated import (
-                    current_graph_token,
-                    token_scopes,
-                )
-                granted = token_scopes(current_graph_token())
-                log.warning(
-                    f"directory lookup denied (403) resolving '{recipient}' — the signed-in "
-                    "user's Graph token is missing the 'User.ReadBasic.All' scope. Scopes "
-                    f"actually granted on this token: {granted!r}. Sign out and sign in again to "
-                    "re-consent (and ensure the OAuth connection requests User.ReadBasic.All)."
-                )
-                return ("I couldn't send it — I don't have permission to look up '"
-                        f"{recipient}' in your organisation's directory yet. Try typing 'sign "
-                        "out' then 'sign in' to refresh access, and ask me again.")
-            log.warning(f"user resolve failed ({type(e).__name__}: {e})")
-            return (f"I couldn't send it — the Teams directory is unreachable right now, so I "
-                    f"couldn't look up '{recipient}'. Please ask me to try again shortly.")
-        if not user or not user.get("id"):
-            return (f"I couldn't find '{recipient}' in the directory — check the alias or use "
-                    "their full email address.")
-        display = user.get("display_name") or user.get("upn") or recipient
+        resolved, not_found = [], []
+        for name in names:
+            try:
+                user = graph.resolve_user(name)
+            except Exception as e:  # noqa: BLE001
+                # A 403 is a tenant directory-access denial (not a per-recipient miss) — it'll hit
+                # every lookup, so abort the whole batch with one clear message. Nothing is sent.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 403:
+                    from eventbuddy.integrations.graph.delegated import (
+                        current_graph_token,
+                        token_scopes,
+                    )
+                    granted = token_scopes(current_graph_token())
+                    log.warning(
+                        f"directory lookup denied (403) resolving '{name}' — the signed-in "
+                        "user's Graph token can't read the directory. Scopes actually granted on "
+                        f"this token: {granted!r}. The tenant likely blocks directory reads for "
+                        "delegated callers; an Entra admin must allow it."
+                    )
+                    return ("I couldn't send it — I don't have permission to look people up in "
+                            "your organisation's directory yet. Please ask an admin to grant "
+                            "directory read access, then try again.")
+                log.warning(f"user resolve failed ({type(e).__name__}: {e})")
+                return ("I couldn't send it — the Teams directory is unreachable right now. "
+                        "Please ask me to try again shortly.")
+            if not user or not user.get("id"):
+                not_found.append(name)
+                continue
+            resolved.append({
+                "user_id": user["id"],
+                "display": user.get("display_name") or user.get("upn") or name,
+            })
+        if not resolved:
+            missing = ", ".join(not_found)
+            return (f"I couldn't find {missing} in the directory — check the alias(es) or use "
+                    "full email addresses.")
         payload = {
             "type": "teams_dm", "event_id": None, "requested_by": user_id,
-            "target_user_id": user["id"], "target_display": display, "text": message,
-            "min_role": "member",
+            "targets": resolved, "text": message, "min_role": "member",
         }
         try:
             pending_id = pending_store.put(payload)
         except Exception as e:  # noqa: BLE001
             log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
             return "Message confirmation is temporarily unavailable — please try again."
+        displays = [t["display"] for t in resolved]
+        title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                 else f"Send Teams message to {len(displays)} people?")
         emit_card(confirm_card(
-            title=f"Send Teams message to {display}?", summary="A direct 1-1 Teams chat message.",
-            pending_id=pending_id, action="teams_dm", recipients=[display], body=message,
+            title=title, summary="A direct 1-1 Teams chat message.",
+            pending_id=pending_id, action="teams_dm", recipients=displays, body=message,
         ))
-        return f"Drafted a Teams message to {display} — confirm on the card to send."
+        reply = (f"Drafted a Teams message to {displays[0]} — confirm on the card to send."
+                 if len(displays) == 1
+                 else f"Drafted a Teams message to {len(displays)} recipient(s) — confirm on the "
+                      "card to send.")
+        if not_found:
+            reply += f" (Couldn't find: {', '.join(not_found)}.)"
+        return reply
 
     def ingest_fn(*, event_id, user_id, url=""):
         """Impl 2: pull the focused event's channel SharePoint files (or a pasted link)
@@ -1438,6 +1554,10 @@ def build_orchestrator() -> Orchestrator:
         pending_store=pending_store, role_resolver=role_resolver,
         execute_fn=execute_confirmed_action,
     )
+    # The router calls this on the turn's emitted cards before sending, to fold a flood of
+    # per-recipient teams_dm cards into one (belt-and-suspenders over the batch tool).
+    orch.coalesce_cards = lambda cards: coalesce_teams_dm_cards(
+        cards, pending_store=pending_store, confirm_card_fn=confirm_card)
     return orch
 
 

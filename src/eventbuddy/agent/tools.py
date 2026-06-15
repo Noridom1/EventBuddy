@@ -370,13 +370,17 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def send_teams_message(recipient: str, message: str) -> str:
-        """Send a direct 1-1 Teams chat message to a colleague, independent of any event.
-        `recipient` is their corporate alias (the part before @, e.g. 'phucnlt2') or full email
-        address; `message` is the text to send. Use this to ping a specific person on Teams.
-        Sending is gated by a confirmation card — this only drafts it. Any member may use it."""
+    def send_teams_message(recipients: str | list[str], message: str) -> str:
+        """Send a direct 1-1 Teams chat message to one or more colleagues, independent of any
+        event. `recipients` is a corporate alias (the part before @, e.g. 'phucnlt2') or full
+        email address, given as a single value or a list; the same `message` is sent to each.
+        Pass ALL the people in ONE call (a list) — do NOT call this once per person — so the user
+        gets a single confirmation card instead of one per recipient. Sending is gated by that
+        card — this only drafts it. Any member may use it."""
+        if isinstance(recipients, str):
+            recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_teams_message_fn(
-            user_id=ctx.user_id, recipient=recipient, message=message)
+            user_id=ctx.user_id, recipients=recipients, message=message)
 
     @tool
     @traced

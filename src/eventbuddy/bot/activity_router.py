@@ -90,6 +90,8 @@ class EventBuddyBot(ActivityHandler):
         self._graph = build_agent_graph(orchestrator)
         # HITL confirm loop (Impl 1): handles Adaptive Card `Action.Submit` clicks.
         self._confirm = getattr(orchestrator, "confirm_handler", None)
+        # Folds a turn's per-recipient teams_dm cards into one before they're sent (or None).
+        self._coalesce_cards = getattr(orchestrator, "coalesce_cards", None)
 
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         activity = turn_context.activity
@@ -162,8 +164,13 @@ class EventBuddyBot(ActivityHandler):
         if reply:
             await turn_context.send_activity(reply)
         # Any cards a tool/capability emitted this turn (e.g. the reminder channel-choice
-        # card) are sent as attachments after the text reply.
-        for card in artifacts.cards:
+        # card) are sent as attachments after the text reply. Coalesce first so a flood of
+        # per-recipient teams_dm cards collapses to one (no-op when nothing to merge).
+        cards = artifacts.cards
+        coalesce = getattr(self, "_coalesce_cards", None)  # defensive: bot may be built via __new__
+        if coalesce is not None:
+            cards = coalesce(cards)
+        for card in cards:
             await turn_context.send_activity(
                 MessageFactory.attachment(CardFactory.adaptive_card(card))
             )

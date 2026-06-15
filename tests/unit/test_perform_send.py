@@ -91,13 +91,35 @@ def test_mail_outlook_still_sends_individually_with_channel_set():
 
 def test_teams_dm_creates_chat_and_posts():
     g = _Graph()
-    payload = {"type": "teams_dm", "target_user_id": "u-42",
-               "target_display": "Phuc", "text": "standup at 10"}
+    payload = {"type": "teams_dm",
+               "targets": [{"user_id": "u-42", "display": "Phuc"}], "text": "standup at 10"}
     ok, summary = _perform_send(graph=g, payload=payload, channel=None)
     assert ok and "Phuc" in summary
     assert g.chats_created == ["u-42"]
     assert g.chat_posts == [("chat-u-42", "standup at 10")]
     assert g.mails == [] and g.channel_posts == []
+
+
+def test_teams_dm_batch_sends_to_each_target():
+    g = _Graph()
+    payload = {"type": "teams_dm", "text": "hi all", "targets": [
+        {"user_id": "u-1", "display": "Anh"},
+        {"user_id": "u-2", "display": "Lam"},
+    ]}
+    ok, summary = _perform_send(graph=g, payload=payload, channel=None)
+    assert ok and "2 people" in summary and "Anh" in summary and "Lam" in summary
+    assert g.chats_created == ["u-1", "u-2"]
+    assert g.chat_posts == [("chat-u-1", "hi all"), ("chat-u-2", "hi all")]
+
+
+def test_teams_dm_legacy_single_target_shape_still_works():
+    # Old pending payloads (pre-batch) carried target_user_id/target_display directly.
+    g = _Graph()
+    payload = {"type": "teams_dm", "target_user_id": "u-9",
+               "target_display": "Old", "text": "hi"}
+    ok, summary = _perform_send(graph=g, payload=payload, channel=None)
+    assert ok and "Old" in summary
+    assert g.chats_created == ["u-9"]
 
 
 def test_teams_dm_without_target_fails_cleanly():
