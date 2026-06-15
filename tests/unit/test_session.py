@@ -1,3 +1,5 @@
+import fakeredis
+
 from eventbuddy.agent.session import SessionStore
 
 
@@ -27,3 +29,12 @@ def test_clear_current_event():
     store.set_current_event("u1", "ev-42")
     store.clear_current_event("u1")
     assert store.get_current_event("u1") is None
+
+
+def test_clear_all_wipes_every_user_session():
+    store = SessionStore(fakeredis.FakeStrictRedis(decode_responses=True))
+    store.set_current_event("u1", "ev-1")
+    store.set_current_event("u2", "ev-2")
+    assert store.clear_all() == 2
+    assert store.get_current_event("u1") is None
+    assert store.get_current_event("u2") is None

@@ -1,9 +1,8 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
-  "id": "REPLACE_WITH_ENTRA_APP_ID",
-  "version": "1.0.0",
-  "packageName": "vn.com.vng.eventbuddy",
+  "id": "c1cb26e0-a557-4669-9bfa-7d8cd9d74bdf",
+  "version": "1.0.1",
   "developer": {
     "name": "VNG AI Lab",
     "websiteUrl": "https://aiplatform.vngcloud.vn",
@@ -25,13 +24,13 @@
   "accentColor": "#0F4880",
   "bots": [
     {
-      "botId": "REPLACE_WITH_ENTRA_APP_ID",
-      "scopes": ["personal", "team"],
-      "supportsFiles": false,
+      "botId": "caa64604-fc25-43c9-9f46-6a9cea4d135e",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": true,
       "isNotificationOnly": false,
       "commandLists": [
         {
-          "scopes": ["personal", "team"],
+          "scopes": ["personal", "team", "groupChat"],
           "commands": [
             { "title": "create event", "description": "Create a new event and its Teams channel" },
             { "title": "focus", "description": "Focus on an event so following messages apply to it" },
@@ -45,8 +44,13 @@
   ],
   "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
-    "endpoint-0a09ccce-2059-4ce4-b1b7-8a35d674aa0c.agentbase-runtime.aiplatform.vngcloud.vn"
+    "endpoint-0a09ccce-2059-4ce4-b1b7-8a35d674aa0c.agentbase-runtime.aiplatform.vngcloud.vn",
+    "token.botframework.com"
   ],
+  "webApplicationInfo": {
+    "id": "caa64604-fc25-43c9-9f46-6a9cea4d135e",
+    "resource": "api://botid-caa64604-fc25-43c9-9f46-6a9cea4d135e/access_as_user"
+  },
   "authorization": {
     "permissions": {
       "resourceSpecific": [

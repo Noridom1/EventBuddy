@@ -9,13 +9,19 @@ class AgentState(TypedDict, total=False):
     channel_id: str | None
     text: str
     sent_at: datetime | None
-    # Conversation scope ("personal" | "channel") and the real Teams team id, derived from the
-    # inbound activity (Impl 3). Both default-safe: a missing scope is treated as "personal".
+    # Conversation scope ("personal" | "channel" | "group") and the real Teams team id, derived
+    # from the inbound activity (Impl 3). Both default-safe: a missing scope → "personal".
     scope: str
     team_id: str | None
+    # Sender's display name for speaker-tagging in shared (group/channel) threads. Default-safe:
+    # None in a 1-1 DM, where tagging is off.
+    display_name: str | None
     # Impl 4 — descriptors for files attached to this turn; forwarded to the orchestrator so a
     # tool can read them. Default-safe: a turn with no files carries an empty list.
     attachments: list[dict]
+    # Plan 13 — delegated Graph bearer token for this caller, acquired at ingress (Teams SSO).
+    # Default-safe: None when delegated auth isn't configured / the user isn't signed in.
+    graph_token: str | None
     reply: str
 
 
@@ -29,6 +35,8 @@ def build_agent_graph(orchestrator):
             sent_at=state.get("sent_at"),
             team_id=state.get("team_id"),
             attachments=state.get("attachments"),
+            graph_token=state.get("graph_token"),
+            display_name=state.get("display_name"),
         )
         return {"reply": reply}
 

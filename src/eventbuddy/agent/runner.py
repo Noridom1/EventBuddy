@@ -23,6 +23,7 @@ from eventbuddy.agent.prompts import system_prompt
 from eventbuddy.agent.tools import ToolCallRecord, begin_trace, end_trace
 from eventbuddy.agent.transcript import sent_at_prefix
 from eventbuddy.common.logging import get_logger
+from eventbuddy.integrations.graph.delegated import reset_graph_token, set_graph_token
 
 log = get_logger("agent.runner")
 
@@ -203,6 +204,26 @@ class AgentRunner:
             except Exception:  # noqa: BLE001
                 pass
 
+    def reset_all(self) -> dict:
+        """Wipe the ENTIRE conversation-memory stack for every user/thread: L1 working windows
+        (checkpointer), L2 durable transcript, L3 rolling summaries. Dev/demo convenience — not
+        used by normal flows. Returns per-layer counts cleared. Clearing L2/L3 matters because a
+        reset window otherwise re-seeds itself from them on the next turn (`_seed_messages`)."""
+        from eventbuddy.agent.memory import flush_all_windows
+
+        cleared = {"windows": flush_all_windows(self._checkpointer)}
+        if self._transcript is not None:
+            try:
+                cleared["transcript"] = self._transcript.clear_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"transcript clear_all failed ({type(e).__name__}: {e})")
+        if self._summarizer is not None:
+            try:
+                cleared["summaries"] = self._summarizer.clear_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"summary clear_all failed ({type(e).__name__}: {e})")
+        return cleared
+
     def run(self, text: str, ctx: RequestContext) -> str:
         # `handle_tool_errors=_handle_tool_error` classifies failures: tool-usage errors go
         # back to the loop for a corrected retry; system/config errors return clean guidance
@@ -224,6 +245,11 @@ class AgentRunner:
         messages.append(ctx.tag(text))
 
         trace, token = begin_trace()
+        # Plan 13 — publish the caller's delegated Graph token to a request-scoped ContextVar
+        # so the tool bodies' `graph_for()` acts on behalf of this user. The tool loop runs
+        # synchronously under `.invoke` on this thread, so the value is visible + isolated per
+        # request (same idiom as the ToolTrace ContextVar above).
+        graph_handle = set_graph_token(ctx.graph_token)
         try:
             result = agent.invoke({"messages": messages}, config=config)
             final = result["messages"][-1]
@@ -239,6 +265,7 @@ class AgentRunner:
                 return _format_error_block(traceback.format_exc(), trace.records)
             raise
         finally:
+            reset_graph_token(graph_handle)
             end_trace(token)
 
 

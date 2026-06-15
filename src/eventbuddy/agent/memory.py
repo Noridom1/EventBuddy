@@ -16,6 +16,10 @@ from eventbuddy.config import settings
 
 WINDOW_TTL_MINUTES = 24 * 60  # 24h working-window TTL
 LOCK_KEY = "lock:{thread_id}"
+# Key prefixes the langgraph Redis checkpointer writes under (langgraph.checkpoint.redis.base:
+# CHECKPOINT_PREFIX / CHECKPOINT_WRITE_PREFIX). A full reset scan-deletes these — it empties the
+# working windows for every thread while leaving the RediSearch indices and other app keys intact.
+CHECKPOINT_KEY_PATTERNS = ("checkpoint:*", "checkpoint_write:*")
 
 
 def build_checkpointer():
@@ -41,6 +45,33 @@ def setup_checkpointer(checkpointer) -> bool:
         return True
     except Exception:
         return False
+
+
+def flush_all_windows(checkpointer) -> int:
+    """Delete EVERY thread's working window (dev/demo reset — wipes all users, not one thread).
+    Returns the number of entries cleared. Handles both the in-memory saver (clear its stores)
+    and the Redis saver (scan-delete the checkpoint key space). Best-effort: any Redis hiccup
+    leaves the rest of the reset to proceed."""
+    if isinstance(checkpointer, InMemorySaver):
+        n = len(getattr(checkpointer, "storage", {}) or {})
+        for attr in ("storage", "writes", "blobs"):
+            d = getattr(checkpointer, attr, None)
+            if isinstance(d, dict):
+                d.clear()
+        return n
+    if not settings.redis_url:
+        return 0
+    from eventbuddy.data.redis import get_redis
+
+    client = get_redis()
+    deleted = 0
+    try:
+        for pattern in CHECKPOINT_KEY_PATTERNS:
+            for key in client.scan_iter(match=pattern, count=500):
+                deleted += client.delete(key)
+    except Exception:  # noqa: BLE001 — dev/demo convenience, never raise mid-reset
+        pass
+    return deleted
 
 
 @contextmanager

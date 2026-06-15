@@ -1,7 +1,7 @@
 import traceback
 from datetime import datetime
 
-from eventbuddy.agent.context import RequestContext
+from eventbuddy.agent.context import RequestContext, focus_key_for
 from eventbuddy.agent.intents import Intent, classify
 from eventbuddy.common.logging import get_logger
 
@@ -26,7 +26,8 @@ class Orchestrator:
     def __init__(self, *, session_store, provision_fn, resolve_event_fn,
                  remind_fn, report_fn, query_tasks_fn,
                  runner=None, agent_mode: str = "llm", role_resolver=None,
-                 channel_event_fn=None, regex_fallback_on_error: bool = True):
+                 channel_event_fn=None, member_autoenroll_fn=None,
+                 regex_fallback_on_error: bool = True):
         self.session = session_store
         self.provision = provision_fn
         self.resolve_event = resolve_event_fn
@@ -40,6 +41,10 @@ class Orchestrator:
         # caller's DM focus); this closure resolves it and backfills the real team id. None →
         # channel scope has no bound event (tests that build the orchestrator directly).
         self._channel_event_fn = channel_event_fn
+        # Group-chat onboarding: when a shared (group/channel) conversation is bound to an event,
+        # enroll the posting user as an EventMember (keyed by Teams id) so they're recognized
+        # here and in their own DM. Best-effort, server-side — None disables it (tests).
+        self._member_autoenroll_fn = member_autoenroll_fn
         # Phase 1.8: when False, a *runtime* LLM error is surfaced (debug) instead of
         # degrading to regex. The no-creds path (runner is None / agent_mode=regex) is
         # decided at wiring time and is unaffected by this flag.
@@ -47,23 +52,32 @@ class Orchestrator:
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
                    sent_at: datetime | None, team_id: str | None = None,
-                   attachments: list[dict] | None = None) -> RequestContext:
-        # In a channel the focused event is whatever is bound to this channel (and we backfill
-        # its real team id on the way); in a DM it's the caller's session focus.
-        if scope == "channel" and channel_id and self._channel_event_fn is not None:
+                   attachments: list[dict] | None = None,
+                   graph_token: str | None = None,
+                   display_name: str | None = None) -> RequestContext:
+        # In a shared conversation (a Team channel *or* a group chat) the focused event is the one
+        # bound to this conversation id — resolve it via the binding (and backfill the real team
+        # id on the way, a no-op in a group chat where team_id is None). In a 1-1 DM the focus
+        # comes from the session store, keyed to the caller.
+        if scope in ("channel", "group") and channel_id and self._channel_event_fn is not None:
             event_id = self._channel_event_fn(channel_id=channel_id, team_id=team_id)
         else:
-            event_id = self.session.get_current_event(user_id)
+            event_id = self.session.get_current_event(
+                focus_key_for(scope, user_id, channel_id)
+            )
         return RequestContext(
             user_id=user_id,
             channel_id=channel_id,
             scope=scope,
+            team_id=team_id,
             role=self._role_resolver(
                 user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
             ),
             current_event_id=event_id,
             sent_at=sent_at,
             attachments=attachments or [],
+            graph_token=graph_token,
+            display_name=display_name,
         )
 
     @staticmethod
@@ -80,13 +94,17 @@ class Orchestrator:
 
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
                scope: str = "personal", sent_at: datetime | None = None,
-               team_id: str | None = None, attachments: list[dict] | None = None) -> str:
-        # `sent_at` (Phase 1.9), `team_id` (Impl 3) + `attachments` (Impl 4) are additive +
-        # keyword-defaulted so existing callers that don't pass them keep working.
+               team_id: str | None = None, attachments: list[dict] | None = None,
+               graph_token: str | None = None, display_name: str | None = None) -> str:
+        # `sent_at` (Phase 1.9), `team_id` (Impl 3), `attachments` (Impl 4), `graph_token`
+        # (Plan 13 — delegated Graph auth) + `display_name` (group-chat speaker tagging) are
+        # additive + keyword-defaulted so existing callers that don't pass them keep working.
         attachments = attachments or []
         if self.agent_mode == "llm" and self.runner is not None:
             try:
-                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments)
+                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments,
+                                      graph_token, display_name)
+                self._maybe_autoenroll(ctx)
                 return self.runner.run(self._with_attachment_note(text, attachments), ctx)
             except Exception as e:  # noqa: BLE001
                 if not self._regex_fallback_on_error:
@@ -95,11 +113,45 @@ class Orchestrator:
                 log.warning(f"LLM agent failed ({type(e).__name__}: {e}); falling back to regex")
         return self._regex_handle(user_id=user_id, channel_id=channel_id, text=text)
 
+    def _maybe_autoenroll(self, ctx: RequestContext) -> None:
+        """In a bound shared conversation, enroll the posting user as an EventMember (keyed by
+        Teams id) so they're recognized here and in their own DM. Best-effort — a failure here
+        must never break the turn."""
+        if self._member_autoenroll_fn is None:
+            return
+        if ctx.scope not in ("group", "channel") or not ctx.current_event_id:
+            return
+        try:
+            self._member_autoenroll_fn(
+                event_id=ctx.current_event_id, user_id=ctx.user_id,
+                display_name=ctx.display_name,
+            )
+        except Exception as e:  # noqa: BLE001 — enrollment is best-effort, never fatal
+            log.warning(f"member auto-enroll skipped ({type(e).__name__}: {e})")
+
     def reset_dm(self, user_id: str) -> None:
         """Clear a user's 1-1 conversation memory + focused event (fresh start)."""
         if self.runner is not None and hasattr(self.runner, "reset"):
             self.runner.reset(f"dm:{user_id}")
         self.session.clear_current_event(user_id)
+
+    def reset_all(self) -> dict:
+        """Clear EVERY user's conversation context: all working windows, the durable transcript,
+        all rolling summaries, and every focused-event session. Dev/demo only — wipes everyone so
+        a fresh demo starts from a clean slate. Returns the per-layer counts cleared."""
+        result: dict = {}
+        if self.runner is not None and hasattr(self.runner, "reset_all"):
+            result.update(self.runner.reset_all())
+        else:
+            # Degraded/regex path: no runner, but a summarizer may still exist (built regardless).
+            summ = getattr(self, "summarizer", None)
+            if summ is not None and hasattr(summ, "clear_all"):
+                result["summaries"] = summ.clear_all()
+        clear_sessions = getattr(self.session, "clear_all", None)
+        if clear_sessions is not None:
+            result["sessions"] = clear_sessions()
+        log.info(f"reset_all cleared {result}")
+        return result
 
     def _regex_handle(self, *, user_id: str, channel_id: str | None, text: str) -> str:
         """Deterministic Phase 1 router — the graceful fallback when the LLM is unavailable."""

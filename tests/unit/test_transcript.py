@@ -150,3 +150,14 @@ def test_flush_window_persists_human_send_time(session_factory):
     with session_factory() as s:
         rows = s.query(ConversationMessage).order_by(ConversationMessage.created_at).all()
     assert rows[0].sent_at.replace(tzinfo=UTC) == sent
+
+
+def test_clear_all_deletes_every_thread(session_factory):
+    t = Transcript(session_factory=session_factory)
+    t.flush_window("dm:u1", [HumanMessage("hi"), AIMessage("hello")])
+    t.flush_window("dm:u2", [HumanMessage("yo"), AIMessage("hey")])
+    with session_factory() as s:
+        assert s.query(ConversationMessage).count() == 4
+    assert t.clear_all() == 4
+    with session_factory() as s:
+        assert s.query(ConversationMessage).count() == 0

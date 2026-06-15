@@ -14,6 +14,17 @@ def system_prompt(ctx: RequestContext, *, now: datetime | None = None) -> str:
         if ctx.current_event_id
         else "No event is focused yet."
     )
+    # Tell the model where it is so it can behave appropriately (and decide whether setup_event
+    # is relevant). In a shared chat, each human turn is tagged with its sender's name.
+    if ctx.scope == "channel":
+        where = ("You are in a Team channel shared by several organizers; each message is tagged "
+                 "with its sender's name. ")
+    elif ctx.scope == "group":
+        where = ("You are in a Teams group chat shared by several organizers; each message is "
+                 "tagged with its sender's name. ")
+    else:
+        who = f" with {ctx.display_name}" if ctx.display_name else ""
+        where = f"You are in a private 1-1 chat{who}. "
     # Anchor "now" so the per-turn send-times stamped on injected history (Phase 1.9) are
     # interpretable — without a current-time reference, "[2026-06-11 14:30 UTC]" means nothing.
     now = now or datetime.now(UTC)
@@ -21,6 +32,7 @@ def system_prompt(ctx: RequestContext, *, now: datetime | None = None) -> str:
     return (
         "You are EventBuddy, a helpful Microsoft Teams assistant for running events "
         "(broadcast, registration, reminders, the event day, feedback, and reports).\n\n"
+        + where + "\n\n"
         + now_line +
         "Some messages in the history are prefixed with their send-time, e.g. "
         "'[2026-06-11 14:30 UTC]'. Use these with the current time to reason about recency "
@@ -33,6 +45,10 @@ def system_prompt(ctx: RequestContext, *, now: datetime | None = None) -> str:
         "When the user focuses on an event you are given a snapshot of that event's shared "
         "discussion — lean on it. Call get_event_context to pull the latest shared context "
         "for the focused event when you need fresh detail.\n\n"
+        "If someone tells you this group chat or channel is for an event — whether it already "
+        "exists or is new — call setup_event with the event name (and an objective if they "
+        "describe it). That binds this conversation to the event so you can assist the "
+        "organizers here. (In a 1-1 chat, use create_event instead.)\n\n"
         "You can look things up on the internet with web_search (top results) and web_fetch "
         "(read one page in full). Use them for external facts, current information, research, "
         "or brainstorm inspiration — NOT for the event's own members, tasks, or feedback, "

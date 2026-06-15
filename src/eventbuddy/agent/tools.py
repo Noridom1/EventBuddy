@@ -153,6 +153,11 @@ def _no_read_event_file(**_kw) -> str:
     return "Reading files isn't available right now."
 
 
+def _no_setup_event(**_kw) -> str:
+    """Default `setup_event_fn` — group/channel onboarding not wired (no DB path)."""
+    return "Setting up an event for this group isn't available right now."
+
+
 def wrap_untrusted(source: str, content: str) -> str:
     """Frame external/untrusted text (web pages, channel messages) so the model treats it as
     reference data, never as instructions (Impl 3 — prompt-injection guard). Capability
@@ -203,6 +208,9 @@ class AgentDeps:
     # images via the vision model). Read-only, any member. Default no-ops (no-Graph path).
     list_event_files_fn: Callable = _no_list_event_files
     read_event_file_fn: Callable = _no_read_event_file
+    # Group-chat onboarding — `setup_event` binds the current group/channel to an event
+    # (resolve-or-create) and enrolls the caller as host. Default no-op (no-DB path).
+    setup_event_fn: Callable = _no_setup_event
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise to the runner's
     # ToolNode error handler for classification.
@@ -236,13 +244,29 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
+    def setup_event(name: str, objective: str = "") -> str:
+        """Set up THIS group chat or Team channel as the workspace for an event, and start
+        assisting the organizers in it. Call this when someone says this group/channel is for an
+        event — e.g. "this is the group for the Spring Hackathon, help us organize". `name` is
+        the event name; pass `objective` if they describe what the event is about. If an event by
+        that name already exists it's reused; otherwise a new one is created. This binds the
+        current conversation to the event (so you'll track its discussion) and makes the caller
+        the host. Only for a group chat / channel — in a 1-1 chat use create_event instead."""
+        return deps.setup_event_fn(
+            name=name, user_id=ctx.user_id, channel_id=ctx.channel_id,
+            team_id=ctx.team_id, scope=ctx.scope, role=ctx.role,
+            display_name=ctx.display_name, objective=objective,
+        )
+
+    @tool
+    @traced
     def set_focus_event(event_query: str) -> str:
         """Switch the focused event to the one matching `event_query` (a name or fragment).
         Subsequent task/reminder/report actions apply to this event."""
         event_id = deps.resolve_event_fn(event_query)
         if not event_id:
             return f"I couldn't find an event matching '{event_query}'."
-        deps.session_store.set_current_event(ctx.user_id, event_id)
+        deps.session_store.set_current_event(ctx.focus_key, event_id)
         msg = f"Focused on '{event_query}'."
         # Option B (Phase 1.9): ground the DM assistant in the event's shared conversation
         # the moment the user focuses — deterministic, no reliance on model judgment. Only
@@ -260,7 +284,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         Optionally pass a `note` to include. Requires a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to send reminders (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         msg = deps.remind_fn(event_id=event_id, user_id=ctx.user_id, raw=note)
@@ -270,7 +294,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     @traced
     def list_my_tasks() -> str:
         """List the caller's assigned tasks in the currently focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.query_tasks_fn(user_id=ctx.user_id, event_id=event_id)
 
     @tool
@@ -279,7 +303,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """Update the status of a task in the currently focused event. `task_query` matches
         the task by name; `status` is one of: todo, in_progress, done. You may update your
         own tasks; moderators/hosts may update any. Requires a focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.update_task_fn(
@@ -301,7 +325,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             # Models routinely emit a bare string for a single address — accept it, and split
             # on commas/semicolons so "a@x.com, b@y.com" works too.
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.send_mail_fn(
             user_id=ctx.user_id, event_id=event_id,
             subject=subject, body=body, recipients=recipients,
@@ -311,7 +335,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     @traced
     def generate_report() -> str:
         """Generate the AI summary report for the currently focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.report_fn(event_id=event_id, user_id=ctx.user_id)
 
     @tool
@@ -322,7 +346,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         yet registered. Requires host or moderator and a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to ingest files (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.ingest_fn(event_id=event_id, user_id=ctx.user_id, url=link or "")
@@ -336,7 +360,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         host or moderator and a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to set feedback sources (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         if not (form_url or workbook_url):
@@ -350,7 +374,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """Fetch the latest shared discussion, decisions, and open questions from the
         currently focused event. Use when you need up-to-date context about the event the
         user is working on."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event to focus on first."
         snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)
@@ -439,7 +463,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         )
 
     tools: list[BaseTool] = [
-        create_event, set_focus_event, prepare_reminders,
+        create_event, setup_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion,

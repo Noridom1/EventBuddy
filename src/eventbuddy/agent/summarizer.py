@@ -7,7 +7,7 @@ the ReAct loop. The runner reads `get_summary` to prepend context when seeding a
 working window."""
 from collections.abc import Callable
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from eventbuddy.data.db import session_scope
 from eventbuddy.domain.models import ConversationMessage, SessionSummary
@@ -84,3 +84,9 @@ class Summarizer:
             if self.summarize_session(thread_id):
                 updated += 1
         return updated
+
+    def clear_all(self) -> int:
+        """Delete EVERY rolling summary across all threads (dev/demo reset). Returns rows
+        deleted."""
+        with self._sf() as s:
+            return s.execute(delete(SessionSummary)).rowcount or 0

@@ -3,7 +3,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from eventbuddy.agent import memory as mem
-from eventbuddy.agent.memory import build_checkpointer, session_lock
+from eventbuddy.agent.memory import build_checkpointer, flush_all_windows, session_lock
 
 
 def test_build_checkpointer_in_memory_when_no_redis(monkeypatch):
@@ -48,3 +48,33 @@ def test_session_lock_noop_without_redis(monkeypatch):
     monkeypatch.setattr(mem.settings, "redis_url", "")
     with session_lock("dm:u1"):  # no redis_client, no redis_url -> no-op, no raise
         pass
+
+
+def test_flush_all_windows_clears_in_memory_saver():
+    saver = InMemorySaver()
+    saver.storage["dm:u1"] = {"x": 1}
+    saver.storage["dm:u2"] = {"y": 2}
+    n = flush_all_windows(saver)
+    assert n == 2
+    assert saver.storage == {}
+
+
+def test_flush_all_windows_scan_deletes_checkpoint_keys(monkeypatch):
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    # langgraph checkpoint keys for two threads, plus an unrelated app key that must survive.
+    r.set("checkpoint:dm:u1:ns:c1", "1")
+    r.set("checkpoint:event:ch9:ns:c2", "1")
+    r.set("checkpoint_write:dm:u1:ns:c1:0", "1")
+    r.set("session:u1", "{}")  # not a checkpoint key — left intact
+    monkeypatch.setattr(mem.settings, "redis_url", "redis://x")
+    monkeypatch.setattr("eventbuddy.data.redis.get_redis", lambda: r)
+
+    n = flush_all_windows(object())  # non-InMemorySaver -> Redis path
+    assert n == 3
+    assert r.get("session:u1") == "{}"
+    assert not list(r.scan_iter(match="checkpoint*"))
+
+
+def test_flush_all_windows_noop_without_redis(monkeypatch):
+    monkeypatch.setattr(mem.settings, "redis_url", "")
+    assert flush_all_windows(object()) == 0

@@ -18,10 +18,10 @@ log = get_logger("main")
 async def lifespan(app: FastAPI):
     scheduler = start_scheduler()
     try:
-        from eventbuddy.agent.wiring import build_summarizer
-        summarizer = build_summarizer()
-        if summarizer is not None:
-            schedule_summarizer(scheduler, summarizer)
+        # Schedule only when MaaS creds are present; the job itself rebuilds the summarizer
+        # at fire time (no live object captured — the persistent jobstore pickles job args).
+        if settings.agentbase_llm_base_url:
+            schedule_summarizer(scheduler)
     except Exception as e:  # noqa: BLE001
         log.warning(f"summarizer job not scheduled: {type(e).__name__}: {e}")
     try:

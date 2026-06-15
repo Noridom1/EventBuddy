@@ -9,6 +9,7 @@ class _FakeRunner:
     def __init__(self):
         self.threads = []
         self.resets = []
+        self.reset_all_called = 0
 
     def run(self, text, ctx):
         self.threads.append(ctx.thread_id)
@@ -17,10 +18,15 @@ class _FakeRunner:
     def reset(self, thread_id):
         self.resets.append(thread_id)
 
+    def reset_all(self):
+        self.reset_all_called += 1
+        return {"windows": 3, "transcript": 5, "summaries": 2}
+
 
 class _FakeSession:
     def __init__(self):
         self.current = {}
+        self.cleared_all = 0
 
     def get_current_event(self, user_id):
         return self.current.get(user_id)
@@ -30,6 +36,12 @@ class _FakeSession:
 
     def clear_current_event(self, user_id):
         self.current.pop(user_id, None)
+
+    def clear_all(self):
+        n = len(self.current)
+        self.current.clear()
+        self.cleared_all += 1
+        return n
 
 
 def _orch_with_runner(runner):
@@ -107,6 +119,29 @@ def test_reset_clears_thread_before_handling():
     r = c.post("/api/dev/handle", json={"user_id": "u1", "text": "fresh", "reset": True})
     assert r.status_code == 200
     assert runner.resets == ["dm:u1"]
+
+
+def test_dev_reset_all_wipes_everyone():
+    runner = _FakeRunner()
+    orch = _orch_with_runner(runner)
+    orch.session.set_current_event("u1", "ev-1")
+    r = _client(orch).post("/api/dev/reset", json={"all": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reset"] == "all"
+    # per-layer counts surfaced; sessions cleared by the orchestrator, not the runner
+    assert body["cleared"] == {"windows": 3, "transcript": 5, "summaries": 2, "sessions": 1}
+    assert runner.reset_all_called == 1
+    assert orch.session.cleared_all == 1
+
+
+def test_dev_reset_single_user_only_resets_that_dm():
+    runner = _FakeRunner()
+    orch = _orch_with_runner(runner)
+    r = _client(orch).post("/api/dev/reset", json={"user_id": "u9"})
+    assert r.json() == {"reset": "u9"}
+    assert runner.resets == ["dm:u9"]  # per-user path, not reset_all
+    assert runner.reset_all_called == 0
 
 
 class _RaisingOrch:

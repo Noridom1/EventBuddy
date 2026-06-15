@@ -101,3 +101,20 @@ def test_summarize_all_processes_pending_threads(session_factory):
 def test_unknown_thread_summary_empty(session_factory):
     summ = Summarizer(_FakeLLM(), session_factory=session_factory)
     assert summ.get_summary("dm:nobody") == ""
+
+
+def test_clear_all_deletes_every_summary(session_factory):
+    Transcript(session_factory=session_factory).flush_window(
+        "dm:u1", [HumanMessage("hi"), AIMessage("hello")]
+    )
+    Transcript(session_factory=session_factory).flush_window(
+        "dm:u2", [HumanMessage("yo"), AIMessage("hey")]
+    )
+    summ = Summarizer(_FakeLLM(), session_factory=session_factory)
+    summ.summarize_session("dm:u1")
+    summ.summarize_session("dm:u2")
+    with session_factory() as s:
+        assert s.query(SessionSummary).count() == 2
+    assert summ.clear_all() == 2
+    with session_factory() as s:
+        assert s.query(SessionSummary).count() == 0

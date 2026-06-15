@@ -50,7 +50,15 @@ class Settings(BaseSettings):
     # the tenant id; empty → fall back to the tenant id for back-compat (single-team demo).
     microsoft_team_id: str = ""
 
-    # Microsoft Graph (client-credentials baseline; AgentBase Identity later)
+    # Microsoft Graph. Two auth modes, selected by whether an OAuth connection is configured:
+    #   • Delegated (mandated by IT — Plan 13): set GRAPH_OAUTH_CONNECTION_NAME to the Azure
+    #     Bot OAuth connection that does Teams SSO → on-behalf-of. The bot then acts as the
+    #     signed-in user, bounded by that user's own access. No tenant-wide app credential.
+    #   • App-only fallback (legacy / pre-migration): the client-credentials trio below. Used
+    #     only when no OAuth connection is set, preserving graceful degradation during rollout.
+    # The Azure Bot OAuth connection name (Teams SSO). Non-empty → delegated auth is active and
+    # the app-only client-credentials path below is no longer used for interactive turns.
+    graph_oauth_connection_name: str = ""
     graph_tenant_id: str = ""
     graph_client_id: str = ""
     graph_client_secret: str = ""
