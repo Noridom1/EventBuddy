@@ -19,10 +19,14 @@ _SIGNIN_COMMANDS = {"sign in", "signin", "sign-in", "log in", "login", "connect"
 def _scope_and_team(activity) -> tuple[str, str | None]:
     """Derive conversation scope + the real Teams team id from a Bot Framework activity
     (Impl 3). A channel message has `conversation.conversation_type == "channel"` and carries
-    the team id in `channel_data.team.id`; everything else is treated as a 1-1 "personal"
-    chat. Group chats are not channels (no team/SharePoint backing), so they stay personal."""
+    the team id in `channel_data.team.id`. A multi-person group chat is `"groupChat"` — not a
+    channel (no team/SharePoint backing), but still a *shared* conversation, so it gets its own
+    "group" scope (one memory thread per chat, members speaker-tagged). Everything else (a 1-1
+    DM) is "personal"."""
     conv = activity.conversation
     conv_type = getattr(conv, "conversation_type", None) if conv else None
+    if conv_type == "groupChat":
+        return "group", None
     if conv_type != "channel":
         return "personal", None
     team_id = None
@@ -32,6 +36,20 @@ def _scope_and_team(activity) -> tuple[str, str | None]:
         if isinstance(team, dict):
             team_id = team.get("id")
     return "channel", team_id
+
+
+def _clean_text(activity) -> str:
+    """The user's message with the bot's own @mention stripped. In a group chat or channel the
+    bot only receives messages that @mention it, and `activity.text` includes the literal
+    "EventBuddy " mention — noise that would otherwise reach the LLM. In a 1-1 DM there is no
+    mention, so this is a no-op. Defensive: any parsing hiccup falls back to the raw text."""
+    text = activity.text or ""
+    try:
+        if getattr(activity, "entities", None):
+            return (TurnContext.remove_recipient_mention(activity) or text).strip()
+    except Exception:  # noqa: BLE001 — never let mention-stripping break a turn
+        pass
+    return text
 
 
 _CARD_PREFIX = "application/vnd.microsoft.card"
@@ -81,13 +99,20 @@ class EventBuddyBot(ActivityHandler):
             await confirm.handle(turn_context)
             return
 
+        # Bot @mention stripped (group chat / channel) so the LLM sees a clean message; no-op
+        # in a 1-1 DM. Used for both the sign-in keyword match and the agent input.
+        text = _clean_text(activity)
+
         # Plan 13 — an explicit "sign in" message starts the Microsoft 365 sign-in flow (shows
         # the OAuth card). Only meaningful when delegated auth is configured.
-        if delegated_enabled() and (activity.text or "").strip().lower() in _SIGNIN_COMMANDS:
+        if delegated_enabled() and text.strip().lower() in _SIGNIN_COMMANDS:
             await send_signin_prompt(turn_context)
             return
 
         user_id = activity.from_property.id if activity.from_property else "unknown"
+        # Speaker name for tagging members apart in shared (group/channel) threads (rule 2:
+        # server-derived, never model-supplied). None in a DM, where tagging is off anyway.
+        display_name = activity.from_property.name if activity.from_property else None
         channel_id = activity.conversation.id if activity.conversation else None
         # Scope + team id (Impl 3). Without this, every message — even one in a channel — was
         # treated as a DM, and channel Graph calls used the tenant id instead of the team id.
@@ -106,12 +131,13 @@ class EventBuddyBot(ActivityHandler):
                 {
                     "user_id": user_id,
                     "channel_id": channel_id,
-                    "text": activity.text or "",
+                    "text": text,
                     "scope": scope,
                     "team_id": team_id,
                     "sent_at": activity.timestamp,
                     "attachments": _attachments(activity),
                     "graph_token": graph_token,
+                    "display_name": display_name,
                 }
             )
         finally:

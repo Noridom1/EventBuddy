@@ -33,8 +33,10 @@ def test_personal_activity_yields_personal_scope():
     assert _scope_and_team(_activity("personal")) == ("personal", None)
 
 
-def test_group_chat_is_not_a_channel():
-    assert _scope_and_team(_activity("groupChat", {"team": {"id": "x"}})) == ("personal", None)
+def test_group_chat_yields_group_scope_no_team():
+    # A multi-person group chat is its own shared scope — not a channel (no team binding),
+    # not a private DM.
+    assert _scope_and_team(_activity("groupChat", {"team": {"id": "x"}})) == ("group", None)
 
 
 def test_channel_without_team_data_degrades_to_none_team():
@@ -131,3 +133,25 @@ def test_build_ctx_personal_scope_uses_session_focus():
     orch = _orch(session=_FakeSession({"u1": "ev-dm"}))
     ctx = orch._build_ctx("u1", None, "personal", None)
     assert ctx.current_event_id == "ev-dm" and ctx.scope == "personal"
+
+
+def test_build_ctx_group_scope_shares_focus_across_members():
+    # The focus is keyed on the chat's conversation id, not the caller — so two different
+    # members of the same group chat resolve the *same* focused event, and it's isolated from
+    # either member's private DM focus.
+    orch = _orch(session=_FakeSession({"group:chat-1": "ev-group", "u1": "ev-dm"}))
+    ctx_a = orch._build_ctx("u1", "chat-1", "group", None)
+    ctx_b = orch._build_ctx("u2", "chat-1", "group", None)
+    assert ctx_a.current_event_id == "ev-group"  # not u1's DM focus
+    assert ctx_b.current_event_id == "ev-group"  # shared with the other member
+    assert ctx_a.thread_id == ctx_b.thread_id == "group:chat-1"  # one shared memory thread
+
+
+def test_group_scope_speaker_tags_turns():
+    # A group-chat turn carries the sender's name so the model can tell members apart;
+    # a DM turn does not.
+    orch = _orch()
+    g = orch._build_ctx("u1", "chat-1", "group", None, display_name="Phuc")
+    assert g.tag("hi").name == "Phuc"
+    dm = orch._build_ctx("u1", None, "personal", None, display_name="Phuc")
+    assert getattr(dm.tag("hi"), "name", None) is None

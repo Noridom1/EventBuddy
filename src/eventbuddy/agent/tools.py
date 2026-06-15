@@ -242,7 +242,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         event_id = deps.resolve_event_fn(event_query)
         if not event_id:
             return f"I couldn't find an event matching '{event_query}'."
-        deps.session_store.set_current_event(ctx.user_id, event_id)
+        deps.session_store.set_current_event(ctx.focus_key, event_id)
         msg = f"Focused on '{event_query}'."
         # Option B (Phase 1.9): ground the DM assistant in the event's shared conversation
         # the moment the user focuses — deterministic, no reliance on model judgment. Only
@@ -260,7 +260,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         Optionally pass a `note` to include. Requires a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to send reminders (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         msg = deps.remind_fn(event_id=event_id, user_id=ctx.user_id, raw=note)
@@ -270,7 +270,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     @traced
     def list_my_tasks() -> str:
         """List the caller's assigned tasks in the currently focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.query_tasks_fn(user_id=ctx.user_id, event_id=event_id)
 
     @tool
@@ -279,7 +279,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """Update the status of a task in the currently focused event. `task_query` matches
         the task by name; `status` is one of: todo, in_progress, done. You may update your
         own tasks; moderators/hosts may update any. Requires a focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.update_task_fn(
@@ -301,7 +301,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             # Models routinely emit a bare string for a single address — accept it, and split
             # on commas/semicolons so "a@x.com, b@y.com" works too.
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.send_mail_fn(
             user_id=ctx.user_id, event_id=event_id,
             subject=subject, body=body, recipients=recipients,
@@ -311,7 +311,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     @traced
     def generate_report() -> str:
         """Generate the AI summary report for the currently focused event."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         return deps.report_fn(event_id=event_id, user_id=ctx.user_id)
 
     @tool
@@ -322,7 +322,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         yet registered. Requires host or moderator and a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to ingest files (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.ingest_fn(event_id=event_id, user_id=ctx.user_id, url=link or "")
@@ -336,7 +336,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         host or moderator and a focused event."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to set feedback sources (needs host or moderator)."
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         if not (form_url or workbook_url):
@@ -350,7 +350,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """Fetch the latest shared discussion, decisions, and open questions from the
         currently focused event. Use when you need up-to-date context about the event the
         user is working on."""
-        event_id = deps.session_store.get_current_event(ctx.user_id)
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event to focus on first."
         snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)

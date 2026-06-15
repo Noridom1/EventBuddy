@@ -11,8 +11,10 @@ class _Activity:
     def __init__(self, text="", value=None):
         self.text = text
         self.value = value
-        self.from_property = type("F", (), {"id": "u1"})()
-        self.conversation = type("C", (), {"id": "c1", "is_group": False})()
+        self.from_property = type("F", (), {"id": "u1", "name": "User One"})()
+        self.conversation = type(
+            "C", (), {"id": "c1", "is_group": False, "conversation_type": "personal"}
+        )()
         self.timestamp = None
 
 

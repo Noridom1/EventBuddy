@@ -16,6 +16,17 @@ def event_thread_id(channel_id: str) -> str:
     return f"event:{channel_id}"
 
 
+def focus_key_for(scope: str, user_id: str, channel_id: str | None) -> str:
+    """The session-store key under which the *focused event* is stored. In a group chat the
+    focus is shared across the members (keyed on the chat's conversation id) so everyone sees
+    the same event; in a 1-1 DM it's the caller's own. Channel scope never uses the session
+    store for focus (it resolves the channel→event binding), so its value here is irrelevant.
+    Single source of truth shared by `Orchestrator._build_ctx` and `RequestContext.focus_key`."""
+    if scope == "group" and channel_id:
+        return f"group:{channel_id}"
+    return user_id
+
+
 @dataclass
 class RequestContext:
     user_id: str
@@ -47,11 +58,21 @@ class RequestContext:
     @property
     def thread_id(self) -> str:
         """Scope-aware memory key. A channel shares one thread across its members
-        (`event:{channel_id}` — keyed on the channel until channel→event binding lands);
-        a 1-1 DM is private (`dm:{user_id}`)."""
+        (`event:{channel_id}` — keyed on the channel until channel→event binding lands); a
+        group chat likewise shares one thread (`group:{channel_id}`, keyed on the chat's
+        conversation id) so the bot sees the whole multi-person conversation as one; a 1-1 DM
+        is private (`dm:{user_id}`)."""
         if self.scope == "channel" and self.channel_id:
             return event_thread_id(self.channel_id)
+        if self.scope == "group" and self.channel_id:
+            return f"group:{self.channel_id}"
         return f"dm:{self.user_id}"
+
+    @property
+    def focus_key(self) -> str:
+        """Session-store key for this turn's focused event — shared in a group chat, per-user
+        in a DM. See `focus_key_for`."""
+        return focus_key_for(self.scope, self.user_id, self.channel_id)
 
     def tag(self, text: str) -> HumanMessage:
         """Wrap a human turn, speaker-tagged in shared event threads so the model can
@@ -61,6 +82,6 @@ class RequestContext:
         extra = {}
         if self.sent_at is not None:
             extra["additional_kwargs"] = {"sent_at": self.sent_at.isoformat()}
-        if self.scope == "channel" and self.display_name:
+        if self.scope in ("channel", "group") and self.display_name:
             return HumanMessage(content=text, name=self.display_name, **extra)
         return HumanMessage(content=text, **extra)
