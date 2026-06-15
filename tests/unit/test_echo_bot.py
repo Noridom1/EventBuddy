@@ -10,4 +10,8 @@ async def test_bot_replies_with_routed_reply(monkeypatch):
     bot = EventBuddyBot.__new__(EventBuddyBot)
     bot._graph = type("G", (), {"invoke": lambda self, s: {"reply": "Hi!"}})()
     adapter = TestAdapter(bot.on_turn)
-    await adapter.test("hello", "Hi!")
+    await adapter.send("hello")
+    # Plan 14 — the turn now also emits typing-indicator activities; the routed text reply is
+    # the message activity among them.
+    texts = [a.text for a in adapter.activity_buffer if a.type == "message"]
+    assert texts == ["Hi!"]

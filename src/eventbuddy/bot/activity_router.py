@@ -1,9 +1,13 @@
+import asyncio
+import contextvars
+
 from botbuilder.core import ActivityHandler, CardFactory, MessageFactory, TurnContext
 from botbuilder.schema import InvokeResponse
 
 from eventbuddy.agent.graph import build_agent_graph
 from eventbuddy.agent.wiring import build_orchestrator
 from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
+from eventbuddy.bot.typing import typing_indicator
 from eventbuddy.integrations.graph.delegated import (
     acquire_graph_token,
     clear_signin_needed,
@@ -143,20 +147,30 @@ class EventBuddyBot(ActivityHandler):
         # `activity.timestamp` is the channel-set send-time (UTC) — Phase 1.9 keeps it
         # instead of discarding it, so the agent can reason about when messages were sent.
         artifacts, token = begin_artifacts()
+        # Plan 14 — show the Teams typing indicator while the turn is prepared. `graph.invoke`
+        # is synchronous and blocks the event loop, so we offload it to a thread executor; that
+        # lets a background task re-send the typing dots on an interval (an in-loop task would
+        # never get scheduled while invoke blocked). `copy_context()` is captured *after*
+        # `begin_artifacts()` so the worker thread sees the turn-artifacts ContextVar — cards
+        # emitted deep in a tool body must still reach the router after the call returns.
+        ctx = contextvars.copy_context()
+        loop = asyncio.get_running_loop()
+        payload = {
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "text": text,
+            "scope": scope,
+            "team_id": team_id,
+            "sent_at": activity.timestamp,
+            "attachments": _attachments(activity),
+            "graph_token": graph_token,
+            "display_name": display_name,
+        }
         try:
-            result = self._graph.invoke(
-                {
-                    "user_id": user_id,
-                    "channel_id": channel_id,
-                    "text": text,
-                    "scope": scope,
-                    "team_id": team_id,
-                    "sent_at": activity.timestamp,
-                    "attachments": _attachments(activity),
-                    "graph_token": graph_token,
-                    "display_name": display_name,
-                }
-            )
+            async with typing_indicator(turn_context):
+                result = await loop.run_in_executor(
+                    None, lambda: ctx.run(self._graph.invoke, payload)
+                )
         finally:
             end_artifacts(token)
 
