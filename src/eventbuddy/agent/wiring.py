@@ -17,11 +17,55 @@ log = get_logger("agent.wiring")
 
 
 def _graph_creds() -> bool:
-    """True when client-credentials Graph auth is configured (so outbound sends can run).
-    Without it, prepare still works and cards still render — only the *send* degrades."""
+    """True when *some* Graph auth is configured, so the Graph-backed tools advertise + attempt
+    their capability. Under delegated auth (Plan 13) this gate is open whenever an OAuth
+    connection is set — the per-user 'is this caller signed in?' check happens at call time
+    (`graph_for()` returns None and the call degrades to a clean message). Under the legacy
+    app-only fallback it requires the client-credentials trio. Without either, prepare still
+    works and cards still render — only the live *send/read* degrades."""
+    from eventbuddy.integrations.graph.delegated import delegated_enabled
+    if delegated_enabled():
+        return True
     return bool(
         settings.graph_tenant_id and settings.graph_client_id and settings.graph_client_secret
     )
+
+
+class GraphAuthUnavailable(RuntimeError):
+    """Raised by `_default_graph()` when no Graph client can be built: delegated auth is on but
+    the caller has no token in scope (not signed in), or no auth is configured at all. Call
+    sites already wrap Graph use in try/except and degrade to a friendly message."""
+
+
+def graph_for(*, sender=None):
+    """The single Graph-client factory (Plan 13). **Delegated-first:** when an OAuth connection
+    is configured *and* a delegated token is in scope (published to the request ContextVar by
+    the runner / confirm handler / scheduler), build a client that acts **on behalf of the
+    signed-in user** — every call bounded by that user's own access. With delegated configured
+    but no token in scope (user not signed in / background host token unavailable), return None
+    — we deliberately do NOT fall back to tenant-wide app credentials (the IT mandate). Only
+    when no OAuth connection is configured at all do we use the legacy app-only client-
+    credentials provider, preserving graceful degradation during rollout. Returns None when
+    nothing is available; callers degrade."""
+    from eventbuddy.integrations.graph.client import GraphClient
+    from eventbuddy.integrations.graph.delegated import (
+        StaticTokenProvider,
+        current_graph_token,
+        delegated_enabled,
+        mark_signin_needed,
+    )
+    if delegated_enabled():
+        token = current_graph_token()
+        if token:
+            return GraphClient(StaticTokenProvider(token), sender=sender, delegated=True)
+        # Delegated configured but no token in scope → the caller isn't signed in. Flag it so the
+        # activity router can auto-prompt sign-in (only fires when Graph was actually attempted).
+        mark_signin_needed()
+        return None
+    if settings.graph_tenant_id and settings.graph_client_id and settings.graph_client_secret:
+        from eventbuddy.integrations.graph.token import MsalTokenProvider
+        return GraphClient(MsalTokenProvider(), sender=sender)
+    return None
 
 
 def _team_id_for(ev) -> str | None:
@@ -253,9 +297,15 @@ def _build_channel_event_fn():
 
 
 def _default_graph():
-    from eventbuddy.integrations.graph.client import GraphClient
-    from eventbuddy.integrations.graph.token import MsalTokenProvider
-    return GraphClient(MsalTokenProvider())
+    """Back-compat default `graph_factory` for the tool closures: build a Graph client for the
+    current caller (delegated) or app-only fallback, raising `GraphAuthUnavailable` when none
+    is available so the existing per-call try/except degrades to a friendly message."""
+    graph = graph_for()
+    if graph is None:
+        raise GraphAuthUnavailable(
+            "No Graph auth available — sign in to Microsoft 365, or configure Graph creds."
+        )
+    return graph
 
 
 def _build_read_channel_fn(graph_factory=None):
@@ -485,7 +535,14 @@ def _download_uploaded_file(attachments):
     descriptor = _pick_readable_attachment(attachments)
     if descriptor is None:
         return "I don't see a file I can read in what you sent."
-    graph = _default_graph() if (not descriptor.get("download_url") and _graph_creds()) else None
+    # Offline sources (Teams downloadUrl, data: URI, localhost) need no Graph — only a remote
+    # SharePoint/OneDrive share link does. Build a (delegated) client just for that case, so an
+    # uploaded file still reads when the user isn't signed in. `graph_for()` returns None
+    # gracefully (no raise) when no auth is available.
+    content_url = descriptor.get("content_url") or ""
+    needs_graph = not descriptor.get("download_url") and content_url.startswith(
+        ("http://", "https://"))
+    graph = graph_for() if needs_graph else None
     try:
         fetched = fetch_attachment_bytes(descriptor, graph=graph)
     except Exception as e:  # noqa: BLE001
@@ -551,12 +608,13 @@ def build_orchestrator() -> Orchestrator:
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.events import EventRepository
         from eventbuddy.data.repositories.members import MemberRepository
-        from eventbuddy.integrations.graph.client import GraphClient
-        from eventbuddy.integrations.graph.token import MsalTokenProvider
+        # graph_for() builds a client as the signed-in host (delegated) — the channel is created
+        # under the host's own access. None (host not signed in / no creds) → ProvisioningService
+        # persists the event locally and skips channel creation (graceful degradation).
         with session_scope() as s:
             svc = ProvisioningService(
                 EventRepository(s), MemberRepository(s),
-                GraphClient(MsalTokenProvider()), team_id=_team_id_for(None),
+                graph_for(), team_id=_team_id_for(None),
             )
             ev = svc.create_event(**kw)
             s.flush()
@@ -647,12 +705,10 @@ def build_orchestrator() -> Orchestrator:
                 feedback_repo = FeedbackRepository(s)
                 llm = LLMGateway()
                 # Fetch fresh Form responses from the responses workbook (the chosen path).
-                if _graph_creds():
+                graph = graph_for() if _graph_creds() else None
+                if graph is not None:
                     try:
                         from eventbuddy.capabilities.forms_sync import discover_workbook
-                        from eventbuddy.integrations.graph.client import GraphClient
-                        from eventbuddy.integrations.graph.token import MsalTokenProvider
-                        graph = GraphClient(MsalTokenProvider())
                         syncer = FormsResponseSync(graph, feedback_repo, FeedbackAnalyzer(llm))
                         if workbook_url:
                             syncer.sync(event_id=event_id, workbook_url=workbook_url)
@@ -791,10 +847,12 @@ def build_orchestrator() -> Orchestrator:
         from eventbuddy.data.repositories.events import EventRepository
         from eventbuddy.ingestion.extractor import Extractor
         from eventbuddy.ingestion.pipeline import IngestionPipeline
-        from eventbuddy.integrations.graph.client import GraphClient
-        from eventbuddy.integrations.graph.token import MsalTokenProvider
         from eventbuddy.integrations.llm.client import LLMGateway
 
+        graph = graph_for()
+        if graph is None:
+            return ("I can't read files yet — please sign in to Microsoft 365 so I can read "
+                    "the channel's files on your behalf.")
         try:
             # Resolve the event's real team id + channel up front (Impl 3 — channel Graph
             # calls need the team id, not the tenant id).
@@ -802,7 +860,6 @@ def build_orchestrator() -> Orchestrator:
                 ev = EventRepository(s).get(event_id)
                 channel_id = ev.teams_channel_id if ev else None
                 team_id = _team_id_for(ev) if ev else _team_id_for(None)
-            graph = GraphClient(MsalTokenProvider())
 
             def post_card(channel_id, card):
                 graph.send_channel_card(team_id, channel_id, card)
@@ -873,11 +930,17 @@ def build_orchestrator() -> Orchestrator:
             return ("Upload a participant list (.xlsx or .csv) here, or paste a SharePoint/"
                     "OneDrive share link, and I'll read it.")
         graph = None
-        if not descriptor.get("download_url"):  # a link/SharePoint ref → needs Graph
+        content_url = descriptor.get("content_url") or ""
+        # A remote SharePoint/OneDrive link needs Graph; an uploaded file (downloadUrl/data URI)
+        # reads offline. `graph_for()` degrades to None (no raise) when the user isn't signed in.
+        if not descriptor.get("download_url") and content_url.startswith(("http://", "https://")):
             if not _graph_creds():
                 return ("I can't open that link — Microsoft Graph isn't configured. Upload the "
                         "file directly in the chat instead.")
-            graph = _default_graph()
+            graph = graph_for()
+            if graph is None:
+                return ("I can't open that link yet — please sign in to Microsoft 365 (type "
+                        "'sign in'), or upload the file directly in the chat instead.")
         try:
             fetched = fetch_attachment_bytes(descriptor, graph=graph)
         except Exception as e:  # noqa: BLE001
@@ -1020,10 +1083,12 @@ def build_orchestrator() -> Orchestrator:
             _audit("failed")
             return False, "Couldn't send — Microsoft Graph isn't configured."
 
-        from eventbuddy.integrations.graph.client import GraphClient
-        from eventbuddy.integrations.graph.token import MsalTokenProvider
+        graph = graph_for()
+        if graph is None:
+            _audit("failed")
+            return False, ("Couldn't send — please sign in to Microsoft 365 so I can send this "
+                           "on your behalf, then confirm again.")
         try:
-            graph = GraphClient(MsalTokenProvider())
             ok, summary = _perform_send(graph=graph, payload=payload, channel=channel)
         except Exception as e:  # noqa: BLE001
             log.warning(f"confirmed {action} send failed ({type(e).__name__}: {e})")

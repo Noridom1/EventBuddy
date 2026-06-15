@@ -62,12 +62,26 @@ class ConfirmHandler:
         clicker = activity.from_property.id if activity.from_property else "unknown"
         conv = activity.conversation
         scope = "channel" if (conv and getattr(conv, "is_group", False)) else "personal"
-        reply = self.resolve(
-            action=value.get("action"),
-            pending_id=value.get("pending_id"),
-            channel=value.get("channel"),
-            clicker=clicker,
-            scope=scope,
-            channel_id=conv.id if conv else None,
+        # Plan 13 — acquire the clicker's delegated Graph token so the confirmed send acts on
+        # their behalf, and publish it to the request-scoped ContextVar that `graph_for()`
+        # reads inside `execute_fn`. None when not signed in / app-only configured — the
+        # execute path then degrades (sign-in prompt) or uses the app-only fallback.
+        from eventbuddy.integrations.graph.delegated import (
+            acquire_graph_token,
+            reset_graph_token,
+            set_graph_token,
         )
+        graph_token = await acquire_graph_token(turn_context)
+        token_handle = set_graph_token(graph_token)
+        try:
+            reply = self.resolve(
+                action=value.get("action"),
+                pending_id=value.get("pending_id"),
+                channel=value.get("channel"),
+                clicker=clicker,
+                scope=scope,
+                channel_id=conv.id if conv else None,
+            )
+        finally:
+            reset_graph_token(token_handle)
         await turn_context.send_activity(reply)

@@ -30,11 +30,16 @@ def _share_token(url: str) -> str:
 class GraphClient:
     """Thin typed wrapper over Microsoft Graph. All Microsoft writes go through here."""
 
-    def __init__(self, token_provider, http=None, sender=None):
+    def __init__(self, token_provider, http=None, sender=None, delegated=False):
         self._token = token_provider
         self._http = http or httpx.Client(base_url=GRAPH_BASE, timeout=30)
         # Mailbox to send as. Defaults to settings; overridable for tests.
         self._sender = sender if sender is not None else settings.graph_sender_upn
+        # Plan 13 — when the token is a *delegated* (on-behalf-of-the-user) token, "me" resolves
+        # to the signed-in user, so mail sends from *their* mailbox via /me/sendMail (no shared
+        # bot mailbox / Application Access Policy). App-only tokens have no "me" and use
+        # /users/{sender}/sendMail.
+        self._delegated = delegated
 
     def _headers(self) -> dict:
         return {
@@ -55,14 +60,18 @@ class GraphClient:
         return r.json()
 
     def send_mail(self, subject: str, body_html: str, to: list[str]) -> None:
-        # App (client-credentials) tokens have no "me" — send as the configured mailbox via
-        # /users/{upn}/sendMail. Mail.Send (application) should be scoped to this mailbox with
-        # an Application Access Policy. Missing sender → fail loud, not a confusing Graph 400.
-        if not self._sender:
-            raise ValueError(
-                "send_mail: no sender mailbox configured (set GRAPH_SENDER_UPN)"
-            )
-        url = f"/users/{quote(self._sender)}/sendMail"
+        # Delegated (Plan 13): "me" is the signed-in user → POST /me/sendMail; the mail comes
+        # from their own mailbox, no configured sender needed. App-only (legacy fallback): tokens
+        # have no "me", so send as the configured mailbox via /users/{upn}/sendMail (Mail.Send
+        # application, scoped by an Application Access Policy). Missing sender there → fail loud.
+        if self._delegated:
+            url = "/me/sendMail"
+        else:
+            if not self._sender:
+                raise ValueError(
+                    "send_mail: no sender mailbox configured (set GRAPH_SENDER_UPN)"
+                )
+            url = f"/users/{quote(self._sender)}/sendMail"
         payload = {
             "message": {
                 "subject": subject,

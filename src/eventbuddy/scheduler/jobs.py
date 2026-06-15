@@ -3,6 +3,23 @@ from eventbuddy.common.logging import get_logger
 log = get_logger("scheduler.jobs")
 
 
+def _resolve_host_token(host_user_id: str | None) -> tuple[str | None, str]:
+    """Background auth resolver (Plan 13). Returns `(token, status)`:
+      • app-only (no OAuth connection) → `(None, "ok")` — `graph_for()` uses the app creds;
+      • delegated + host has a valid stored token → `(token, "ok")` — act as the host;
+      • delegated + host not signed in / token expired → `(None, "reauth")` — the job degrades
+        and the host must re-open EventBuddy to re-authenticate.
+    Best-effort: never raises (token fetch is wrapped)."""
+    from eventbuddy.integrations.graph.delegated import (
+        acquire_graph_token_for_user,
+        delegated_enabled,
+    )
+    if not delegated_enabled():
+        return None, "ok"
+    token = acquire_graph_token_for_user(host_user_id) if host_user_id else None
+    return (token, "ok") if token else (None, "reauth")
+
+
 def _default_reminder_sender(event_id: str, kind: str) -> int:
     """Real out-of-band reminder send (no TurnContext): Outlook mail to the event's members
     via Graph, plus a durable `scheduled_jobs` status update. Returns the number sent.
@@ -23,6 +40,7 @@ def _default_reminder_sender(event_id: str, kind: str) -> int:
         if ev is None:
             return 0
         event_name = ev.event_name
+        host_id = ev.host_user_id
         recipients = [m.email for m in MemberRepository(s).list(event_id) if m.email]
 
     if not _graph_creds():
@@ -31,12 +49,30 @@ def _default_reminder_sender(event_id: str, kind: str) -> int:
         log.warning(f"reminder {kind} for {event_id}: Graph not configured — skipped")
         return 0
 
-    from eventbuddy.integrations.graph.client import GraphClient
-    from eventbuddy.integrations.graph.token import MsalTokenProvider
+    # Plan 13 — under delegated auth the send acts as the event host (the token service stores
+    # the host's refresh token). No valid host token → the host must re-authenticate; the job
+    # degrades rather than crashing (matching the no-creds path).
+    host_token, status = _resolve_host_token(host_id)
+    if status == "reauth":
+        with session_scope() as s:
+            ScheduledJobRepository(s).set_status(event_id=event_id, job_type=kind, status="failed")
+        log.warning(f"reminder {kind} for {event_id}: host not signed in — needs re-auth, skipped")
+        return 0
 
-    svc = ReminderService(GraphClient(MsalTokenProvider()))
-    for email in recipients:  # individually — never a shared To/CC (PII rule §11)
-        svc.remind_outlook(email=email, task_name="your event tasks", event_name=event_name)
+    from eventbuddy.agent.wiring import graph_for
+    from eventbuddy.integrations.graph.delegated import use_graph_token
+
+    with use_graph_token(host_token):  # None under app-only → graph_for uses app creds
+        graph = graph_for()
+        if graph is None:
+            with session_scope() as s:
+                ScheduledJobRepository(s).set_status(
+                    event_id=event_id, job_type=kind, status="failed")
+            log.warning(f"reminder {kind} for {event_id}: Graph unavailable — skipped")
+            return 0
+        svc = ReminderService(graph)
+        for email in recipients:  # individually — never a shared To/CC (PII rule §11)
+            svc.remind_outlook(email=email, task_name="your event tasks", event_name=event_name)
 
     with session_scope() as s:
         ScheduledJobRepository(s).set_status(event_id=event_id, job_type=kind, status="sent")
@@ -71,16 +107,43 @@ def _non_responders(member_emails: list[str], responded: set[str]) -> list[str]:
     return [e for e in member_emails if e.strip().lower() not in responded]
 
 
-def _send_form_individually(event_name: str, form_link: str, emails: list[str]) -> int:
-    """Mail the Forms link to each recipient one-by-one (never a shared To/CC — PII §11)."""
+def _send_form_individually(event_name: str, form_link: str, emails: list[str], graph) -> int:
+    """Mail the Forms link to each recipient one-by-one (never a shared To/CC — PII §11). The
+    `graph` is resolved by the caller (delegated host token under Plan 13, or app-only)."""
     from eventbuddy.capabilities.feedback import FeedbackDispatchService
-    from eventbuddy.integrations.graph.client import GraphClient
-    from eventbuddy.integrations.graph.token import MsalTokenProvider
 
-    svc = FeedbackDispatchService(GraphClient(MsalTokenProvider()))
+    svc = FeedbackDispatchService(graph)
     for email in emails:
         svc.send_form(event_name=event_name, form_link=form_link, member_emails=[email])
     return len(emails)
+
+
+def _dispatch_form_as_host(event_id: str, job_type: str, event_name: str, form_link: str,
+                           emails: list[str], host_id: str | None) -> int | None:
+    """Send the feedback form to `emails` acting as the event host (Plan 13). Returns the count
+    sent, or None when degraded (host re-auth needed / Graph unavailable) — setting the job
+    status to 'failed' in that case. Never raises."""
+    from eventbuddy.agent.wiring import graph_for
+    from eventbuddy.data.db import session_scope
+    from eventbuddy.data.repositories.scheduled_jobs import ScheduledJobRepository
+    from eventbuddy.integrations.graph.delegated import use_graph_token
+
+    host_token, status = _resolve_host_token(host_id)
+    if status == "reauth":
+        with session_scope() as s:
+            ScheduledJobRepository(s).set_status(
+                event_id=event_id, job_type=job_type, status="failed")
+        log.warning(f"{job_type} for {event_id}: host not signed in — needs re-auth, skipped")
+        return None
+    with use_graph_token(host_token):  # None under app-only → graph_for uses app creds
+        graph = graph_for()
+        if graph is None:
+            with session_scope() as s:
+                ScheduledJobRepository(s).set_status(
+                    event_id=event_id, job_type=job_type, status="failed")
+            log.warning(f"{job_type} for {event_id}: Graph unavailable — skipped")
+            return None
+        return _send_form_individually(event_name, form_link, emails, graph)
 
 
 def _default_feedback_sender(event_id: str) -> int:
@@ -99,6 +162,7 @@ def _default_feedback_sender(event_id: str) -> int:
         if ev is None:
             return 0
         event_name = ev.event_name
+        host_id = ev.host_user_id
         event_form_url = ev.feedback_form_url  # per-event link (Option 1) wins
         emails = [m.email for m in MemberRepository(s).list(event_id) if m.email]
 
@@ -110,7 +174,9 @@ def _default_feedback_sender(event_id: str) -> int:
         log.warning(f"feedback_send for {event_id}: form link / Graph not configured — skipped")
         return 0
 
-    n = _send_form_individually(event_name, form_link, emails)
+    n = _dispatch_form_as_host(event_id, "feedback_send", event_name, form_link, emails, host_id)
+    if n is None:
+        return 0  # degraded (host re-auth / Graph unavailable) — status already set
     with session_scope() as s:
         ScheduledJobRepository(s).set_status(
             event_id=event_id, job_type="feedback_send", status="sent")
@@ -137,6 +203,7 @@ def _default_followup_sender(event_id: str) -> int:
         if ev is None:
             return 0
         event_name = ev.event_name
+        host_id = ev.host_user_id
         event_form_url = ev.feedback_form_url  # per-event link (Option 1) wins
         member_emails = [m.email for m in MemberRepository(s).list(event_id) if m.email]
         responded = FeedbackRepository(s).respondent_emails(event_id)
@@ -156,7 +223,10 @@ def _default_followup_sender(event_id: str) -> int:
         log.info(f"feedback_followup for {event_id}: everyone responded — nothing to send")
         return 0
 
-    n = _send_form_individually(event_name, form_link, non_responders)
+    n = _dispatch_form_as_host(
+        event_id, "feedback_followup", event_name, form_link, non_responders, host_id)
+    if n is None:
+        return 0  # degraded (host re-auth / Graph unavailable) — status already set
     with session_scope() as s:
         ScheduledJobRepository(s).set_status(
             event_id=event_id, job_type="feedback_followup", status="sent")
@@ -188,10 +258,19 @@ def run_feedback_followup(event_id: str, sender=None) -> None:
         log.warning(f"feedback_followup for {event_id} failed: {type(e).__name__}: {e}")
 
 
-def run_summarize_sessions(summarizer) -> None:
+def run_summarize_sessions() -> None:
     """Periodic rolling-summary consolidation (Phase 1.7). Best-effort: a failure (e.g. no
-    DB/LLM creds) must not crash the scheduler."""
+    DB/LLM creds) must not crash the scheduler.
+
+    The summarizer is rebuilt here at fire time rather than captured as a job arg: a
+    persistent (SQLAlchemy) jobstore pickles each job's args, and the live summarizer holds
+    an unpicklable ``threading.RLock`` via its LLM client. Reconstructing per run keeps the
+    persisted job a bare picklable function reference."""
     try:
+        from eventbuddy.agent.wiring import build_summarizer
+        summarizer = build_summarizer()
+        if summarizer is None:
+            return
         updated = summarizer.summarize_all()
         if updated:
             log.info(f"summarize_sessions updated {updated} thread(s)")

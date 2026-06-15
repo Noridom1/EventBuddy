@@ -23,6 +23,7 @@ from eventbuddy.agent.prompts import system_prompt
 from eventbuddy.agent.tools import ToolCallRecord, begin_trace, end_trace
 from eventbuddy.agent.transcript import sent_at_prefix
 from eventbuddy.common.logging import get_logger
+from eventbuddy.integrations.graph.delegated import reset_graph_token, set_graph_token
 
 log = get_logger("agent.runner")
 
@@ -224,6 +225,11 @@ class AgentRunner:
         messages.append(ctx.tag(text))
 
         trace, token = begin_trace()
+        # Plan 13 — publish the caller's delegated Graph token to a request-scoped ContextVar
+        # so the tool bodies' `graph_for()` acts on behalf of this user. The tool loop runs
+        # synchronously under `.invoke` on this thread, so the value is visible + isolated per
+        # request (same idiom as the ToolTrace ContextVar above).
+        graph_handle = set_graph_token(ctx.graph_token)
         try:
             result = agent.invoke({"messages": messages}, config=config)
             final = result["messages"][-1]
@@ -239,6 +245,7 @@ class AgentRunner:
                 return _format_error_block(traceback.format_exc(), trace.records)
             raise
         finally:
+            reset_graph_token(graph_handle)
             end_trace(token)
 
 

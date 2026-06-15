@@ -6,11 +6,12 @@ class _Orch:
         self.seen = {}
 
     def handle(self, *, user_id, channel_id, text, scope="personal", sent_at=None,
-               team_id=None, attachments=None):
+               team_id=None, attachments=None, graph_token=None):
         self.seen["sent_at"] = sent_at
         self.seen["scope"] = scope
         self.seen["team_id"] = team_id
         self.seen["attachments"] = attachments
+        self.seen["graph_token"] = graph_token
         return f"handled:{text}"
 
 

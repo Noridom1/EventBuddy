@@ -57,10 +57,12 @@ def schedule_event_jobs(scheduler, *, event_id: str, start_at: datetime, end_at:
     _record_scheduled_jobs(event_id, sched_times)
 
 
-def schedule_summarizer(scheduler, summarizer, *, minutes: int = 5) -> None:
-    """Register the periodic rolling-summary consolidation job (Phase 1.7)."""
+def schedule_summarizer(scheduler, *, minutes: int = 5) -> None:
+    """Register the periodic rolling-summary consolidation job (Phase 1.7). The job rebuilds
+    its summarizer at fire time, so no live (unpicklable) object is captured — required for
+    the persistent SQLAlchemy jobstore, which pickles job args."""
     scheduler.add_job(
-        run_summarize_sessions, "interval", minutes=minutes, args=[summarizer],
+        run_summarize_sessions, "interval", minutes=minutes,
         id="summarize_sessions", replace_existing=True,
     )
 

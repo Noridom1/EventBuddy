@@ -16,6 +16,9 @@ class AgentState(TypedDict, total=False):
     # Impl 4 — descriptors for files attached to this turn; forwarded to the orchestrator so a
     # tool can read them. Default-safe: a turn with no files carries an empty list.
     attachments: list[dict]
+    # Plan 13 — delegated Graph bearer token for this caller, acquired at ingress (Teams SSO).
+    # Default-safe: None when delegated auth isn't configured / the user isn't signed in.
+    graph_token: str | None
     reply: str
 
 
@@ -29,6 +32,7 @@ def build_agent_graph(orchestrator):
             sent_at=state.get("sent_at"),
             team_id=state.get("team_id"),
             attachments=state.get("attachments"),
+            graph_token=state.get("graph_token"),
         )
         return {"reply": reply}
 

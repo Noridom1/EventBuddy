@@ -128,12 +128,23 @@ ok "Runtime id: $RUNTIME_ID"
 say "Waiting for runtime to reach ACTIVE (polling every 10s, ~10m timeout)"
 DEADLINE=$(( $(date +%s) + 600 ))
 STATUS=""
+# A fresh deploy transiently passes through ERROR while the container pulls,
+# runs migrations and starts uvicorn (the platform's /health probe fails during
+# that window). The runtime self-heals to ACTIVE once the app is up, so tolerate
+# ERROR and only give up if it persists across several consecutive polls.
+ERR_STREAK=0
+ERR_MAX=12
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   STATUS="$(bash "$SCRIPTS/runtime.sh" get "$RUNTIME_ID" | jq -r '.status // "UNKNOWN"')"
   printf '   status: %s\n' "$STATUS"
   case "$STATUS" in
     ACTIVE) break ;;
-    ERROR)  die "Runtime entered ERROR state. Inspect logs: make logs" ;;
+    ERROR)
+      ERR_STREAK=$(( ERR_STREAK + 1 ))
+      [ "$ERR_STREAK" -ge "$ERR_MAX" ] && \
+        die "Runtime stuck in ERROR for $ERR_STREAK polls. Inspect logs: make logs"
+      ;;
+    *) ERR_STREAK=0 ;;
   esac
   sleep 10
 done

@@ -37,6 +37,12 @@ class RequestContext:
     # inbound activity, so the model can't fabricate a file (rule 2). A tool
     # (`read_participant_file`) downloads + parses on demand.
     attachments: list[dict] = field(default_factory=list)
+    # Delegated Microsoft Graph bearer token for this caller (Plan 13). Acquired server-side
+    # from the Bot Framework token service (Teams SSO / OAuth connection) at ingress — never
+    # model-supplied (rule 2). None when delegated auth isn't configured, or the user hasn't
+    # signed in yet; the runner publishes it to a request-scoped ContextVar that
+    # `wiring.graph_for()` reads, so Graph calls act on behalf of this user.
+    graph_token: str | None = None
 
     @property
     def thread_id(self) -> str:

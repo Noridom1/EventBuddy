@@ -1,8 +1,19 @@
 from botbuilder.core import ActivityHandler, CardFactory, MessageFactory, TurnContext
+from botbuilder.schema import InvokeResponse
 
 from eventbuddy.agent.graph import build_agent_graph
 from eventbuddy.agent.wiring import build_orchestrator
 from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
+from eventbuddy.integrations.graph.delegated import (
+    acquire_graph_token,
+    clear_signin_needed,
+    delegated_enabled,
+    send_signin_prompt,
+    signin_needed,
+)
+
+# Words a user can type to start the Microsoft 365 sign-in flow (Plan 13, delegated auth).
+_SIGNIN_COMMANDS = {"sign in", "signin", "sign-in", "log in", "login", "connect", "authenticate"}
 
 
 def _scope_and_team(activity) -> tuple[str, str | None]:
@@ -70,11 +81,23 @@ class EventBuddyBot(ActivityHandler):
             await confirm.handle(turn_context)
             return
 
+        # Plan 13 — an explicit "sign in" message starts the Microsoft 365 sign-in flow (shows
+        # the OAuth card). Only meaningful when delegated auth is configured.
+        if delegated_enabled() and (activity.text or "").strip().lower() in _SIGNIN_COMMANDS:
+            await send_signin_prompt(turn_context)
+            return
+
         user_id = activity.from_property.id if activity.from_property else "unknown"
         channel_id = activity.conversation.id if activity.conversation else None
         # Scope + team id (Impl 3). Without this, every message — even one in a channel — was
         # treated as a DM, and channel Graph calls used the tenant id instead of the team id.
         scope, team_id = _scope_and_team(activity)
+        # Plan 13 — delegated Graph auth: acquire the caller's Graph token from the Bot
+        # Framework token service here, where the TurnContext exists. None when delegated auth
+        # isn't configured or the user isn't signed in yet — Graph-backed tools then degrade
+        # cleanly. Identity-bound + server-acquired, never model-supplied (rule 2).
+        graph_token = await acquire_graph_token(turn_context)
+        clear_signin_needed()  # reset the per-turn "Graph needed but no token" flag
         # `activity.timestamp` is the channel-set send-time (UTC) — Phase 1.9 keeps it
         # instead of discarding it, so the agent can reason about when messages were sent.
         artifacts, token = begin_artifacts()
@@ -88,6 +111,7 @@ class EventBuddyBot(ActivityHandler):
                     "team_id": team_id,
                     "sent_at": activity.timestamp,
                     "attachments": _attachments(activity),
+                    "graph_token": graph_token,
                 }
             )
         finally:
@@ -102,3 +126,32 @@ class EventBuddyBot(ActivityHandler):
             await turn_context.send_activity(
                 MessageFactory.attachment(CardFactory.adaptive_card(card))
             )
+        # Plan 13 — if a Graph-backed tool needed access this turn but the user has no token,
+        # auto-prompt sign-in so they can connect and retry (fires only when Graph was actually
+        # attempted — never on plain chit-chat).
+        if delegated_enabled() and graph_token is None and signin_needed():
+            await send_signin_prompt(
+                turn_context,
+                "To do that I need access to your Microsoft 365 — sign in below, then ask again.",
+            )
+
+    async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
+        """Complete the Teams sign-in flow. After the user finishes the OAuth card, Teams sends
+        a `signin/verifyState` (magic code) or `signin/tokenExchange` (SSO) invoke; we fetch the
+        now-issued token and confirm. Anything else falls through to the base handler."""
+        name = turn_context.activity.name
+        if name in ("signin/verifyState", "signin/tokenExchange"):
+            value = turn_context.activity.value if isinstance(turn_context.activity.value, dict) \
+                else {}
+            token = await acquire_graph_token(turn_context, magic_code=value.get("state"))
+            if token:
+                await turn_context.send_activity(
+                    "✅ You're signed in. Ask me again and I'll act on your behalf in Microsoft "
+                    "365."
+                )
+            else:
+                await turn_context.send_activity(
+                    "I couldn't complete the sign-in — please try 'sign in' again."
+                )
+            return InvokeResponse(status=200)
+        return await super().on_invoke_activity(turn_context)

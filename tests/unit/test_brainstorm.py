@@ -126,6 +126,8 @@ def test_no_focused_event_guides(monkeypatch):
 
 
 def test_no_graph_creds_degrades(monkeypatch):
+    # No Graph auth at all: neither delegated (OAuth connection) nor app-only creds (Plan 13).
+    monkeypatch.setattr(wiring.settings, "graph_oauth_connection_name", "")
     monkeypatch.setattr(wiring.settings, "graph_tenant_id", "")
     monkeypatch.setattr(wiring.settings, "graph_client_id", "")
     monkeypatch.setattr(wiring.settings, "graph_client_secret", "")

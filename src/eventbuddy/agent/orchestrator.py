@@ -47,7 +47,8 @@ class Orchestrator:
 
     def _build_ctx(self, user_id: str, channel_id: str | None, scope: str,
                    sent_at: datetime | None, team_id: str | None = None,
-                   attachments: list[dict] | None = None) -> RequestContext:
+                   attachments: list[dict] | None = None,
+                   graph_token: str | None = None) -> RequestContext:
         # In a channel the focused event is whatever is bound to this channel (and we backfill
         # its real team id on the way); in a DM it's the caller's session focus.
         if scope == "channel" and channel_id and self._channel_event_fn is not None:
@@ -64,6 +65,7 @@ class Orchestrator:
             current_event_id=event_id,
             sent_at=sent_at,
             attachments=attachments or [],
+            graph_token=graph_token,
         )
 
     @staticmethod
@@ -80,13 +82,16 @@ class Orchestrator:
 
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
                scope: str = "personal", sent_at: datetime | None = None,
-               team_id: str | None = None, attachments: list[dict] | None = None) -> str:
-        # `sent_at` (Phase 1.9), `team_id` (Impl 3) + `attachments` (Impl 4) are additive +
-        # keyword-defaulted so existing callers that don't pass them keep working.
+               team_id: str | None = None, attachments: list[dict] | None = None,
+               graph_token: str | None = None) -> str:
+        # `sent_at` (Phase 1.9), `team_id` (Impl 3), `attachments` (Impl 4) + `graph_token`
+        # (Plan 13 — delegated Graph auth) are additive + keyword-defaulted so existing callers
+        # that don't pass them keep working.
         attachments = attachments or []
         if self.agent_mode == "llm" and self.runner is not None:
             try:
-                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments)
+                ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments,
+                                      graph_token)
                 return self.runner.run(self._with_attachment_note(text, attachments), ctx)
             except Exception as e:  # noqa: BLE001
                 if not self._regex_fallback_on_error:
