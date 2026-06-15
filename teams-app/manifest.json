@@ -2,8 +2,7 @@
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
   "id": "c1cb26e0-a557-4669-9bfa-7d8cd9d74bdf",
-  "version": "1.0.0",
-  "packageName": "vn.com.vng.eventbuddy",
+  "version": "1.0.1",
   "developer": {
     "name": "VNG AI Lab",
     "websiteUrl": "https://aiplatform.vngcloud.vn",
@@ -26,12 +25,12 @@
   "bots": [
     {
       "botId": "caa64604-fc25-43c9-9f46-6a9cea4d135e",
-      "scopes": ["personal", "team"],
+      "scopes": ["personal", "team", "groupChat"],
       "supportsFiles": true,
       "isNotificationOnly": false,
       "commandLists": [
         {
-          "scopes": ["personal", "team"],
+          "scopes": ["personal", "team", "groupChat"],
           "commands": [
             { "title": "create event", "description": "Create a new event and its Teams channel" },
             { "title": "focus", "description": "Focus on an event so following messages apply to it" },
