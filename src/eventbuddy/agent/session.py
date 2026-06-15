@@ -32,3 +32,14 @@ class SessionStore:
         data = self._load(user_id)
         data.pop("current_event_id", None)
         self._save(user_id, data)
+
+    def clear_all(self) -> int:
+        """Delete every user's session (focused-event state). Dev/demo reset — wipes all
+        users at once. Returns the number of sessions cleared. Best-effort."""
+        n = 0
+        try:
+            for key in self.r.scan_iter(match=SESSION_KEY.format(user_id="*"), count=500):
+                n += self.r.delete(key)
+        except Exception:  # noqa: BLE001 — dev/demo convenience, never raise mid-reset
+            pass
+        return n

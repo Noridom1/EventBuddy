@@ -47,7 +47,10 @@ class EventMember(Base):
     mapping_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     event_id: Mapped[str] = mapped_column(ForeignKey("events.event_id", ondelete="CASCADE"))
     teams_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    email: Mapped[str] = mapped_column(String(255))
+    # Nullable since group-chat onboarding (setup_event / auto-enroll): a member enrolled from a
+    # Teams post is keyed by `teams_user_id` + display name — we don't have their email until a
+    # roster file / Graph lookup backfills it. Reminder/mail recipient builders skip empty emails.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     role: Mapped[str] = mapped_column(String(20), default="member")
     registration_status: Mapped[str] = mapped_column(String(20), default="pending")

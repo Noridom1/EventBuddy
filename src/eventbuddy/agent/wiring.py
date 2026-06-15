@@ -296,6 +296,92 @@ def _build_channel_event_fn():
     return channel_event_fn
 
 
+def _build_setup_event_fn():
+    """The group/channel onboarding resolver. Binds THIS conversation to an event — resolving it
+    by name, or creating it when new — and enrolls the caller as host. Identity, conversation id,
+    team id and scope are server-supplied (rule 2). Reuses the repositories directly so it does
+    NOT create a second Teams channel; it binds the existing conversation
+    (`Event.teams_channel_id` = the conversation id, the same key `by_channel` resolves). Module-
+    level + lazy `session_scope` import so tests can sqlite-redirect."""
+    def setup_event_fn(*, name, user_id, channel_id, team_id=None, scope="group",
+                       role="member", display_name=None, objective=""):
+        from sqlalchemy import select
+
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.events import EventRepository
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.domain.models import Event
+        if scope not in ("group", "channel"):
+            return ("This sets up a group or channel for an event. In a 1-1 chat, use "
+                    "create_event instead.")
+        if not channel_id:
+            return "I can't tell which conversation this is — try again from the group."
+        name = (name or "").strip()
+        if not name:
+            return "Tell me the event name, e.g. 'this is the group for Spring Hackathon'."
+        try:
+            with session_scope() as s:
+                events = EventRepository(s)
+                members = MemberRepository(s)
+                bound = events.by_channel(channel_id)
+                existing = s.scalar(select(Event).where(Event.event_name.ilike(f"%{name}%")))
+                # Rebinding this conversation to a *different* event needs host/moderator (it's
+                # disruptive); first-time setup of an unbound conversation is open to anyone (the
+                # declarer becomes host). Idempotent when already bound to the same event.
+                if bound is not None:
+                    if existing is not None and existing.event_id == bound.event_id:
+                        return f"This group is already set up for '{bound.event_name}'."
+                    if ROLE_RANK.get(role, 0) < ROLE_RANK["moderator"]:
+                        return (f"This group is already set up for '{bound.event_name}'. Ask a "
+                                "host or moderator if it should be changed.")
+                    bound.teams_channel_id = None  # free the unique binding before re-pointing it
+                    s.flush()
+                if existing is not None:
+                    target_id, event_name, created = existing.event_id, existing.event_name, False
+                else:
+                    ev = events.create(event_name=name, host_user_id=user_id,
+                                       objective=objective or None, status="ideation")
+                    target_id, event_name, created = ev.event_id, name, True
+                events.set_channel(target_id, channel_id)
+                if team_id:
+                    events.set_team_id(target_id, team_id)
+                if members.get_by_user(target_id, user_id) is None:
+                    members.add_many(target_id, [{
+                        "teams_user_id": user_id, "display_name": display_name,
+                        "role": "host", "email": None,
+                    }])
+        except Exception as e:  # noqa: BLE001 — degrade gracefully, never break the turn
+            log.warning(f"setup_event failed ({type(e).__name__}: {e})")
+            return "I couldn't set this group up right now — please try again shortly."
+        verb = "Created and set up" if created else "Set up"
+        return (f"✅ {verb} '{event_name}' for this group — I'll track this conversation's "
+                f"discussion for it, and you're set as host. (event id {target_id})")
+
+    return setup_event_fn
+
+
+def _build_member_autoenroll_fn():
+    """Builds the auto-enroll closure. Enrolls the posting user as an EventMember (keyed by Teams
+    id) when they're not yet on the bound event's roster — so organizers who join the group are
+    recognized here and in their own DM (`list_for_user` / task lookup / cross-context all key on
+    teams_user_id). Called best-effort per shared-conversation turn; the orchestrator swallows
+    failures. Module-level + lazy `session_scope` import so tests can sqlite-redirect."""
+    def member_autoenroll_fn(*, event_id, user_id, display_name=None):
+        if not (event_id and user_id):
+            return
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        with session_scope() as s:
+            repo = MemberRepository(s)
+            if repo.get_by_user(event_id, user_id) is None:
+                repo.add_many(event_id, [{
+                    "teams_user_id": user_id, "display_name": display_name,
+                    "role": "member", "email": None,
+                }])
+
+    return member_autoenroll_fn
+
+
 def _default_graph():
     """Back-compat default `graph_factory` for the tool closures: build a Graph client for the
     current caller (delegated) or app-only fallback, raising `GraphAuthUnavailable` when none
@@ -1121,6 +1207,8 @@ def build_orchestrator() -> Orchestrator:
                 return f"Couldn't fetch readable content from {url}."
             return wrap_untrusted(f"web page: {url}", page["content"])
 
+    setup_event_fn = _build_setup_event_fn()
+    member_autoenroll_fn = _build_member_autoenroll_fn()
     channel_event_fn = _build_channel_event_fn()
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
@@ -1131,6 +1219,7 @@ def build_orchestrator() -> Orchestrator:
         send_participant_reminders_fn=send_participant_reminders_fn,
         list_event_files_fn=_build_list_event_files_fn(),
         read_event_file_fn=_build_read_event_file_fn(),
+        setup_event_fn=setup_event_fn,
     )
 
     orch = Orchestrator(
@@ -1139,6 +1228,7 @@ def build_orchestrator() -> Orchestrator:
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         runner=runner, agent_mode=settings.agent_mode if runner else "regex",
         role_resolver=role_resolver, channel_event_fn=channel_event_fn,
+        member_autoenroll_fn=member_autoenroll_fn,
         regex_fallback_on_error=not settings.agent_debug,
     )
     orch.summarizer = summarizer  # exposed so main.py can schedule the consolidation job
@@ -1164,7 +1254,7 @@ def _build_runner_and_summarizer(
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
-    list_event_files_fn=None, read_event_file_fn=None,
+    list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -1202,6 +1292,7 @@ def _build_runner_and_summarizer(
         _no_send_mail,
         _no_send_participant_reminders,
         _no_set_feedback,
+        _no_setup_event,
         _no_update_task,
     )
 
@@ -1221,6 +1312,7 @@ def _build_runner_and_summarizer(
             send_participant_reminders_fn or _no_send_participant_reminders),
         list_event_files_fn=list_event_files_fn or _no_list_event_files,
         read_event_file_fn=read_event_file_fn or _no_read_event_file,
+        setup_event_fn=setup_event_fn or _no_setup_event,
         web_search_fn=web_search_fn,
         web_fetch_fn=web_fetch_fn,
         debug=settings.agent_debug,

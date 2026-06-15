@@ -59,6 +59,22 @@ def test_update_task_schema_is_query_and_status_only():
     assert set(tools["update_task"].args) == {"task_query", "status"}
 
 
+def test_setup_event_tool_passes_ctx_and_hides_identity():
+    calls = {}
+    deps, _ = _deps(setup_event_fn=lambda **kw: calls.update(kw) or "ok")
+    ctx = RequestContext(user_id="u1", channel_id="conv-1", team_id="team-9", scope="group",
+                         role="member", display_name="Alice")
+    tools = _by_name(build_tools(deps, ctx))
+    # The model only chooses name + objective; identity/conversation/scope come from ctx.
+    assert set(tools["setup_event"].args) == {"name", "objective"}
+    tools["setup_event"].invoke({"name": "Spring Hackathon", "objective": "a hackathon"})
+    assert calls == {
+        "name": "Spring Hackathon", "user_id": "u1", "channel_id": "conv-1",
+        "team_id": "team-9", "scope": "group", "role": "member",
+        "display_name": "Alice", "objective": "a hackathon",
+    }
+
+
 def test_update_task_needs_focused_event():
     deps, calls = _deps()
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))

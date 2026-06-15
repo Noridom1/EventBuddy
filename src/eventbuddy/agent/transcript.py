@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from eventbuddy.data.db import session_scope
 from eventbuddy.domain.models import ConversationMessage
@@ -161,6 +161,12 @@ class Transcript:
                 total += t
             kept.reverse()
             return [self._to_message(r) for r in kept]
+
+    def clear_all(self) -> int:
+        """Delete EVERY persisted turn across all threads (dev/demo reset). Returns rows
+        deleted. Wipes the durable transcript so a reset window won't re-seed old context."""
+        with self._session_factory() as s:
+            return s.execute(delete(ConversationMessage)).rowcount or 0
 
     @staticmethod
     def _to_message(row: ConversationMessage) -> BaseMessage:

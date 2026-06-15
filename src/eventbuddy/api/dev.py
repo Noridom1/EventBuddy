@@ -42,6 +42,16 @@ class HandleRequest(BaseModel):
     attachments: list[dict] = []
 
 
+class ResetRequest(BaseModel):
+    """Clear conversation context for testing/demoing. With `all: true` it wipes EVERY user's
+    context (all working windows, the durable transcript, all rolling summaries, every focused
+    event) — a clean slate for a fresh demo. Otherwise it resets just `user_id`'s 1-1 thread
+    (same as passing `reset: true` to `/api/dev/handle`)."""
+
+    all: bool = False
+    user_id: str = "dev-user"
+
+
 class ConfirmRequest(BaseModel):
     """Simulates an Adaptive Card `Action.Submit` click without the Emulator (which, against
     a remote/deployed bot, would need ngrok for the async reply). `pending_id` comes from the
@@ -78,6 +88,20 @@ async def dev_handle(
     except Exception as e:
         # Data-backed intents need Postgres/Redis/Graph creds; surface the cause plainly
         # instead of a 500 so the route stays useful for probing what's wired up.
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@router.post("/api/dev/reset")
+async def dev_reset(
+    body: ResetRequest, orch: Annotated[object, Depends(get_orchestrator)]
+) -> dict:
+    """Demo/testing reset. `all: true` → wipe everyone's context; else reset one user's DM."""
+    try:
+        if body.all:
+            return {"reset": "all", "cleared": orch.reset_all()}
+        orch.reset_dm(body.user_id)
+        return {"reset": body.user_id}
+    except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
 

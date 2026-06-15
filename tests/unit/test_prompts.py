@@ -27,3 +27,14 @@ def test_system_prompt_includes_now():
     p = system_prompt(RequestContext(user_id="u1"), now=datetime(2026, 6, 13, 9, 30, tzinfo=UTC))
     assert "2026-06-13 09:30 UTC" in p
     assert "current date and time" in p.lower()
+
+
+def test_prompt_states_scope_and_setup_guidance():
+    dm = system_prompt(RequestContext(user_id="u1", display_name="Alice")).lower()
+    assert "1-1 chat" in dm and "alice" in dm
+    grp = system_prompt(RequestContext(user_id="u1", scope="group")).lower()
+    assert "group chat" in grp
+    ch = system_prompt(RequestContext(user_id="u1", scope="channel")).lower()
+    assert "team channel" in ch
+    # The model is told to bind a group/channel to an event via setup_event.
+    assert "setup_event" in grp

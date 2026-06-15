@@ -153,6 +153,11 @@ def _no_read_event_file(**_kw) -> str:
     return "Reading files isn't available right now."
 
 
+def _no_setup_event(**_kw) -> str:
+    """Default `setup_event_fn` — group/channel onboarding not wired (no DB path)."""
+    return "Setting up an event for this group isn't available right now."
+
+
 def wrap_untrusted(source: str, content: str) -> str:
     """Frame external/untrusted text (web pages, channel messages) so the model treats it as
     reference data, never as instructions (Impl 3 — prompt-injection guard). Capability
@@ -203,6 +208,9 @@ class AgentDeps:
     # images via the vision model). Read-only, any member. Default no-ops (no-Graph path).
     list_event_files_fn: Callable = _no_list_event_files
     read_event_file_fn: Callable = _no_read_event_file
+    # Group-chat onboarding — `setup_event` binds the current group/channel to an event
+    # (resolve-or-create) and enrolls the caller as host. Default no-op (no-DB path).
+    setup_event_fn: Callable = _no_setup_event
     # When True, tool failures are softened (recorded + returned as a string) so the runner
     # can surface them in the debug footer; when False, they re-raise to the runner's
     # ToolNode error handler for classification.
@@ -233,6 +241,22 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             name=name, host_user_id=ctx.user_id, member_emails=member_emails, objective=objective
         )
         return f"Created event '{name}' (id {ev.event_id})."
+
+    @tool
+    @traced
+    def setup_event(name: str, objective: str = "") -> str:
+        """Set up THIS group chat or Team channel as the workspace for an event, and start
+        assisting the organizers in it. Call this when someone says this group/channel is for an
+        event — e.g. "this is the group for the Spring Hackathon, help us organize". `name` is
+        the event name; pass `objective` if they describe what the event is about. If an event by
+        that name already exists it's reused; otherwise a new one is created. This binds the
+        current conversation to the event (so you'll track its discussion) and makes the caller
+        the host. Only for a group chat / channel — in a 1-1 chat use create_event instead."""
+        return deps.setup_event_fn(
+            name=name, user_id=ctx.user_id, channel_id=ctx.channel_id,
+            team_id=ctx.team_id, scope=ctx.scope, role=ctx.role,
+            display_name=ctx.display_name, objective=objective,
+        )
 
     @tool
     @traced
@@ -439,7 +463,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         )
 
     tools: list[BaseTool] = [
-        create_event, set_focus_event, prepare_reminders,
+        create_event, setup_event, set_focus_event, prepare_reminders,
         list_my_tasks, update_task, send_outlook_mail,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion,

@@ -108,3 +108,93 @@ def test_no_runner_uses_regex():
     orch = Orchestrator(**_deps())  # runner defaults to None
     out = orch.handle(user_id="u1", channel_id=None, text="focus on AI Workshop")
     assert "Focused on 'AI Workshop'" in out
+
+
+# --- group/channel onboarding: binding + auto-enroll -----------------------------------------
+
+def test_group_scope_resolves_event_via_binding_and_carries_team_id():
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(
+        **_deps(), runner=runner,
+        channel_event_fn=lambda *, channel_id, team_id=None: "ev-bound",
+    )
+    orch.handle(user_id="u1", channel_id="conv-1", text="hi", scope="group", team_id="team-9")
+    _, ctx = runner.seen[0]
+    assert ctx.current_event_id == "ev-bound"  # from the binding, not the session focus
+    assert ctx.team_id == "team-9"
+    assert ctx.thread_id == "group:conv-1"
+
+
+def test_autoenroll_called_in_bound_shared_conversation():
+    seen = []
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(
+        **_deps(), runner=runner,
+        channel_event_fn=lambda *, channel_id, team_id=None: "ev-bound",
+        member_autoenroll_fn=lambda **kw: seen.append(kw),
+    )
+    orch.handle(user_id="u1", channel_id="conv-1", text="hi", scope="group",
+                display_name="Alice")
+    assert seen == [{"event_id": "ev-bound", "user_id": "u1", "display_name": "Alice"}]
+
+
+def test_autoenroll_skipped_in_dm():
+    seen = []
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(**_deps(), runner=runner,
+                        member_autoenroll_fn=lambda **kw: seen.append(kw))
+    orch.handle(user_id="u1", channel_id=None, text="hi")  # personal scope
+    assert seen == []
+
+
+def test_autoenroll_skipped_when_conversation_unbound():
+    seen = []
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(
+        **_deps(), runner=runner,
+        channel_event_fn=lambda *, channel_id, team_id=None: None,  # no event bound
+        member_autoenroll_fn=lambda **kw: seen.append(kw),
+    )
+    orch.handle(user_id="u1", channel_id="conv-1", text="hi", scope="group")
+    assert seen == []
+
+
+def test_autoenroll_failure_never_breaks_turn():
+    def boom(**kw):
+        raise RuntimeError("db down")
+
+    runner = _FakeRunner(reply="still works")
+    orch = Orchestrator(
+        **_deps(), runner=runner,
+        channel_event_fn=lambda *, channel_id, team_id=None: "ev-bound",
+        member_autoenroll_fn=boom,
+    )
+    out = orch.handle(user_id="u1", channel_id="conv-1", text="hi", scope="group")
+    assert out == "still works"
+
+
+def test_reset_all_coordinates_runner_and_session():
+    class _Runner(_FakeRunner):
+        def __init__(self):
+            super().__init__(reply="ok")
+            self.reset_all_seen = 0
+
+        def reset_all(self):
+            self.reset_all_seen += 1
+            return {"windows": 2, "transcript": 4, "summaries": 1}
+
+    runner = _Runner()
+    orch = Orchestrator(**_deps(), runner=runner)
+    orch.session.clear_all = lambda: 7  # session store grows a clear_all
+    out = orch.reset_all()
+    assert runner.reset_all_seen == 1
+    assert out == {"windows": 2, "transcript": 4, "summaries": 1, "sessions": 7}
+
+
+def test_reset_all_degraded_path_uses_summarizer_attr():
+    # No runner (regex/degraded): falls back to the orchestrator's summarizer attribute for L3.
+    orch = Orchestrator(**_deps())  # runner=None
+    orch.summarizer = type("S", (), {"clear_all": lambda self: 3})()
+    orch.session.clear_all = lambda: 1
+    out = orch.reset_all()
+    assert out == {"summaries": 3, "sessions": 1}

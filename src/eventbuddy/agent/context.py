@@ -33,6 +33,10 @@ class RequestContext:
     channel_id: str | None = None
     # "personal" = 1-1 DM, "channel" = a shared event channel. Drives memory scope.
     scope: str = "personal"
+    # Real Teams team/group id this conversation lives under (channel scope only — None in a
+    # group chat or DM). Server-derived from `activity.channel_data.team.id` (rule 2). Carried
+    # so `setup_event` can persist it onto the bound event for later channel Graph calls.
+    team_id: str | None = None
     # The caller's role for permission checks (server-resolved). Read-only tools ignore it.
     role: str = "member"
     # The session's focused event; resolved server-side, not model-supplied.

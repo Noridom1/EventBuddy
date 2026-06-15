@@ -204,6 +204,26 @@ class AgentRunner:
             except Exception:  # noqa: BLE001
                 pass
 
+    def reset_all(self) -> dict:
+        """Wipe the ENTIRE conversation-memory stack for every user/thread: L1 working windows
+        (checkpointer), L2 durable transcript, L3 rolling summaries. Dev/demo convenience — not
+        used by normal flows. Returns per-layer counts cleared. Clearing L2/L3 matters because a
+        reset window otherwise re-seeds itself from them on the next turn (`_seed_messages`)."""
+        from eventbuddy.agent.memory import flush_all_windows
+
+        cleared = {"windows": flush_all_windows(self._checkpointer)}
+        if self._transcript is not None:
+            try:
+                cleared["transcript"] = self._transcript.clear_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"transcript clear_all failed ({type(e).__name__}: {e})")
+        if self._summarizer is not None:
+            try:
+                cleared["summaries"] = self._summarizer.clear_all()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"summary clear_all failed ({type(e).__name__}: {e})")
+        return cleared
+
     def run(self, text: str, ctx: RequestContext) -> str:
         # `handle_tool_errors=_handle_tool_error` classifies failures: tool-usage errors go
         # back to the loop for a corrected retry; system/config errors return clean guidance
