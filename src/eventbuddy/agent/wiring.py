@@ -480,6 +480,51 @@ def _build_read_channel_fn(graph_factory=None):
     return read_channel_discussion_fn
 
 
+def _build_list_members_fn(graph_factory=None):
+    """List the people in the current conversation (Impl 8) — scope-aware and event-independent.
+    A group chat / 1-1 DM resolves via `/chats/{chat-id}/members` (the chat id is the inbound
+    `channel_id`); a Team channel resolves via `/teams/{team-id}/channels/{channel-id}/members`.
+    Read-only; wraps the roster as untrusted. The caller is a participant by construction and
+    acts under their own delegated token, so Graph enforces access — no DB membership check.
+    Degrades to a clean message (never raises)."""
+    graph_factory = graph_factory or _default_graph
+
+    def list_members_fn(*, scope, channel_id, team_id=None, user_id=None, event_id=None):
+        from eventbuddy.agent.tools import wrap_untrusted
+        if not _graph_creds():
+            return "I can't list members yet — Microsoft Graph isn't configured."
+        if scope in ("group", "personal"):
+            if not channel_id:
+                return "I can't tell which chat this is, so I can't list its members."
+            try:
+                members = graph_factory().list_chat_members(channel_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"chat member list failed ({type(e).__name__}: {e})")
+                return "I couldn't list this chat's members right now — please try again shortly."
+            where = "this chat"
+        else:  # channel
+            if not (team_id and channel_id):
+                return ("I can't list this channel's members yet — I haven't seen its Teams team "
+                        "id. Post once in the channel and try again.")
+            try:
+                members = graph_factory().list_channel_members(team_id, channel_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"channel member list failed ({type(e).__name__}: {e})")
+                return ("I couldn't list this channel's members right now — please try again "
+                        "shortly.")
+            where = "this channel"
+        if not members:
+            return f"I couldn't find anyone in {where}."
+        lines = []
+        for m in members:
+            name = m.get("display_name") or "(unknown)"
+            email = m.get("email")
+            lines.append(f"• {name} <{email}>" if email else f"• {name}")
+        return wrap_untrusted(f"members of {where}", "\n".join(lines))
+
+    return list_members_fn
+
+
 # --- Impl 5: generic file browse + on-demand read (membership-gated, read-only) ------------
 
 READ_FILE_BUDGET = 6000  # chars of file content returned to the model (window discipline)
@@ -521,12 +566,33 @@ def _resolve_channel_access(event_id, user_id):
 
 
 def _build_list_event_files_fn(graph_factory=None):
-    """List the focused event channel's files live, enriched with each file's stored catalog
-    summary + doc_type (Impl 5). Read-only, membership-gated; wraps the list as untrusted."""
+    """List the files available in the current conversation (Impl 5 + Impl 8). In a Team channel
+    this is the focused event channel's SharePoint files, enriched with each file's stored
+    catalog summary + doc_type, membership-gated. In a group chat / 1-1 DM (Impl 8) it is the
+    files shared in the chat itself (OneDrive driveItems referenced on messages) — keyed on the
+    chat id, **no focused event required**. Read-only; wraps the list as untrusted."""
     graph_factory = graph_factory or _default_graph
 
-    def list_event_files_fn(*, user_id, event_id):
+    def _list_chat_files(channel_id):
         from eventbuddy.agent.tools import wrap_untrusted
+        if not _graph_creds():
+            return "I can't read files yet — Microsoft Graph isn't configured."
+        if not channel_id:
+            return "I can't tell which chat this is, so I can't list its files."
+        try:
+            files = graph_factory().list_chat_files(channel_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"chat file list failed ({type(e).__name__}: {e})")
+            return "I couldn't list this chat's files right now — please try again shortly."
+        if not files:
+            return "No files have been shared in this chat yet."
+        lines = [f"• {f.get('name') or '(unnamed)'} (link: {f.get('url')})" for f in files]
+        return wrap_untrusted("files shared in this chat", "\n".join(lines))
+
+    def list_event_files_fn(*, user_id, event_id, scope="channel", channel_id=None):
+        from eventbuddy.agent.tools import wrap_untrusted
+        if scope in ("group", "personal"):
+            return _list_chat_files(channel_id)
         ok, info = _resolve_channel_access(event_id, user_id)
         if not ok:
             return info
@@ -577,7 +643,14 @@ def _build_read_event_file_fn(graph_factory=None):
     lazily backfills the catalog summary; wraps the content as untrusted and bounds its size."""
     graph_factory = graph_factory or _default_graph
 
-    def read_event_file_fn(*, user_id, event_id, attachments=None, file_id="", link=""):
+    def read_event_file_fn(
+        *, user_id, event_id, attachments=None, file_id="", link="",
+        scope="channel", channel_id=None,
+    ):
+        # `scope`/`channel_id` are accepted for parity with the scope-aware tools (Impl 8). A
+        # group-chat / DM file is read via its share `link` (surfaced by list_event_files's chat
+        # branch) — the `link` path below already works in any scope and needs no event. A bare
+        # `file_id` only addresses a Team channel's SharePoint folder, so it stays channel-scoped.
         from eventbuddy.agent.tools import wrap_untrusted
         from eventbuddy.ingestion.parsers import parse, render_pdf_first_page
 
@@ -585,6 +658,12 @@ def _build_read_event_file_fn(graph_factory=None):
         if not file_id and not link and not attachments:
             return ("Tell me which file to read — upload it here, use the id from "
                     "list_event_files, or paste a SharePoint/OneDrive link.")
+        # In a group chat / DM there's no channel folder to address by id — chat files are read
+        # by their share link (which list_event_files surfaces). Route a stray file_id to clean
+        # guidance instead of the channel "focus on an event" path.
+        if scope in ("group", "personal") and file_id and not link and not attachments:
+            return ("In this chat I read a file by its link — call list_event_files to get the "
+                    "file's link, then pass it as `link` (or just upload the file here).")
 
         # Source resolution → (filename, content, drive_item_id|None). An uploaded attachment
         # (file_id/link not given) is read directly — works offline (no Graph for a Teams
@@ -1319,6 +1398,7 @@ def build_orchestrator() -> Orchestrator:
         send_participant_reminders_fn=send_participant_reminders_fn,
         list_event_files_fn=_build_list_event_files_fn(),
         read_event_file_fn=_build_read_event_file_fn(),
+        list_members_fn=_build_list_members_fn(),
         setup_event_fn=setup_event_fn,
         send_email_fn=send_email_fn, send_teams_message_fn=send_teams_message_fn,
     )
@@ -1356,7 +1436,7 @@ def _build_runner_and_summarizer(
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
     list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
-    send_email_fn=None, send_teams_message_fn=None,
+    send_email_fn=None, send_teams_message_fn=None, list_members_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -1388,6 +1468,7 @@ def _build_runner_and_summarizer(
         _no_ingest,
         _no_list_event_files,
         _no_list_events,
+        _no_list_members,
         _no_read_channel,
         _no_read_event_file,
         _no_read_participant_file,
@@ -1416,6 +1497,7 @@ def _build_runner_and_summarizer(
             send_participant_reminders_fn or _no_send_participant_reminders),
         list_event_files_fn=list_event_files_fn or _no_list_event_files,
         read_event_file_fn=read_event_file_fn or _no_read_event_file,
+        list_members_fn=list_members_fn or _no_list_members,
         setup_event_fn=setup_event_fn or _no_setup_event,
         send_email_fn=send_email_fn or _no_send_email,
         send_teams_message_fn=send_teams_message_fn or _no_send_teams_message,

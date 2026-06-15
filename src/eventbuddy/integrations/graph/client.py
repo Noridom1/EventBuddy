@@ -242,3 +242,57 @@ class GraphClient:
         )
         r.raise_for_status()
         return r.json()
+
+    @staticmethod
+    def _as_member(d: dict) -> dict:
+        """Map a Graph `conversationMember` (chat or channel) → `{id, display_name, email}`.
+        `id` prefers the directory `userId`; `email` falls back to the UPN. A non-AAD member
+        (e.g. an anonymous guest) may lack both — we keep the row with empty strings rather
+        than dropping it, so the count stays honest."""
+        return {
+            "id": d.get("userId") or d.get("id") or "",
+            "display_name": d.get("displayName") or "",
+            "email": d.get("email") or d.get("userPrincipalName") or "",
+        }
+
+    def list_chat_members(self, chat_id: str) -> list[dict]:
+        """List the participants of a 1-1 or group chat → `[{id, display_name, email}]`.
+        Works for both `oneOnOne` and `group` chats (Impl 8). `chat_id` is the Bot Framework
+        `conversation.id` for a chat, which is the Graph chat id. Delegated `ChatMember.Read`
+        (or `Chat.ReadBasic`). Does not page — a chat's membership is small."""
+        url = f"/chats/{quote(chat_id, safe='')}/members"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        return [self._as_member(m) for m in r.json().get("value", [])]
+
+    def list_channel_members(self, team_id: str, channel_id: str) -> list[dict]:
+        """List the members of a Teams channel → `[{id, display_name, email}]` (Impl 8).
+        Delegated `ChannelMember.Read.All`. Requires the real `team_id`."""
+        url = f"/teams/{team_id}/channels/{channel_id}/members"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        return [self._as_member(m) for m in r.json().get("value", [])]
+
+    def list_chat_files(self, chat_id: str, limit: int = 50) -> list[dict]:
+        """List files shared in a 1-1 or group chat → `[{name, url}]` (Impl 8). A chat has no
+        SharePoint `filesFolder`; files live in the sender's OneDrive and surface as `reference`
+        attachments on chat messages. We scan the most recent `limit` messages and collect each
+        file attachment's sharing `contentUrl` (de-duplicated, newest-first). Read the bytes by
+        passing that url to `resolve_share_url` + `get_drive_item_content`. Delegated `Chat.Read`
+        (and `Files.Read.All` to later download). Bounded scan — a file shared far earlier than
+        the window won't appear; the caller surfaces that limit."""
+        url = f"/chats/{quote(chat_id, safe='')}/messages?$top={int(limit)}"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        out: list[dict] = []
+        seen: set[str] = set()
+        for m in r.json().get("value", []):
+            for att in m.get("attachments") or []:
+                if att.get("contentType") != "reference":
+                    continue
+                content_url = att.get("contentUrl")
+                if not content_url or content_url in seen:
+                    continue
+                seen.add(content_url)
+                out.append({"name": att.get("name") or "(unnamed)", "url": content_url})
+        return out

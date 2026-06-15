@@ -94,6 +94,35 @@ def test_readonly_tools_take_no_model_args(name):
     assert tools[name].args == {}
 
 
+# --- Impl 8: scope-aware members/files threaded from RequestContext -------------------
+
+def test_list_members_passes_scope_and_channel_from_context():
+    seen = {}
+    deps, _ = _deps(list_members_fn=lambda **kw: seen.update(kw) or "ok")
+    ctx = RequestContext(user_id="u1", channel_id="19:chat@thread.v2", scope="group", role="member")
+    tools = _by_name(build_tools(deps, ctx))
+    assert "list_members" in tools
+    assert tools["list_members"].args == {}  # no model-settable args (identity is server-side)
+    tools["list_members"].invoke({})
+    assert seen["scope"] == "group" and seen["channel_id"] == "19:chat@thread.v2"
+    assert "user_id" in seen  # identity injected server-side
+
+
+def test_file_tools_pass_scope_and_channel_from_context():
+    seen_list, seen_read = {}, {}
+    deps, _ = _deps(
+        list_event_files_fn=lambda **kw: seen_list.update(kw) or "ok",
+        read_event_file_fn=lambda **kw: seen_read.update(kw) or "ok",
+    )
+    ctx = RequestContext(user_id="u1", channel_id="19:chat@thread.v2", scope="personal",
+                         role="member")
+    tools = _by_name(build_tools(deps, ctx))
+    tools["list_event_files"].invoke({})
+    tools["read_event_file"].invoke({"link": "https://x/f.docx"})
+    assert seen_list["scope"] == "personal" and seen_list["channel_id"] == "19:chat@thread.v2"
+    assert seen_read["scope"] == "personal" and seen_read["link"] == "https://x/f.docx"
+
+
 # --- Phase 1.9: cross-context memory (DM ← event) -------------------------------------
 
 def _ctx_fn(snapshot="Context from event 'X': earlier discussion"):
