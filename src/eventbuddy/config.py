@@ -97,5 +97,10 @@ class Settings(BaseSettings):
     # Dev-only debug HTTP routes (no Bot Framework auth) — keep off in production.
     dev_routes_enabled: bool = False
 
+    # Plan 14 — the Teams "EventBuddy is typing…" indicator. On by default; set false to disable
+    # it entirely (e.g. while debugging a connector/typing issue). Best-effort decoration, so
+    # turning it off never changes a turn's reply.
+    typing_indicator_enabled: bool = True
+
 
 settings = Settings()

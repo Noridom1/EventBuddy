@@ -97,7 +97,19 @@ docker build --platform "$PLATFORM" -f deployment/Dockerfile -t "$IMAGE" . || di
 ok "Built $IMAGE"
 
 say "Pushing image"
-docker push "$IMAGE" || die "docker push failed (check CR login / quota)."
+# The CR login token can go stale during a slow build (login happens above, before
+# the build). Refresh it immediately before pushing, then retry once with another
+# fresh login if the registry hiccups (the generic "error from registry: unknown
+# error" is usually a stale token or a transient server-side blip, not a real quota).
+push_with_relogin() {
+  bash "$SCRIPTS/cr.sh" credentials docker-login >/dev/null 2>&1 || return 1
+  docker push "$IMAGE"
+}
+if ! push_with_relogin; then
+  say "Push failed — refreshing CR login and retrying once"
+  sleep 3
+  push_with_relogin || die "docker push failed twice (check CR login / quota / registry health)."
+fi
 ok "Pushed $IMAGE"
 
 # --------------------------------------------------- create or update runtime

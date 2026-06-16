@@ -1,3 +1,6 @@
+from eventbuddy.agent.formatting import render_markdown
+
+
 class BroadcastService:
     """Capability ① — announce an event on Teams + Outlook (architecture §5 capabilities)."""
 
@@ -19,5 +22,7 @@ class BroadcastService:
         text = f"📢 {event_name}\n{body}\nRegister: {registration_link}"
         self.graph.send_channel_message(self.team_id, channel_id, text)
         self.graph.send_mail(subject=f"[Event] {event_name}",
-                             body_html=f"<p>{body}</p><p>Register: {registration_link}</p>",
+                             body_html=render_markdown(body)
+                             + f'<p>Register: <a href="{registration_link}">'
+                               f"{registration_link}</a></p>",
                              to=member_emails)

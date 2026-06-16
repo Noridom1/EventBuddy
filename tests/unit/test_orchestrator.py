@@ -19,7 +19,7 @@ def test_create_event_routes_to_provisioning():
 
 def test_context_switch_sets_session():
     sess = _Session()
-    deps = _deps(session=sess, resolve_event=lambda q: "ev-42")
+    deps = _deps(session=sess, resolve_event=lambda q, **kw: "ev-42")
     orch = Orchestrator(**deps)
     orch.handle(user_id="u1", channel_id=None, text="focus on AI Workshop")
     assert sess.current == "ev-42"
@@ -29,7 +29,7 @@ def _deps(provisioning=None, session=None, resolve_event=None):
     return {
         "session_store": session or _Session(),
         "provision_fn": provisioning or (lambda **kw: type("E", (), {"event_id": "x"})()),
-        "resolve_event_fn": resolve_event or (lambda q: "ev-0"),
+        "resolve_event_fn": resolve_event or (lambda q, **kw: "ev-0"),
         "remind_fn": lambda **kw: None,
         "report_fn": lambda **kw: "report-done",
         "query_tasks_fn": lambda **kw: "you have 2 tasks",

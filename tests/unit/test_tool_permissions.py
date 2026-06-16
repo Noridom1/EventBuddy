@@ -21,7 +21,7 @@ def _deps(calls):
     return AgentDeps(
         session_store=_FakeSession({"m1": "ev-1", "h1": "ev-1"}),
         provision_fn=provision_fn,
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: calls.setdefault("remind", kw),
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",

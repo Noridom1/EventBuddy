@@ -23,6 +23,13 @@ class TaskRepository:
     def by_assignee(self, assignee_id: str) -> list[Task]:
         return list(self.s.scalars(select(Task).where(Task.assignee_id == assignee_id)))
 
+    def by_assignee_in_event(self, assignee_id: str, event_id: str) -> list[Task]:
+        """The caller's tasks within a single event — backs `list_my_tasks` once an event is
+        focused, so the list changes as the user switches focus (not a global cross-event dump)."""
+        return list(self.s.scalars(
+            select(Task).where(Task.assignee_id == assignee_id, Task.event_id == event_id)
+        ))
+
     def due_within(self, event_id: str, hours: int) -> list[Task]:
         cutoff = datetime.now(UTC) + timedelta(hours=hours)
         return [

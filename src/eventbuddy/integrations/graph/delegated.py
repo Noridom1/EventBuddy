@@ -106,6 +106,27 @@ def use_graph_token(token: str | None):
         reset_graph_token(handle)
 
 
+def token_scopes(token: str | None) -> str | None:
+    """Best-effort diagnostic: decode the (UNVERIFIED) JWT payload of a delegated Graph token and
+    return its `scp` claim — the space-delimited delegated scopes the token was actually granted.
+    Returns None when there's no token or it can't be parsed. Used only to explain a 403 in the
+    logs without needing Azure-admin access to inspect the OAuth connection. Scope *names* aren't
+    sensitive and we never log the token itself; we don't verify the signature (we're reading our
+    own token's claims, not trusting them). Never raises."""
+    if not token:
+        return None
+    try:
+        import base64
+        import json
+
+        payload_b64 = token.split(".")[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+        return claims.get("scp")
+    except Exception:  # noqa: BLE001 — diagnostic only; a malformed token just yields None
+        return None
+
+
 def _user_token_client(turn_context):
     """The `CloudAdapter` surfaces the token service as a `UserTokenClient` stored in turn_state
     under ``CloudAdapterBase.USER_TOKEN_CLIENT_KEY`` (the literal "UserTokenClient"). NOTE: the
@@ -232,6 +253,41 @@ async def send_signin_prompt(turn_context, text: str | None = None) -> bool:
         return True
     except Exception as e:  # noqa: BLE001 — degrade silently rather than break the turn
         log.warning(f"sign-in prompt failed ({type(e).__name__}: {e})")
+        return False
+
+
+async def sign_out_user(turn_context) -> bool:
+    """Clear the caller's cached token for the configured OAuth connection in the Bot Framework
+    token store. Needed when the consented scope set changed (e.g. IT granted a new delegated
+    permission): the token service caches the original refresh token, so a stale grant keeps
+    handing back tokens with the old `scp` until the user signs out and signs in again. Returns
+    True when a sign-out call was issued. Best-effort and never raises into the turn — mirrors
+    the UserTokenClient → legacy-adapter fallback used by `acquire_graph_token`."""
+    if not delegated_enabled():
+        return False
+    connection = settings.graph_oauth_connection_name
+    activity = turn_context.activity
+    user_id = activity.from_property.id if activity.from_property else None
+    channel_id = getattr(activity, "channel_id", None)
+
+    client = _user_token_client(turn_context)
+    if client is not None:
+        try:
+            await client.sign_out_user(user_id, connection, channel_id)
+            return True
+        except Exception as e:  # noqa: BLE001 — try the adapter path next
+            log.debug(f"UserTokenClient sign-out failed ({type(e).__name__}: {e})")
+
+    # Legacy BotFrameworkAdapter exposed sign_out_user(turn_context, connection, user_id);
+    # CloudAdapter routes through the UserTokenClient above. Guard so we never AttributeError.
+    adapter = getattr(turn_context, "adapter", None)
+    if adapter is None or not hasattr(adapter, "sign_out_user"):
+        return False
+    try:
+        await adapter.sign_out_user(turn_context, connection, user_id)
+        return True
+    except Exception as e:  # noqa: BLE001 — degrade: never break the turn
+        log.warning(f"adapter sign-out failed ({type(e).__name__}: {e})")
         return False
 
 

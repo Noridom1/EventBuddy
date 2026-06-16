@@ -1,3 +1,6 @@
+import pytest
+
+from eventbuddy.config import settings
 from eventbuddy.integrations.graph.client import GraphClient
 
 
@@ -88,6 +91,44 @@ def test_resolve_user_miss_returns_none():
     http = _RoutedHttp(get_routes={"$filter": _Resp(200, {"value": []})})
     gc = GraphClient(token_provider=_FakeToken(), http=http)
     assert gc.resolve_user("ghost") is None
+
+
+def test_resolve_user_by_alias_prefers_direct_read(monkeypatch):
+    # A bare alias resolves via a direct /users/{alias}@{domain} read — NO directory
+    # enumeration ($filter), which the tenant may deny (403). The "/users/" route matches the
+    # direct read only ("/users?$filter" has no trailing slash).
+    monkeypatch.setattr(settings, "corp_email_domain", "vng.com.vn")
+    http = _RoutedHttp(get_routes={
+        "/users/": _Resp(200, {
+            "id": "u-3", "displayName": "Anh", "userPrincipalName": "anhpn8@vng.com.vn"}),
+    })
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    user = gc.resolve_user("anhpn8")
+    assert user == {"id": "u-3", "display_name": "Anh", "upn": "anhpn8@vng.com.vn"}
+    assert not any("$filter" in u for u in http.get_calls)  # enumeration avoided
+
+
+def test_resolve_user_falls_back_to_enumeration_when_direct_read_misses(monkeypatch):
+    # Direct read 404s (no "/users/" route) → fall back to the $filter enumeration.
+    monkeypatch.setattr(settings, "corp_email_domain", "vng.com.vn")
+    http = _RoutedHttp(get_routes={
+        "$filter": _Resp(200, {"value": [
+            {"id": "u-4", "displayName": "Lam", "userPrincipalName": "lamtt7@vng.com.vn"}]}),
+    })
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    user = gc.resolve_user("lamtt7")
+    assert user["id"] == "u-4"
+    assert any("mailNickname" in u for u in http.get_calls)
+
+
+def test_resolve_user_propagates_enumeration_denial(monkeypatch):
+    # Direct read misses AND enumeration is denied → the error propagates so the caller can
+    # surface a clear "no permission" message (vs. a misleading "not found").
+    monkeypatch.setattr(settings, "corp_email_domain", "vng.com.vn")
+    http = _RoutedHttp(get_routes={"$filter": _Resp(403, {})})
+    gc = GraphClient(token_provider=_FakeToken(), http=http)
+    with pytest.raises(Exception):  # noqa: B017 — stub raises on raise_for_status(403)
+        gc.resolve_user("anhpn8")
 
 
 def test_create_one_on_one_chat_binds_both_members():

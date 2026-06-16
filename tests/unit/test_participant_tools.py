@@ -30,7 +30,7 @@ def _deps(**overrides):
     base = dict(
         session_store=_FakeSession(),
         provision_fn=lambda **kw: type("E", (), {"event_id": "ev-1"})(),
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: None,
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",

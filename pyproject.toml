@@ -27,6 +27,7 @@ dependencies = [
   "openpyxl>=3.1",        # .xlsx parsing for document ingestion (Impl 2)
   "python-docx>=1.1",     # .docx parsing for document ingestion (Impl 2)
   "pypdf>=4.0",           # .pdf parsing for document ingestion (Impl 2)
+  "markdown>=3.5",        # render model-authored Markdown bodies → HTML for email/Teams sends
 ]
 
 [project.optional-dependencies]

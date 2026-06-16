@@ -25,7 +25,7 @@ def _deps(**overrides):
     base = dict(
         session_store=_FakeSession(),
         provision_fn=provision_fn,
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: calls.setdefault("remind", kw),
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",
@@ -72,7 +72,7 @@ def test_set_focus_event_resolves_and_writes_session():
 
 
 def test_set_focus_event_unknown_returns_not_found_and_no_write():
-    deps, _ = _deps(resolve_event_fn=lambda q: None)
+    deps, _ = _deps(resolve_event_fn=lambda q, **kw: None)
     ctx = RequestContext(user_id="u1", role="host")
     tools = _by_name(build_tools(deps, ctx))
     out = tools["set_focus_event"].invoke({"event_query": "Nope"})
@@ -87,11 +87,53 @@ def test_list_my_tasks_passes_focused_event():
     assert tools["list_my_tasks"].invoke({}) == "u1:ev-3"
 
 
+def test_list_event_tasks_passes_focused_event():
+    deps, _ = _deps(list_event_tasks_fn=lambda *, event_id: f"board:{event_id}")
+    deps.session_store.set_current_event("u1", "ev-9")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert tools["list_event_tasks"].invoke({}) == "board:ev-9"
+
+
+def test_list_event_tasks_requires_focus():
+    deps, _ = _deps(list_event_tasks_fn=lambda *, event_id: "should-not-run")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert "no event is focused" in tools["list_event_tasks"].invoke({}).lower()
+
+
 @pytest.mark.parametrize("name", ["list_my_tasks", "generate_report", "get_event_context"])
 def test_readonly_tools_take_no_model_args(name):
     deps, _ = _deps()
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert tools[name].args == {}
+
+
+# --- Impl 8: scope-aware members/files threaded from RequestContext -------------------
+
+def test_list_members_passes_scope_and_channel_from_context():
+    seen = {}
+    deps, _ = _deps(list_members_fn=lambda **kw: seen.update(kw) or "ok")
+    ctx = RequestContext(user_id="u1", channel_id="19:chat@thread.v2", scope="group", role="member")
+    tools = _by_name(build_tools(deps, ctx))
+    assert "list_members" in tools
+    assert tools["list_members"].args == {}  # no model-settable args (identity is server-side)
+    tools["list_members"].invoke({})
+    assert seen["scope"] == "group" and seen["channel_id"] == "19:chat@thread.v2"
+    assert "user_id" in seen  # identity injected server-side
+
+
+def test_file_tools_pass_scope_and_channel_from_context():
+    seen_list, seen_read = {}, {}
+    deps, _ = _deps(
+        list_event_files_fn=lambda **kw: seen_list.update(kw) or "ok",
+        read_event_file_fn=lambda **kw: seen_read.update(kw) or "ok",
+    )
+    ctx = RequestContext(user_id="u1", channel_id="19:chat@thread.v2", scope="personal",
+                         role="member")
+    tools = _by_name(build_tools(deps, ctx))
+    tools["list_event_files"].invoke({})
+    tools["read_event_file"].invoke({"link": "https://x/f.docx"})
+    assert seen_list["scope"] == "personal" and seen_list["channel_id"] == "19:chat@thread.v2"
+    assert seen_read["scope"] == "personal" and seen_read["link"] == "https://x/f.docx"
 
 
 # --- Phase 1.9: cross-context memory (DM ← event) -------------------------------------

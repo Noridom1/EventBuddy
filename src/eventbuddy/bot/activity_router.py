@@ -1,19 +1,31 @@
+import asyncio
+import contextvars
+
 from botbuilder.core import ActivityHandler, CardFactory, MessageFactory, TurnContext
 from botbuilder.schema import InvokeResponse
 
 from eventbuddy.agent.graph import build_agent_graph
 from eventbuddy.agent.wiring import build_orchestrator
 from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
+from eventbuddy.bot.typing import typing_indicator
 from eventbuddy.integrations.graph.delegated import (
     acquire_graph_token,
     clear_signin_needed,
     delegated_enabled,
     send_signin_prompt,
+    sign_out_user,
     signin_needed,
 )
 
 # Words a user can type to start the Microsoft 365 sign-in flow (Plan 13, delegated auth).
 _SIGNIN_COMMANDS = {"sign in", "signin", "sign-in", "log in", "login", "connect", "authenticate"}
+# Words a user can type to clear their cached token (force a fresh sign-in/consent — e.g. after
+# IT grants a new delegated scope, since the token service caches the old grant).
+_SIGNOUT_COMMANDS = {"sign out", "signout", "sign-out", "log out", "logout", "disconnect"}
+# A diagnostic command: echo the caller's server-derived identity (the exact `teams_user_id`
+# the bot keys everything on) so you can grab it for `make seed HOST_USER_ID=...`. Only ever
+# reveals the caller's *own* id to themselves, so it carries no identity-spoofing risk (rule 2).
+_WHOAMI_COMMANDS = {"whoami", "who am i", "my id", "myid"}
 
 
 def _scope_and_team(activity) -> tuple[str, str | None]:
@@ -86,6 +98,8 @@ class EventBuddyBot(ActivityHandler):
         self._graph = build_agent_graph(orchestrator)
         # HITL confirm loop (Impl 1): handles Adaptive Card `Action.Submit` clicks.
         self._confirm = getattr(orchestrator, "confirm_handler", None)
+        # Folds a turn's per-recipient teams_dm cards into one before they're sent (or None).
+        self._coalesce_cards = getattr(orchestrator, "coalesce_cards", None)
 
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         activity = turn_context.activity
@@ -109,7 +123,32 @@ class EventBuddyBot(ActivityHandler):
             await send_signin_prompt(turn_context)
             return
 
+        # Plan 13 — "sign out" clears the cached token so the next sign-in re-consents with the
+        # current scope set (the token service otherwise keeps refreshing the original grant).
+        if delegated_enabled() and text.strip().lower() in _SIGNOUT_COMMANDS:
+            ok = await sign_out_user(turn_context)
+            await turn_context.send_activity(
+                "You're signed out of Microsoft 365. Type 'sign in' to reconnect."
+                if ok else
+                "I couldn't sign you out right now — please try again shortly."
+            )
+            return
+
         user_id = activity.from_property.id if activity.from_property else "unknown"
+
+        # Diagnostic: reply with the caller's own server-derived identity so they can copy the
+        # exact `teams_user_id` for seeding (`make seed HOST_USER_ID=...`). Placed after
+        # `user_id` is resolved; reveals only the caller's own id (no spoofing surface).
+        if text.strip().lower() in _WHOAMI_COMMANDS:
+            scope_dbg, _ = _scope_and_team(activity)
+            name_dbg = activity.from_property.name if activity.from_property else None
+            await turn_context.send_activity(
+                f"Your Teams user id is:\n\n`{user_id}`\n\n"
+                f"(name: {name_dbg or 'unknown'}, scope: {scope_dbg})\n\n"
+                f"Use it with: `make seed HOST_USER_ID={user_id}`"
+            )
+            return
+
         # Speaker name for tagging members apart in shared (group/channel) threads (rule 2:
         # server-derived, never model-supplied). None in a DM, where tagging is off anyway.
         display_name = activity.from_property.name if activity.from_property else None
@@ -126,32 +165,54 @@ class EventBuddyBot(ActivityHandler):
         # `activity.timestamp` is the channel-set send-time (UTC) — Phase 1.9 keeps it
         # instead of discarding it, so the agent can reason about when messages were sent.
         artifacts, token = begin_artifacts()
+        # Plan 14 — show the Teams typing indicator while the turn is prepared. `graph.invoke`
+        # is synchronous and blocks the event loop, so we offload it to a thread executor; that
+        # lets a background task re-send the typing dots on an interval (an in-loop task would
+        # never get scheduled while invoke blocked). `copy_context()` is captured *after*
+        # `begin_artifacts()` so the worker thread sees the turn-artifacts ContextVar — cards
+        # emitted deep in a tool body must still reach the router after the call returns.
+        ctx = contextvars.copy_context()
+        loop = asyncio.get_running_loop()
+        payload = {
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "text": text,
+            "scope": scope,
+            "team_id": team_id,
+            "sent_at": activity.timestamp,
+            "attachments": _attachments(activity),
+            "graph_token": graph_token,
+            "display_name": display_name,
+        }
         try:
-            result = self._graph.invoke(
-                {
-                    "user_id": user_id,
-                    "channel_id": channel_id,
-                    "text": text,
-                    "scope": scope,
-                    "team_id": team_id,
-                    "sent_at": activity.timestamp,
-                    "attachments": _attachments(activity),
-                    "graph_token": graph_token,
-                    "display_name": display_name,
-                }
-            )
+            async with typing_indicator(turn_context):
+                result = await loop.run_in_executor(
+                    None, lambda: ctx.run(self._graph.invoke, payload)
+                )
         finally:
             end_artifacts(token)
 
+        # Track whether the turn put *anything* on the wire. The LLM can end a turn with an empty
+        # final message (e.g. it acted via a tool and produced no closing text); if that turn also
+        # emits no cards we'd send nothing at all — and with nothing sent, the typing indicator
+        # (Plan 14) has no message to clear it and the dots linger. We backstop with a fallback.
+        sent_any = False
         reply = result.get("reply")
         if reply:
             await turn_context.send_activity(reply)
+            sent_any = True
         # Any cards a tool/capability emitted this turn (e.g. the reminder channel-choice
-        # card) are sent as attachments after the text reply.
-        for card in artifacts.cards:
+        # card) are sent as attachments after the text reply. Coalesce first so a flood of
+        # per-recipient teams_dm cards collapses to one (no-op when nothing to merge).
+        cards = artifacts.cards
+        coalesce = getattr(self, "_coalesce_cards", None)  # defensive: bot may be built via __new__
+        if coalesce is not None:
+            cards = coalesce(cards)
+        for card in cards:
             await turn_context.send_activity(
                 MessageFactory.attachment(CardFactory.adaptive_card(card))
             )
+            sent_any = True
         # Plan 13 — if a Graph-backed tool needed access this turn but the user has no token,
         # auto-prompt sign-in so they can connect and retry (fires only when Graph was actually
         # attempted — never on plain chit-chat).
@@ -160,6 +221,12 @@ class EventBuddyBot(ActivityHandler):
                 turn_context,
                 "To do that I need access to your Microsoft 365 — sign in below, then ask again.",
             )
+            sent_any = True
+        # Backstop: the turn produced no reply, no cards, and no sign-in prompt. Send a short
+        # acknowledgement so the user isn't left staring at a stuck typing indicator (and so the
+        # dots clear). Rare — only when the model returns an empty final message with no action.
+        if not sent_any:
+            await turn_context.send_activity("Sorry, I didn't catch that — could you rephrase?")
 
     async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
         """Complete the Teams sign-in flow. After the user finishes the OAuth card, Teams sends

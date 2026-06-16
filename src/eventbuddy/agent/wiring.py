@@ -1,5 +1,6 @@
 from langchain_core.messages import HumanMessage
 
+from eventbuddy.agent.formatting import render_markdown
 from eventbuddy.agent.orchestrator import Orchestrator, _default_role
 from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.roster_store import RosterStore
@@ -130,16 +131,108 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
             )
         return True, f"✅ Sent the email to {len(recipients)} recipient(s)."
     if action == "teams_dm":
-        # Generic 1-1 Teams message (event-independent). Recipient was resolved to a directory
-        # id at prepare time; create-or-get the 1-1 chat and post the message.
-        target_user_id = payload.get("target_user_id")
-        if not target_user_id:
+        # Generic 1-1 Teams message (event-independent). Recipients were resolved to directory
+        # ids at prepare time; create-or-get each 1-1 chat and post the message. Accepts the
+        # batch `targets` list; falls back to the legacy single-target shape for old pendings.
+        targets = payload.get("targets")
+        if not targets:
+            tid = payload.get("target_user_id")
+            targets = ([{"user_id": tid, "display": payload.get("target_display") or "them"}]
+                       if tid else [])
+        if not targets:
             return False, "I don't have a resolved recipient to message."
-        target = payload.get("target_display") or "them"
-        chat_id = graph.create_one_on_one_chat(target_user_id)
-        graph.send_chat_message(chat_id, payload.get("text", ""))
-        return True, f"✅ Sent the Teams message to {target}."
+        # The model authors the message in Markdown; Teams chat renders a subset of HTML,
+        # so convert and post as html (newlines/bold/bullets survive instead of collapsing).
+        body_html = render_markdown(payload.get("text", ""))
+        sent = []
+        for t in targets:
+            chat_id = graph.create_one_on_one_chat(t["user_id"])
+            graph.send_chat_message(chat_id, body_html, content_type="html")
+            sent.append(t.get("display") or "them")
+        if len(sent) == 1:
+            return True, f"✅ Sent the Teams message to {sent[0]}."
+        return True, f"✅ Sent the Teams message to {len(sent)} people ({', '.join(sent)})."
     return False, "I don't know how to perform that action."
+
+
+def _card_action_data(card: dict) -> dict:
+    """The `Action.Submit` data dict of a confirm card (carries `action` + `pending_id`), or {}."""
+    try:
+        return card["actions"][0]["data"] or {}
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+
+def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn) -> list[dict]:
+    """Merge the turn's `teams_dm` confirm cards that share the same message text into ONE card
+    per distinct message — so a model that (against instructions) calls `send_teams_message` once
+    per person still yields a single confirmation card instead of a flood.
+
+    The recipient list lives server-side in the pending store (rule 2 — never on the card button),
+    so merging means: read each card's pending payload, union the `targets` (deduped by user id),
+    store one merged pending, and emit one rebuilt card pointing at it (superseded pendings are
+    popped to free them). Non-`teams_dm` cards, and a message that only produced one card, pass
+    through untouched and in place. Best-effort: any store hiccup returns the cards unchanged so
+    card delivery never breaks."""
+    try:
+        groups: dict[str, dict] = {}  # text -> {targets, pids, payload, first_card}
+        order: list[str] = []
+        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", text)
+        for card in cards:
+            data = _card_action_data(card)
+            pid = data.get("pending_id")
+            payload = (pending_store.get(pid)
+                       if data.get("action") == "teams_dm" and pid else None)
+            if not payload or not payload.get("targets"):
+                plan.append(("pass", card))
+                continue
+            text = payload.get("text", "")
+            g = groups.get(text)
+            if g is None:
+                g = groups[text] = {"targets": [], "pids": [], "payload": payload,
+                                    "first_card": card}
+                order.append(text)
+            seen_ids = {t["user_id"] for t in g["targets"]}
+            for t in payload["targets"]:
+                if t["user_id"] not in seen_ids:
+                    seen_ids.add(t["user_id"])
+                    g["targets"].append(t)
+            g["pids"].append(pid)
+            plan.append(("dm", text))
+
+        if not any(len(g["pids"]) > 1 for g in groups.values()):
+            return cards  # nothing to merge — leave the list (and pendings) exactly as-is
+
+        final: dict[str, dict] = {}
+        for text in order:
+            g = groups[text]
+            if len(g["pids"]) <= 1:
+                final[text] = g["first_card"]
+                continue
+            merged = dict(g["payload"])
+            merged["targets"] = g["targets"]
+            merged["text"] = text
+            new_pid = pending_store.put(merged)
+            for pid in g["pids"]:
+                pending_store.pop(pid)  # supersede the per-recipient pendings
+            displays = [t["display"] for t in g["targets"]]
+            title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                     else f"Send Teams message to {len(displays)} people?")
+            final[text] = confirm_card_fn(
+                title=title, summary="A direct 1-1 Teams chat message.",
+                pending_id=new_pid, action="teams_dm", recipients=displays, body=text)
+
+        out, emitted = [], set()
+        for kind, val in plan:
+            if kind == "pass":
+                out.append(val)
+            elif val not in emitted:
+                out.append(final[val])
+                emitted.add(val)
+        return out
+    except Exception as e:  # noqa: BLE001 — coalescing is best-effort; never drop cards on error
+        log.warning(f"teams_dm card coalescing failed ({type(e).__name__}: {e})")
+        return cards
 
 
 def _expand_aliases(values) -> list[str]:
@@ -480,6 +573,51 @@ def _build_read_channel_fn(graph_factory=None):
     return read_channel_discussion_fn
 
 
+def _build_list_members_fn(graph_factory=None):
+    """List the people in the current conversation (Impl 8) — scope-aware and event-independent.
+    A group chat / 1-1 DM resolves via `/chats/{chat-id}/members` (the chat id is the inbound
+    `channel_id`); a Team channel resolves via `/teams/{team-id}/channels/{channel-id}/members`.
+    Read-only; wraps the roster as untrusted. The caller is a participant by construction and
+    acts under their own delegated token, so Graph enforces access — no DB membership check.
+    Degrades to a clean message (never raises)."""
+    graph_factory = graph_factory or _default_graph
+
+    def list_members_fn(*, scope, channel_id, team_id=None, user_id=None, event_id=None):
+        from eventbuddy.agent.tools import wrap_untrusted
+        if not _graph_creds():
+            return "I can't list members yet — Microsoft Graph isn't configured."
+        if scope in ("group", "personal"):
+            if not channel_id:
+                return "I can't tell which chat this is, so I can't list its members."
+            try:
+                members = graph_factory().list_chat_members(channel_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"chat member list failed ({type(e).__name__}: {e})")
+                return "I couldn't list this chat's members right now — please try again shortly."
+            where = "this chat"
+        else:  # channel
+            if not (team_id and channel_id):
+                return ("I can't list this channel's members yet — I haven't seen its Teams team "
+                        "id. Post once in the channel and try again.")
+            try:
+                members = graph_factory().list_channel_members(team_id, channel_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"channel member list failed ({type(e).__name__}: {e})")
+                return ("I couldn't list this channel's members right now — please try again "
+                        "shortly.")
+            where = "this channel"
+        if not members:
+            return f"I couldn't find anyone in {where}."
+        lines = []
+        for m in members:
+            name = m.get("display_name") or "(unknown)"
+            email = m.get("email")
+            lines.append(f"• {name} <{email}>" if email else f"• {name}")
+        return wrap_untrusted(f"members of {where}", "\n".join(lines))
+
+    return list_members_fn
+
+
 # --- Impl 5: generic file browse + on-demand read (membership-gated, read-only) ------------
 
 READ_FILE_BUDGET = 6000  # chars of file content returned to the model (window discipline)
@@ -521,12 +659,33 @@ def _resolve_channel_access(event_id, user_id):
 
 
 def _build_list_event_files_fn(graph_factory=None):
-    """List the focused event channel's files live, enriched with each file's stored catalog
-    summary + doc_type (Impl 5). Read-only, membership-gated; wraps the list as untrusted."""
+    """List the files available in the current conversation (Impl 5 + Impl 8). In a Team channel
+    this is the focused event channel's SharePoint files, enriched with each file's stored
+    catalog summary + doc_type, membership-gated. In a group chat / 1-1 DM (Impl 8) it is the
+    files shared in the chat itself (OneDrive driveItems referenced on messages) — keyed on the
+    chat id, **no focused event required**. Read-only; wraps the list as untrusted."""
     graph_factory = graph_factory or _default_graph
 
-    def list_event_files_fn(*, user_id, event_id):
+    def _list_chat_files(channel_id):
         from eventbuddy.agent.tools import wrap_untrusted
+        if not _graph_creds():
+            return "I can't read files yet — Microsoft Graph isn't configured."
+        if not channel_id:
+            return "I can't tell which chat this is, so I can't list its files."
+        try:
+            files = graph_factory().list_chat_files(channel_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"chat file list failed ({type(e).__name__}: {e})")
+            return "I couldn't list this chat's files right now — please try again shortly."
+        if not files:
+            return "No files have been shared in this chat yet."
+        lines = [f"• {f.get('name') or '(unnamed)'} (link: {f.get('url')})" for f in files]
+        return wrap_untrusted("files shared in this chat", "\n".join(lines))
+
+    def list_event_files_fn(*, user_id, event_id, scope="channel", channel_id=None):
+        from eventbuddy.agent.tools import wrap_untrusted
+        if scope in ("group", "personal"):
+            return _list_chat_files(channel_id)
         ok, info = _resolve_channel_access(event_id, user_id)
         if not ok:
             return info
@@ -577,7 +736,14 @@ def _build_read_event_file_fn(graph_factory=None):
     lazily backfills the catalog summary; wraps the content as untrusted and bounds its size."""
     graph_factory = graph_factory or _default_graph
 
-    def read_event_file_fn(*, user_id, event_id, attachments=None, file_id="", link=""):
+    def read_event_file_fn(
+        *, user_id, event_id, attachments=None, file_id="", link="",
+        scope="channel", channel_id=None,
+    ):
+        # `scope`/`channel_id` are accepted for parity with the scope-aware tools (Impl 8). A
+        # group-chat / DM file is read via its share `link` (surfaced by list_event_files's chat
+        # branch) — the `link` path below already works in any scope and needs no event. A bare
+        # `file_id` only addresses a Team channel's SharePoint folder, so it stays channel-scoped.
         from eventbuddy.agent.tools import wrap_untrusted
         from eventbuddy.ingestion.parsers import parse, render_pdf_first_page
 
@@ -585,6 +751,12 @@ def _build_read_event_file_fn(graph_factory=None):
         if not file_id and not link and not attachments:
             return ("Tell me which file to read — upload it here, use the id from "
                     "list_event_files, or paste a SharePoint/OneDrive link.")
+        # In a group chat / DM there's no channel folder to address by id — chat files are read
+        # by their share link (which list_event_files surfaces). Route a stray file_id to clean
+        # guidance instead of the channel "focus on an event" path.
+        if scope in ("group", "personal") and file_id and not link and not attachments:
+            return ("In this chat I read a file by its link — call list_event_files to get the "
+                    "file's link, then pass it as `link` (or just upload the file here).")
 
         # Source resolution → (filename, content, drive_item_id|None). An uploaded attachment
         # (file_id/link not given) is read directly — works offline (no Graph for a Teams
@@ -742,14 +914,51 @@ def build_orchestrator() -> Orchestrator:
             s.flush()
             return type("E", (), {"event_id": ev.event_id})()
 
-    def resolve_event_fn(query: str) -> str | None:
-        from sqlalchemy import select
+    def _score_event_match(query: str, name: str) -> int:
+        """Rank how well `name` matches `query`. Higher is better; 0 means no match. Prefers
+        exact > prefix > contiguous-substring > all-query-words-present (any order). The
+        word-overlap tier is why "AI Summit" resolves "AI Innovation Summit 2026" even though
+        it isn't a contiguous substring — the old `ilike('%query%')` missed that."""
+        q, n = query.strip().lower(), name.lower()
+        if not q:
+            return 0
+        if q == n:
+            return 100
+        if n.startswith(q):
+            return 80
+        if q in n:
+            return 60
+        q_words = [w for w in q.split() if w]
+        if q_words and all(w in n for w in q_words):
+            return 40
+        return 0
 
+    def resolve_event_fn(query: str, *, user_id: str | None = None) -> str | None:
+        """Resolve an event-name fragment to an event_id (backs `set_focus_event`). When
+        `user_id` is given, only the caller's own events (member or host) are considered — you
+        can't focus an event you're not part of — and the best name match among them wins
+        (ties broken newest-first). Falls back to a global best-match when the caller has no
+        candidates (or no user_id), so non-DB/test paths and edge cases still resolve."""
         from eventbuddy.data.db import session_scope
-        from eventbuddy.domain.models import Event
+        from eventbuddy.data.repositories.events import EventRepository
         with session_scope() as s:
-            ev = s.scalar(select(Event).where(Event.event_name.ilike(f"%{query}%")))
-            return ev.event_id if ev else None
+            repo = EventRepository(s)
+            candidates: list = []
+            if user_id:
+                candidates = [ev for ev, _role in repo.list_for_user(user_id)]
+            if not candidates:
+                from sqlalchemy import select
+
+                from eventbuddy.domain.models import Event
+                candidates = list(s.scalars(
+                    select(Event).order_by(Event.created_at.desc())
+                ))
+            best, best_score = None, 0
+            for ev in candidates:  # candidates are newest-first, so ties keep the newest
+                score = _score_event_match(query, ev.event_name)
+                if score > best_score:
+                    best, best_score = ev, score
+            return best.event_id if best else None
 
     def remind_fn(*, event_id, user_id, raw=""):
         """Impl 1: *prepare* (don't send) — resolve recipients, stash a one-shot pending
@@ -887,10 +1096,48 @@ def build_orchestrator() -> Orchestrator:
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.tasks import TaskRepository
         with session_scope() as s:
-            tasks = TaskRepository(s).by_assignee(user_id)
+            repo = TaskRepository(s)
+            # Scope to the focused event so switching focus changes the list. Without a focus
+            # (event_id None), fall back to the caller's tasks across all their events.
+            tasks = repo.by_assignee_in_event(user_id, event_id) if event_id \
+                else repo.by_assignee(user_id)
             if not tasks:
-                return "You have no assigned tasks."
+                return ("You have no assigned tasks in this event." if event_id
+                        else "You have no assigned tasks.")
             return "Your tasks:\n" + "\n".join(f"- {t.task_name} ({t.status})" for t in tasks)
+
+    def list_event_tasks_fn(*, event_id):
+        """The whole task board for one event — every task with assignee + status, grouped by
+        status — backing `list_event_tasks`. Read-only; the focused-event gate happens upstream."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.tasks import TaskRepository
+        try:
+            with session_scope() as s:
+                tasks = TaskRepository(s).list(event_id)
+                if not tasks:
+                    return "This event has no tasks yet."
+                # Resolve assignee display names once (id/email → name) for readable output.
+                members = MemberRepository(s).list(event_id)
+                by_id = {m.teams_user_id: m.display_name for m in members if m.teams_user_id}
+                by_email = {m.email: m.display_name for m in members if m.email}
+
+                def who(t):
+                    name = by_id.get(t.assignee_id) or by_email.get(t.assignee_email)
+                    return name or t.assignee_email or "unassigned"
+
+                order = {"todo": 0, "in_progress": 1, "done": 2}
+                label = {"todo": "To do", "in_progress": "In progress", "done": "Done"}
+                tasks.sort(key=lambda t: (order.get(t.status, 9), t.task_name.lower()))
+                lines = [f"Task board ({len(tasks)} task(s)):"]
+                for t in tasks:
+                    lines.append(
+                        f"- {t.task_name} — {label.get(t.status, t.status)} (assignee: {who(t)})"
+                    )
+                return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"list event tasks failed ({type(e).__name__}: {e})")
+            return "I couldn't load the event's tasks right now — please try again."
 
     def update_task_fn(*, user_id, role, event_id, task_query, status):
         """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
@@ -945,7 +1192,7 @@ def build_orchestrator() -> Orchestrator:
         payload = {
             "type": "mail", "event_id": event_id, "event_name": event_name,
             "requested_by": user_id, "subject": subject,
-            "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+            "body_html": render_markdown(body), "recipient_emails": emails,
         }
         try:
             pending_id = pending_store.put(payload)
@@ -968,7 +1215,7 @@ def build_orchestrator() -> Orchestrator:
                     "corporate domain is configured.")
         payload = {
             "type": "mail", "event_id": None, "requested_by": user_id,
-            "subject": subject, "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+            "subject": subject, "body_html": render_markdown(body), "recipient_emails": emails,
             "min_role": "member",
         }
         try:
@@ -982,12 +1229,22 @@ def build_orchestrator() -> Orchestrator:
         ))
         return f"Drafted the email to {len(emails)} recipient(s) — confirm on the card to send."
 
-    def send_teams_message_fn(*, user_id, recipient, message):
-        """Generic (event-independent) 1-1 Teams message: resolve the recipient from a corporate
-        alias/email to a directory user, then draft behind the HITL confirm card. The directory
-        lookup acts on the caller's behalf (delegated Graph) — degrades cleanly when not signed
-        in or the user can't be found. The send (create chat + post) happens on confirm."""
-        if not (recipient or "").strip():
+    def send_teams_message_fn(*, user_id, recipients, message):
+        """Generic (event-independent) 1-1 Teams message to one or more colleagues: resolve each
+        recipient (corporate alias/email) to a directory user, then draft a SINGLE HITL confirm
+        card covering the whole batch — the same `message` goes to each. The directory lookup
+        acts on the caller's behalf (delegated Graph) and degrades cleanly. The sends (create
+        chat + post, per recipient) happen on confirm."""
+        # Normalize to a deduped list (case-insensitive, order-preserving) — the model may pass a
+        # single string or a list; either way we want one card for the batch.
+        raw = recipients if isinstance(recipients, list) else [recipients]
+        names, seen = [], set()
+        for r in raw:
+            r = (r or "").strip()
+            if r and r.lower() not in seen:
+                seen.add(r.lower())
+                names.append(r)
+        if not names:
             return "Tell me who to message — a corporate alias (e.g. 'phucnlt2') or their email."
         if not (message or "").strip():
             return "Tell me what the message should say."
@@ -997,30 +1254,66 @@ def build_orchestrator() -> Orchestrator:
         if graph is None:
             return ("I can't send Teams messages yet — please sign in to Microsoft 365 (type "
                     "'sign in') so I can send it on your behalf.")
-        try:
-            user = graph.resolve_user(recipient)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"user resolve failed ({type(e).__name__}: {e})")
-            return "I couldn't reach the Teams directory right now — please try again shortly."
-        if not user or not user.get("id"):
-            return (f"I couldn't find '{recipient}' in the directory — check the alias or use "
-                    "their full email address.")
-        display = user.get("display_name") or user.get("upn") or recipient
+        resolved, not_found = [], []
+        for name in names:
+            try:
+                user = graph.resolve_user(name)
+            except Exception as e:  # noqa: BLE001
+                # A 403 is a tenant directory-access denial (not a per-recipient miss) — it'll hit
+                # every lookup, so abort the whole batch with one clear message. Nothing is sent.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 403:
+                    from eventbuddy.integrations.graph.delegated import (
+                        current_graph_token,
+                        token_scopes,
+                    )
+                    granted = token_scopes(current_graph_token())
+                    log.warning(
+                        f"directory lookup denied (403) resolving '{name}' — the signed-in "
+                        "user's Graph token can't read the directory. Scopes actually granted on "
+                        f"this token: {granted!r}. The tenant likely blocks directory reads for "
+                        "delegated callers; an Entra admin must allow it."
+                    )
+                    return ("I couldn't send it — I don't have permission to look people up in "
+                            "your organisation's directory yet. Please ask an admin to grant "
+                            "directory read access, then try again.")
+                log.warning(f"user resolve failed ({type(e).__name__}: {e})")
+                return ("I couldn't send it — the Teams directory is unreachable right now. "
+                        "Please ask me to try again shortly.")
+            if not user or not user.get("id"):
+                not_found.append(name)
+                continue
+            resolved.append({
+                "user_id": user["id"],
+                "display": user.get("display_name") or user.get("upn") or name,
+            })
+        if not resolved:
+            missing = ", ".join(not_found)
+            return (f"I couldn't find {missing} in the directory — check the alias(es) or use "
+                    "full email addresses.")
         payload = {
             "type": "teams_dm", "event_id": None, "requested_by": user_id,
-            "target_user_id": user["id"], "target_display": display, "text": message,
-            "min_role": "member",
+            "targets": resolved, "text": message, "min_role": "member",
         }
         try:
             pending_id = pending_store.put(payload)
         except Exception as e:  # noqa: BLE001
             log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
             return "Message confirmation is temporarily unavailable — please try again."
+        displays = [t["display"] for t in resolved]
+        title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                 else f"Send Teams message to {len(displays)} people?")
         emit_card(confirm_card(
-            title=f"Send Teams message to {display}?", summary="A direct 1-1 Teams chat message.",
-            pending_id=pending_id, action="teams_dm", recipients=[display], body=message,
+            title=title, summary="A direct 1-1 Teams chat message.",
+            pending_id=pending_id, action="teams_dm", recipients=displays, body=message,
         ))
-        return f"Drafted a Teams message to {display} — confirm on the card to send."
+        reply = (f"Drafted a Teams message to {displays[0]} — confirm on the card to send."
+                 if len(displays) == 1
+                 else f"Drafted a Teams message to {len(displays)} recipient(s) — confirm on the "
+                      "card to send.")
+        if not_found:
+            reply += f" (Couldn't find: {', '.join(not_found)}.)"
+        return reply
 
     def ingest_fn(*, event_id, user_id, url=""):
         """Impl 2: pull the focused event's channel SharePoint files (or a pasted link)
@@ -1190,7 +1483,7 @@ def build_orchestrator() -> Orchestrator:
                 log.warning(f"event lookup for participant send failed ({type(e).__name__}: {e})")
         payload = {
             "type": "mail", "event_id": event_id, "event_name": event_name,
-            "requested_by": user_id, "subject": subject, "body_html": f"<p>{body}</p>",
+            "requested_by": user_id, "subject": subject, "body_html": render_markdown(body),
             "recipient_emails": emails, "channel_id": channel_id, "team_id": team_id,
             "notice_text": body,
         }
@@ -1313,12 +1606,14 @@ def build_orchestrator() -> Orchestrator:
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
+        list_event_tasks_fn=list_event_tasks_fn,
         list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
         read_participant_file_fn=read_participant_file_fn,
         send_participant_reminders_fn=send_participant_reminders_fn,
         list_event_files_fn=_build_list_event_files_fn(),
         read_event_file_fn=_build_read_event_file_fn(),
+        list_members_fn=_build_list_members_fn(),
         setup_event_fn=setup_event_fn,
         send_email_fn=send_email_fn, send_teams_message_fn=send_teams_message_fn,
     )
@@ -1338,6 +1633,10 @@ def build_orchestrator() -> Orchestrator:
         pending_store=pending_store, role_resolver=role_resolver,
         execute_fn=execute_confirmed_action,
     )
+    # The router calls this on the turn's emitted cards before sending, to fold a flood of
+    # per-recipient teams_dm cards into one (belt-and-suspenders over the batch tool).
+    orch.coalesce_cards = lambda cards: coalesce_teams_dm_cards(
+        cards, pending_store=pending_store, confirm_card_fn=confirm_card)
     return orch
 
 
@@ -1353,10 +1652,11 @@ def build_summarizer():
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
+    list_event_tasks_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
     list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
-    send_email_fn=None, send_teams_message_fn=None,
+    send_email_fn=None, send_teams_message_fn=None, list_members_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -1387,7 +1687,9 @@ def _build_runner_and_summarizer(
     from eventbuddy.agent.tools import (
         _no_ingest,
         _no_list_event_files,
+        _no_list_event_tasks,
         _no_list_events,
+        _no_list_members,
         _no_read_channel,
         _no_read_event_file,
         _no_read_participant_file,
@@ -1406,6 +1708,7 @@ def _build_runner_and_summarizer(
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         event_context_fn=event_context_fn,
         update_task_fn=update_task_fn or _no_update_task,
+        list_event_tasks_fn=list_event_tasks_fn or _no_list_event_tasks,
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
         set_feedback_fn=set_feedback_fn or _no_set_feedback,
@@ -1416,6 +1719,7 @@ def _build_runner_and_summarizer(
             send_participant_reminders_fn or _no_send_participant_reminders),
         list_event_files_fn=list_event_files_fn or _no_list_event_files,
         read_event_file_fn=read_event_file_fn or _no_read_event_file,
+        list_members_fn=list_members_fn or _no_list_members,
         setup_event_fn=setup_event_fn or _no_setup_event,
         send_email_fn=send_email_fn or _no_send_email,
         send_teams_message_fn=send_teams_message_fn or _no_send_teams_message,

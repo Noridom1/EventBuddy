@@ -53,9 +53,12 @@ class GraphClient:
         r.raise_for_status()
         return r.json()
 
-    def send_chat_message(self, chat_id: str, text: str) -> dict:
+    def send_chat_message(self, chat_id: str, text: str, content_type: str = "text") -> dict:
         url = f"/chats/{chat_id}/messages"
-        r = self._http.post(url, json={"body": {"content": text}}, headers=self._headers())
+        body = {"content": text}
+        if content_type != "text":  # default plain (reminders); "html" for formatted DMs
+            body["contentType"] = content_type
+        r = self._http.post(url, json={"body": body}, headers=self._headers())
         r.raise_for_status()
         return r.json()
 
@@ -75,39 +78,52 @@ class GraphClient:
         }
 
     def _first_user_match(self, filter_expr: str, select: str) -> dict | None:
-        """Run a `/users?$filter=…` query and return the first match as a user dict, or None."""
+        """Run a `/users?$filter=…` query and return the first match as a user dict, or None.
+        This is a directory *enumeration* — some tenants deny it (403 `Authorization_RequestDenied`)
+        for non-admin delegated callers even when the token holds `User.ReadBasic.All`. A 403 here
+        propagates; `resolve_user` prefers the direct-read path below to avoid relying on it."""
         url = f"/users?$filter={quote(filter_expr)}&$select={select}&$top=1"
         r = self._http.get(url, headers=self._headers())
         r.raise_for_status()
         vals = r.json().get("value", [])
         return self._as_user(vals[0]) if vals else None
 
+    def _get_user(self, upn_or_id: str, select: str) -> dict | None:
+        """Direct single-object read of `/users/{upn|id}`. Returns the user dict on 200, else None
+        (a 404 miss or a 403 deny — never raises). A direct read is frequently permitted in
+        tenants that block `/users` list/$filter enumeration, so it's the preferred resolve path."""
+        r = self._http.get(
+            f"/users/{quote(upn_or_id)}?$select={select}", headers=self._headers())
+        return self._as_user(r.json()) if r.status_code == 200 else None
+
     def resolve_user(self, alias_or_email: str) -> dict | None:
         """Resolve a corporate alias (mailNickname, e.g. 'phucnlt2') or a full email/UPN to a
         directory user → `{id, display_name, upn}`, or None when not found. Powers the generic
-        `send_teams_message` tool. Needs the delegated `User.ReadBasic.All` scope. A miss returns
-        None rather than raising, so the caller degrades to a clean "couldn't find them" message."""
+        `send_teams_message` tool. Needs the delegated `User.ReadBasic.All` scope.
+
+        Strategy: try a **direct read** of `/users/{upn}` first (works even where the tenant denies
+        directory *enumeration*), building the UPN from the corp domain for a bare alias. Only when
+        we have no UPN to try, or the direct read misses, do we fall back to the `/users?$filter`
+        enumeration — which may raise 403 in restricted tenants (the caller then surfaces a clear
+        permission message). A plain not-found returns None rather than raising."""
         value = (alias_or_email or "").strip()
         if not value:
             return None
         select = "id,displayName,userPrincipalName,mail"
+        # Prefer a direct read by UPN — bare alias → "{alias}@{corp_email_domain}".
         if "@" in value:
-            r = self._http.get(
-                f"/users/{quote(value)}?$select={select}", headers=self._headers())
-            if r.status_code == 200:
-                return self._as_user(r.json())
-            return self._first_user_match(f"mail eq '{value}'", select)
-        # Bare alias → match on mailNickname; fall back to a UPN built from the corp domain.
-        match = self._first_user_match(f"mailNickname eq '{value}'", select)
-        if match is not None:
-            return match
-        if settings.corp_email_domain:
-            upn = f"{value}@{settings.corp_email_domain}"
-            r = self._http.get(
-                f"/users/{quote(upn)}?$select={select}", headers=self._headers())
-            if r.status_code == 200:
-                return self._as_user(r.json())
-        return None
+            candidate_upn = value
+        elif settings.corp_email_domain:
+            candidate_upn = f"{value}@{settings.corp_email_domain}"
+        else:
+            candidate_upn = None
+        if candidate_upn:
+            match = self._get_user(candidate_upn, select)
+            if match is not None:
+                return match
+        # Fall back to directory enumeration (may be denied by tenant policy → raises 403).
+        filter_expr = f"mail eq '{value}'" if "@" in value else f"mailNickname eq '{value}'"
+        return self._first_user_match(filter_expr, select)
 
     def create_one_on_one_chat(self, target_user_id: str) -> str:
         """Create (or return the existing) 1-1 chat between the signed-in user and
@@ -242,3 +258,57 @@ class GraphClient:
         )
         r.raise_for_status()
         return r.json()
+
+    @staticmethod
+    def _as_member(d: dict) -> dict:
+        """Map a Graph `conversationMember` (chat or channel) → `{id, display_name, email}`.
+        `id` prefers the directory `userId`; `email` falls back to the UPN. A non-AAD member
+        (e.g. an anonymous guest) may lack both — we keep the row with empty strings rather
+        than dropping it, so the count stays honest."""
+        return {
+            "id": d.get("userId") or d.get("id") or "",
+            "display_name": d.get("displayName") or "",
+            "email": d.get("email") or d.get("userPrincipalName") or "",
+        }
+
+    def list_chat_members(self, chat_id: str) -> list[dict]:
+        """List the participants of a 1-1 or group chat → `[{id, display_name, email}]`.
+        Works for both `oneOnOne` and `group` chats (Impl 8). `chat_id` is the Bot Framework
+        `conversation.id` for a chat, which is the Graph chat id. Delegated `ChatMember.Read`
+        (or `Chat.ReadBasic`). Does not page — a chat's membership is small."""
+        url = f"/chats/{quote(chat_id, safe='')}/members"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        return [self._as_member(m) for m in r.json().get("value", [])]
+
+    def list_channel_members(self, team_id: str, channel_id: str) -> list[dict]:
+        """List the members of a Teams channel → `[{id, display_name, email}]` (Impl 8).
+        Delegated `ChannelMember.Read.All`. Requires the real `team_id`."""
+        url = f"/teams/{team_id}/channels/{channel_id}/members"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        return [self._as_member(m) for m in r.json().get("value", [])]
+
+    def list_chat_files(self, chat_id: str, limit: int = 50) -> list[dict]:
+        """List files shared in a 1-1 or group chat → `[{name, url}]` (Impl 8). A chat has no
+        SharePoint `filesFolder`; files live in the sender's OneDrive and surface as `reference`
+        attachments on chat messages. We scan the most recent `limit` messages and collect each
+        file attachment's sharing `contentUrl` (de-duplicated, newest-first). Read the bytes by
+        passing that url to `resolve_share_url` + `get_drive_item_content`. Delegated `Chat.Read`
+        (and `Files.Read.All` to later download). Bounded scan — a file shared far earlier than
+        the window won't appear; the caller surfaces that limit."""
+        url = f"/chats/{quote(chat_id, safe='')}/messages?$top={int(limit)}"
+        r = self._http.get(url, headers=self._headers())
+        r.raise_for_status()
+        out: list[dict] = []
+        seen: set[str] = set()
+        for m in r.json().get("value", []):
+            for att in m.get("attachments") or []:
+                if att.get("contentType") != "reference":
+                    continue
+                content_url = att.get("contentUrl")
+                if not content_url or content_url in seen:
+                    continue
+                seen.add(content_url)
+                out.append({"name": att.get("name") or "(unnamed)", "url": content_url})
+        return out

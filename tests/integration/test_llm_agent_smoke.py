@@ -61,7 +61,7 @@ def _runner_and_checkpointer():
     deps = AgentDeps(
         session_store=_Session(),
         provision_fn=_provision_fn,
-        resolve_event_fn=lambda q: None,
+        resolve_event_fn=lambda q, **kw: None,
         remind_fn=lambda **kw: None,
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "no tasks",
