@@ -53,10 +53,48 @@ def test_new_tools_registered_and_identity_absent():
         assert "user_id" not in tools[name].args and "role" not in tools[name].args
 
 
-def test_update_task_schema_is_query_and_status_only():
+def test_update_task_schema_exposes_query_status_due_and_note():
     deps, _ = _deps()
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
-    assert set(tools["update_task"].args) == {"task_query", "status"}
+    assert set(tools["update_task"].args) == {"task_query", "status", "due_date", "note"}
+
+
+def test_create_task_registered_and_hides_identity():
+    deps, _ = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert "create_task" in tools
+    assert set(tools["create_task"].args) == {
+        "task_name", "assignee", "due_date", "status", "note"}
+    assert "user_id" not in tools["create_task"].args
+    assert "identity" not in tools["create_task"].args
+
+
+def test_create_task_needs_focused_event():
+    calls = {}
+    deps, _ = _deps(create_task_fn=lambda **kw: calls.setdefault("create", kw) or "made")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["create_task"].invoke({"task_name": "Send thanks"})
+    assert "focus" in out.lower()
+    assert "create" not in calls
+
+
+def test_create_task_delegates_with_context_identity_any_member():
+    captured = {}
+    deps, _ = _deps(create_task_fn=lambda **kw: captured.update(kw) or "made")
+    deps.session_store.set_current_event("u1", "ev-3")
+    # `member` (not moderator) — any member may create tasks.
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["create_task"].invoke({
+        "task_name": "Send thanks", "assignee": "tho", "due_date": "2026-06-20",
+        "status": "todo", "note": "rescheduled",
+    })
+    assert out == "made"
+    assert captured["identity"].teams_user_id == "u1"
+    assert captured["event_id"] == "ev-3"
+    assert captured["task_name"] == "Send thanks" and captured["assignee"] == "tho"
+    assert captured["due_date"] == "2026-06-20" and captured["note"] == "rescheduled"
+    # identity is server-built, never a model arg
+    assert "user_id" not in captured
 
 
 def test_setup_event_tool_passes_ctx_and_hides_identity():
@@ -208,7 +246,7 @@ def test_generic_send_tools_registered_with_identity_absent():
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert {"send_email", "send_teams_message"} <= set(tools)
     assert set(tools["send_email"].args) == {"subject", "body", "recipients"}
-    assert set(tools["send_teams_message"].args) == {"recipients", "message"}
+    assert set(tools["send_teams_message"].args) == {"recipients", "message", "group"}
 
 
 def test_send_email_callable_by_member_and_delegates():
@@ -231,8 +269,10 @@ def test_send_teams_message_callable_by_member_and_delegates():
     out = tools["send_teams_message"].invoke(
         {"recipients": "phucnlt2", "message": "standup at 10"})
     assert out == "drafted"
-    # A single string is coerced to a one-item list before reaching the closure.
-    assert calls == {"user_id": "u1", "recipients": ["phucnlt2"], "message": "standup at 10"}
+    # A single string is coerced to a one-item list before reaching the closure; `group`
+    # defaults to "" when the model omits it.
+    assert calls == {"user_id": "u1", "recipients": ["phucnlt2"],
+                     "message": "standup at 10", "group": ""}
 
 
 def test_send_teams_message_coerces_delimited_string_to_list():
@@ -243,3 +283,14 @@ def test_send_teams_message_coerces_delimited_string_to_list():
         {"recipients": "anhpn8, lamtt7; phucnlt2", "message": "hi"})
     assert out == "drafted"
     assert calls["recipients"] == ["anhpn8", "lamtt7", "phucnlt2"]
+
+
+def test_send_teams_message_passes_group_label_through():
+    # Impl 10 — the agent's `group` label reaches the closure verbatim (it decides merge/separate).
+    calls = {}
+    deps, _ = _deps(send_teams_message_fn=lambda **kw: calls.update(kw) or "drafted")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["send_teams_message"].invoke(
+        {"recipients": "phucnlt2", "message": "your task is due", "group": "task-update"})
+    assert out == "drafted"
+    assert calls["group"] == "task-update"

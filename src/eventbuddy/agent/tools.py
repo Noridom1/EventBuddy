@@ -108,6 +108,11 @@ def _no_update_task(**_kw) -> str:
     return "Task updates aren't available right now."
 
 
+def _no_create_task(**_kw) -> str:
+    """Default `create_task_fn` — task creation not wired (no DB path)."""
+    return "Creating tasks isn't available right now."
+
+
 def _no_list_event_tasks(**_kw) -> str:
     """Default `list_event_tasks_fn` — full task-board listing not wired (no DB path)."""
     return "Listing the event's tasks isn't available right now."
@@ -211,6 +216,9 @@ class AgentDeps:
     # Impl 1 (action plane) — `update_task` (direct) + `send_outlook_mail` (HITL). Default to
     # no-ops so the existing tests/no-DB path still build the tool set.
     update_task_fn: Callable = _no_update_task
+    # Task-creation plane — `create_task` adds a new task (name + assignee + due date + status +
+    # note) to the focused event. Any member. Default no-op so the no-DB path still builds.
+    create_task_fn: Callable = _no_create_task
     # Impl 1 — `list_event_tasks` shows the whole task board (every assignee + status) for the
     # focused event, not just the caller's own tasks. Read-only, any member. Default no-op.
     list_event_tasks_fn: Callable = _no_list_event_tasks
@@ -381,16 +389,44 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def update_task(task_query: str, status: str) -> str:
-        """Update the status of a task in the currently focused event. `task_query` matches
-        the task by name; `status` is one of: todo, in_progress, done. You may update your
-        own tasks; moderators/hosts may update any. Requires a focused event."""
+    def create_task(
+        task_name: str, assignee: str = "", due_date: str = "",
+        status: str = "todo", note: str = "",
+    ) -> str:
+        """Create a new task in the currently focused event. Use when the user wants to add a
+        to-do / assign work — e.g. "add a task to send thank-you emails, assign it to Thơ, due
+        June 20". `task_name` is required. `assignee` is who it's for — a corporate alias (the
+        part before @, e.g. 'phucnlt2'), a full email, or a member's display name; leave empty to
+        leave it unassigned. `due_date` is the deadline as a single ISO date ('2026-06-20')
+        — if the user gives a range, pass the END date. `status` is one of todo, in_progress,
+        done (defaults to todo). `note` is any free-form context to attach (a blocker, a reason
+        for a deadline change). Any member may create tasks. Requires a focused event. To change
+        an existing task instead of adding one, use update_task."""
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.create_task_fn(
+            identity=ctx.identity, event_id=event_id, task_name=task_name,
+            assignee=assignee, due_date=due_date, status=status, note=note,
+        )
+
+    @tool
+    @traced
+    def update_task(
+        task_query: str, status: str = "", due_date: str = "", note: str = "",
+    ) -> str:
+        """Update an existing task in the currently focused event. `task_query` matches the task
+        by name. Supply any of: `status` (one of todo, in_progress, done), `due_date` (a single
+        ISO date like '2026-06-20' — to reschedule a deadline), and `note` (free-form context to
+        attach/replace, e.g. why a deadline moved). At least one is required. You may update your
+        own tasks; moderators/hosts may update any. This does NOT create tasks — if the task
+        doesn't exist yet, use create_task. Requires a focused event."""
         event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.update_task_fn(
             identity=ctx.identity, role=ctx.role, event_id=event_id,
-            task_query=task_query, status=status,
+            task_query=task_query, status=status, due_date=due_date, note=note,
         )
 
     @tool
@@ -433,19 +469,26 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def send_teams_message(recipients: str | list[str], message: str) -> str:
+    def send_teams_message(recipients: str | list[str], message: str, group: str = "") -> str:
         """Send a direct 1-1 Teams chat message to one or more colleagues, independent of any
         event. `recipients` is a corporate alias (the part before @, e.g. 'phucnlt2') or full
-        email address, given as a single value or a list; the same `message` is sent to each.
-        Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines between
-        paragraphs; it's rendered as formatted text in the chat. Pass ALL the people in ONE call
-        (a list) — do NOT call this once per person — so the user gets a single confirmation card
-        instead of one per recipient. Sending is gated by that card — this only drafts it. Any
-        member may use it."""
+        email address, given as a single value or a list; the same `message` goes to everyone in
+        THIS call. Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines
+        between paragraphs; it's rendered as formatted text in the chat.
+
+        To send the SAME message to several people, pass them all as a list in one call (one
+        confirmation card). To PERSONALIZE — give different people different messages — call this
+        once per distinct message. The `group` argument decides how those calls are confirmed:
+        give several calls the SAME non-empty `group` label to fold them into ONE consolidated
+        confirmation card (a per-recipient breakdown the user approves at once); omit `group` (or
+        use different labels) to keep them as SEPARATE confirmation cards. When personalizing a
+        batch of related messages, prefer one shared `group` label.
+
+        Sending is gated by the confirmation card — this only drafts it. Any member may use it."""
         if isinstance(recipients, str):
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_teams_message_fn(
-            user_id=ctx.user_id, recipients=recipients, message=message)
+            user_id=ctx.user_id, recipients=recipients, message=message, group=group)
 
     @tool
     @traced
@@ -604,7 +647,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     tools: list[BaseTool] = [
         create_event, setup_event, sync_event_members, set_focus_event, prepare_reminders,
-        list_my_tasks, list_event_tasks, update_task, send_outlook_mail,
+        list_my_tasks, list_event_tasks, create_task, update_task, send_outlook_mail,
         send_email, send_teams_message,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion, list_members,

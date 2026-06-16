@@ -6,7 +6,11 @@ from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.roster_store import RosterStore
 from eventbuddy.agent.session import SessionStore
 from eventbuddy.bot.auth import ROLE_RANK
-from eventbuddy.bot.cards.builders import confirm_card, reminder_channel_card
+from eventbuddy.bot.cards.builders import (
+    confirm_card,
+    personalized_dm_card,
+    reminder_channel_card,
+)
 from eventbuddy.bot.cards.report_card import report_card
 from eventbuddy.bot.confirm import ConfirmHandler
 from eventbuddy.bot.turn_artifacts import emit_card
@@ -142,12 +146,15 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
                        if tid else [])
         if not targets:
             return False, "I don't have a resolved recipient to message."
-        # The model authors the message in Markdown; Teams chat renders a subset of HTML,
-        # so convert and post as html (newlines/bold/bullets survive instead of collapsing).
-        body_html = render_markdown(payload.get("text", ""))
+        # The model authors the message in Markdown; Teams chat renders a subset of HTML, so
+        # convert and post as html (newlines/bold/bullets survive instead of collapsing). Each
+        # target may carry its own `text` (personalized batch); fall back to the shared top-level
+        # `text` (the same-message-to-many case, and legacy pendings).
+        shared = payload.get("text", "")
         sent = []
         for t in targets:
             chat_id = graph.create_one_on_one_chat(t["user_id"])
+            body_html = render_markdown(t.get("text") or shared)
             graph.send_chat_message(chat_id, body_html, content_type="html")
             sent.append(t.get("display") or "them")
         if len(sent) == 1:
@@ -164,21 +171,28 @@ def _card_action_data(card: dict) -> dict:
         return {}
 
 
-def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn) -> list[dict]:
-    """Merge the turn's `teams_dm` confirm cards that share the same message text into ONE card
-    per distinct message — so a model that (against instructions) calls `send_teams_message` once
-    per person still yields a single confirmation card instead of a flood.
+def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn,
+                            personalized_card_fn=personalized_dm_card) -> list[dict]:
+    """Fold the turn's `teams_dm` confirm cards into one card *per group* — so several
+    `send_teams_message` calls yield a single confirmation instead of a flood. The agent controls
+    grouping (Impl 10): calls that share a non-empty `group` label merge together; calls with no
+    label fall back to grouping by identical message text (the original safety net). Calls in
+    distinct groups (or with distinct text and no label) stay as separate cards — that is how the
+    agent keeps personalized messages separate.
 
     The recipient list lives server-side in the pending store (rule 2 — never on the card button),
-    so merging means: read each card's pending payload, union the `targets` (deduped by user id),
-    store one merged pending, and emit one rebuilt card pointing at it (superseded pendings are
-    popped to free them). Non-`teams_dm` cards, and a message that only produced one card, pass
-    through untouched and in place. Best-effort: any store hiccup returns the cards unchanged so
-    card delivery never breaks."""
+    so merging means: read each card's pending payload, union the `targets` (deduped by user id,
+    each tagged with its own message text), store one merged pending, and emit one rebuilt card
+    pointing at it (superseded pendings are popped to free them). A merged group whose members all
+    share one text renders as a single batch card (one message to many); a merged group with
+    *distinct* texts renders as a consolidated **personalized** card (a per-recipient breakdown).
+    Non-`teams_dm` cards, and a group that produced only one card, pass through untouched and in
+    place. Best-effort: any store hiccup returns the cards unchanged so card delivery never
+    breaks."""
     try:
-        groups: dict[str, dict] = {}  # text -> {targets, pids, payload, first_card}
+        groups: dict[str, dict] = {}  # key -> {targets, pids, payload, first_card}
         order: list[str] = []
-        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", text)
+        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", key)
         for card in cards:
             data = _card_action_data(card)
             pid = data.get("pending_id")
@@ -188,40 +202,58 @@ def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn
                 plan.append(("pass", card))
                 continue
             text = payload.get("text", "")
-            g = groups.get(text)
+            label = payload.get("group") or ""
+            # A non-empty agent-supplied label is the grouping key; otherwise fall back to the
+            # message text so an unlabelled batch of the same note still collapses to one card.
+            key = f"__group__:{label}" if label else f"__text__:{text}"
+            g = groups.get(key)
             if g is None:
-                g = groups[text] = {"targets": [], "pids": [], "payload": payload,
-                                    "first_card": card}
-                order.append(text)
+                g = groups[key] = {"targets": [], "pids": [], "payload": payload,
+                                   "first_card": card}
+                order.append(key)
             seen_ids = {t["user_id"] for t in g["targets"]}
             for t in payload["targets"]:
                 if t["user_id"] not in seen_ids:
                     seen_ids.add(t["user_id"])
-                    g["targets"].append(t)
+                    g["targets"].append({**t, "text": text})  # tag each target with its message
             g["pids"].append(pid)
-            plan.append(("dm", text))
+            plan.append(("dm", key))
 
         if not any(len(g["pids"]) > 1 for g in groups.values()):
             return cards  # nothing to merge — leave the list (and pendings) exactly as-is
 
         final: dict[str, dict] = {}
-        for text in order:
-            g = groups[text]
+        for key in order:
+            g = groups[key]
             if len(g["pids"]) <= 1:
-                final[text] = g["first_card"]
+                final[key] = g["first_card"]
                 continue
-            merged = dict(g["payload"])
-            merged["targets"] = g["targets"]
-            merged["text"] = text
-            new_pid = pending_store.put(merged)
+            targets = g["targets"]
+            texts = {t["text"] for t in targets}
+            merged = dict(g["payload"])  # carry over type/event_id/requested_by/min_role
+            if len(texts) == 1:
+                # One message to many — the original batch card; keep the simple shared-text shape.
+                shared = next(iter(texts))
+                merged["targets"] = [{"user_id": t["user_id"], "display": t["display"]}
+                                     for t in targets]
+                merged["text"] = shared
+                new_pid = pending_store.put(merged)
+                displays = [t["display"] for t in targets]
+                title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                         else f"Send Teams message to {len(displays)} people?")
+                final[key] = confirm_card_fn(
+                    title=title, summary="A direct 1-1 Teams chat message.",
+                    pending_id=new_pid, action="teams_dm", recipients=displays, body=shared)
+            else:
+                # Personalized batch — each target keeps its own text; render a per-recipient card.
+                merged["targets"] = [{"user_id": t["user_id"], "display": t["display"],
+                                      "text": t["text"]} for t in targets]
+                merged["text"] = ""
+                new_pid = pending_store.put(merged)
+                items = [{"display": t["display"], "message": t["text"]} for t in targets]
+                final[key] = personalized_card_fn(items=items, pending_id=new_pid)
             for pid in g["pids"]:
                 pending_store.pop(pid)  # supersede the per-recipient pendings
-            displays = [t["display"] for t in g["targets"]]
-            title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
-                     else f"Send Teams message to {len(displays)} people?")
-            final[text] = confirm_card_fn(
-                title=title, summary="A direct 1-1 Teams chat message.",
-                pending_id=new_pid, action="teams_dm", recipients=displays, body=text)
 
         out, emitted = [], set()
         for kind, val in plan:
@@ -260,6 +292,74 @@ def _expand_aliases(values) -> list[str]:
             seen.add(key)
             out.append(v)
     return out
+
+
+# --- Task-creation plane: due-date + assignee helpers (module-level → unit-testable) --------
+
+def _parse_due_date(raw):
+    """Parse a model-supplied deadline into a tz-aware UTC datetime, or None.
+
+    Accepts ISO (`2026-06-20`, `2026-06-20T09:00`), `DD/MM/YYYY`, and `DD/MM` (current year).
+    If `raw` carries a range or extra text (e.g. '20/06 - 25/06', 'by 20/06'), the FIRST
+    date-like token wins. Returns None for empty/unparseable input — the caller stores no
+    deadline rather than guessing."""
+    import re as _re
+    from datetime import UTC, datetime
+
+    s = (raw or "").strip()
+    if not s:
+        return None
+
+    def _aware(dt):
+        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+    # ISO first — most explicit, handles optional time.
+    try:
+        return _aware(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except ValueError:
+        pass
+    # YYYY-MM-DD or DD/MM[/YYYY] anywhere in the string (first match).
+    iso = _re.search(r"\d{4}-\d{1,2}-\d{1,2}", s)
+    if iso:
+        try:
+            return _aware(datetime.strptime(iso.group(), "%Y-%m-%d"))
+        except ValueError:
+            pass
+    dmy = _re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", s)
+    if dmy:
+        day, month, year = dmy.group(1), dmy.group(2), dmy.group(3)
+        try:
+            yr = int(year) if year else datetime.now(UTC).year
+            if yr < 100:
+                yr += 2000
+            return datetime(yr, int(month), int(day), tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_task_assignee(member_repo, event_id, assignee):
+    """Resolve a model-supplied `assignee` (alias, email, or display name) to task identity
+    fields {assignee_id, assignee_email} against the event's members. Matches, in order:
+    exact email (raw or alias→corp-domain expanded), then case-insensitive display-name
+    substring. A matched member contributes their `teams_user_id`/`aad_object_id` + email so
+    task ownership works across contexts (Impl 18). Unmatched but email-like input is stored as
+    a bare `assignee_email` (the person may be enrolled later); otherwise returns no fields
+    (unassigned)."""
+    a = (assignee or "").strip()
+    if not a:
+        return {}
+    members = member_repo.list(event_id)
+    expanded = (_expand_aliases([a]) or [None])[0]
+    want_email = (expanded or "").lower()
+    for m in members:
+        if want_email and m.email and m.email.lower() == want_email:
+            return {"assignee_id": m.teams_user_id or m.aad_object_id, "assignee_email": m.email}
+    low = a.lower()
+    for m in members:
+        if m.display_name and low in m.display_name.lower():
+            return {"assignee_id": m.teams_user_id or m.aad_object_id, "assignee_email": m.email}
+    return {"assignee_email": expanded} if expanded else {}
 
 
 # --- Impl 4: participant-roster helpers (module-level → unit-testable) ----------------------
@@ -1367,15 +1467,61 @@ def build_orchestrator() -> Orchestrator:
             log.warning(f"list event tasks failed ({type(e).__name__}: {e})")
             return "I couldn't load the event's tasks right now — please try again."
 
-    def update_task_fn(*, user_id=None, identity=None, role, event_id, task_query, status):
-        """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
-        any. Resolves the task by name within the focused event. Ownership is matched by identity
-        (Impl 18) — the task's `assignee_id` (BF/AAD id) or `assignee_email` (domain identity)."""
-        if identity is None and user_id:
-            identity = CallerIdentity.of(teams_user_id=user_id)
+    def create_task_fn(
+        *, user_id=None, identity=None, event_id, task_name,
+        assignee="", due_date="", status="todo", note="",
+    ):
+        """Create a new task in the focused event (any member). Resolves `assignee`
+        (alias/email/display name) to a member's identity, parses `due_date` into a deadline,
+        and stores the optional free-form `note`. `status` defaults to 'todo'."""
+        name = (task_name or "").strip()
+        if not name:
+            return "I need a task name to create the task."
         valid = {"todo", "in_progress", "done"}
+        status = (status or "todo").strip() or "todo"
         if status not in valid:
             return f"Status must be one of: {', '.join(sorted(valid))}."
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.tasks import TaskRepository
+        try:
+            with session_scope() as s:
+                repo = TaskRepository(s)
+                if any(name.lower() == t.task_name.lower() for t in repo.list(event_id)):
+                    return (f"A task named '{name}' already exists in this event — "
+                            "update it instead, or pick a different name.")
+                fields = _resolve_task_assignee(MemberRepository(s), event_id, assignee)
+                due = _parse_due_date(due_date)
+                repo.create(
+                    event_id, name, status=status,
+                    note=(note or "").strip() or None, due_date=due, **fields,
+                )
+            who = fields.get("assignee_email") or (assignee.strip() if assignee else None)
+            tail = f" for {who}" if who else ""
+            when = f", due {due.date().isoformat()}" if due else ""
+            return f"Created task '{name}'{tail} ({status}{when})."
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"create_task failed ({type(e).__name__}: {e})")
+            return "Couldn't create the task right now."
+
+    def update_task_fn(
+        *, user_id=None, identity=None, role, event_id, task_query,
+        status="", due_date="", note="",
+    ):
+        """Direct (non-HITL) task update. Member may update own tasks; moderator/host any.
+        Resolves the task by name within the focused event, then updates whichever of `status`,
+        `due_date`, and `note` are supplied. Ownership is matched by identity (Impl 18) — the
+        task's `assignee_id` (BF/AAD id) or `assignee_email` (domain identity)."""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
+        status = (status or "").strip()
+        valid = {"todo", "in_progress", "done"}
+        if status and status not in valid:
+            return f"Status must be one of: {', '.join(sorted(valid))}."
+        due = _parse_due_date(due_date) if (due_date or "").strip() else None
+        note = (note or "").strip()
+        if not (status or due or note):
+            return "Tell me what to change — a status, a deadline, or a note."
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.tasks import TaskRepository
         try:
@@ -1395,8 +1541,17 @@ def build_orchestrator() -> Orchestrator:
                 if not is_mod and not owns:
                     return "You can only update your own tasks (moderators can update any)."
                 name = t.task_name
-                repo.set_status(t.task_id, status)
-                return f"Updated '{name}' → {status}."
+                changed = []
+                if status:
+                    t.status = status
+                    changed.append(f"status → {status}")
+                if due:
+                    t.due_date = due
+                    changed.append(f"due → {due.date().isoformat()}")
+                if note:
+                    t.note = note
+                    changed.append("note updated")
+                return f"Updated '{name}': {', '.join(changed)}."
         except Exception as e:  # noqa: BLE001
             log.warning(f"update_task failed ({type(e).__name__}: {e})")
             return "Couldn't update the task right now."
@@ -1462,12 +1617,14 @@ def build_orchestrator() -> Orchestrator:
         ))
         return f"Drafted the email to {len(emails)} recipient(s) — confirm on the card to send."
 
-    def send_teams_message_fn(*, user_id, recipients, message):
+    def send_teams_message_fn(*, user_id, recipients, message, group=""):
         """Generic (event-independent) 1-1 Teams message to one or more colleagues: resolve each
-        recipient (corporate alias/email) to a directory user, then draft a SINGLE HITL confirm
-        card covering the whole batch — the same `message` goes to each. The directory lookup
-        acts on the caller's behalf (delegated Graph) and degrades cleanly. The sends (create
-        chat + post, per recipient) happen on confirm."""
+        recipient (corporate alias/email) to a directory user, then draft a HITL confirm card —
+        the same `message` goes to each recipient in this call. To personalize, the model calls
+        this once per distinct message; `group` (a non-empty label shared across those calls)
+        folds them into ONE consolidated confirmation card (see `coalesce_teams_dm_cards`). The
+        directory lookup acts on the caller's behalf (delegated Graph) and degrades cleanly. The
+        sends (create chat + post, per recipient) happen on confirm."""
         # Normalize to a deduped list (case-insensitive, order-preserving) — the model may pass a
         # single string or a list; either way we want one card for the batch.
         raw = recipients if isinstance(recipients, list) else [recipients]
@@ -1527,6 +1684,9 @@ def build_orchestrator() -> Orchestrator:
         payload = {
             "type": "teams_dm", "event_id": None, "requested_by": user_id,
             "targets": resolved, "text": message, "min_role": "member",
+            # Coalescing key (Impl 10): a non-empty label folds several per-recipient calls into
+            # ONE consolidated confirmation card; empty falls back to the text-based default.
+            "group": group or "",
         }
         try:
             pending_id = pending_store.put(payload)
@@ -1917,6 +2077,7 @@ def build_orchestrator() -> Orchestrator:
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
+        create_task_fn=create_task_fn,
         list_event_tasks_fn=list_event_tasks_fn,
         list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
@@ -1953,7 +2114,8 @@ def build_orchestrator() -> Orchestrator:
     # The router calls this on the turn's emitted cards before sending, to fold a flood of
     # per-recipient teams_dm cards into one (belt-and-suspenders over the batch tool).
     orch.coalesce_cards = lambda cards: coalesce_teams_dm_cards(
-        cards, pending_store=pending_store, confirm_card_fn=confirm_card)
+        cards, pending_store=pending_store, confirm_card_fn=confirm_card,
+        personalized_card_fn=personalized_dm_card)
     return orch
 
 
@@ -1969,6 +2131,7 @@ def build_summarizer():
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
+    create_task_fn=None,
     list_event_tasks_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
@@ -2003,6 +2166,7 @@ def _build_runner_and_summarizer(
     event_context_fn = _build_event_context_fn(transcript, summarizer)
 
     from eventbuddy.agent.tools import (
+        _no_create_task,
         _no_ingest,
         _no_list_event_files,
         _no_list_event_tasks,
@@ -2027,6 +2191,7 @@ def _build_runner_and_summarizer(
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         event_context_fn=event_context_fn,
         update_task_fn=update_task_fn or _no_update_task,
+        create_task_fn=create_task_fn or _no_create_task,
         list_event_tasks_fn=list_event_tasks_fn or _no_list_event_tasks,
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
