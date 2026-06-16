@@ -36,7 +36,7 @@ export GREENNODE_CLIENT_SECRET ?= $(shell jq -r '.client_secret // .clientSecret
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test lint run seed seed-clean smoke creds deploy redeploy status health logs endpoint destroy
+.PHONY: help test lint run seed seed-clean reset smoke creds deploy redeploy status health logs endpoint destroy
 
 help: ## Show this help
 	@echo "EventBuddy targets:"
@@ -62,6 +62,9 @@ seed: ## Seed demo event/members/tasks into the DB (override HOST_USER_ID=...)
 
 seed-clean: ## Remove the demo event (cascades members + tasks)
 	cd $(ROOT) && $(PY) scripts/seed.py --clean
+
+reset: ## Hard-reset EVERYTHING — wipe all DB tables + Redis windows/sessions (prompts; use YES=1 to skip)
+	cd $(ROOT) && $(PY) scripts/reset.py $(if $(YES),--yes,)
 
 smoke: ## HITL end-to-end via dev routes (URL=<base> or the deployed endpoint; SMOKE_USER=...)
 	@base="$(URL)"; [ -n "$$base" ] || base="$$($(MAKE) -s endpoint)"; \
