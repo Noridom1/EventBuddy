@@ -14,3 +14,4 @@ venv/
 .agentbase/
 .claude/
 __plans__/
+__documents__/
