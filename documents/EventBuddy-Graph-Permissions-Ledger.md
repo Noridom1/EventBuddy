@@ -5,6 +5,8 @@ user can already access. No tenant-wide application permissions are requested.
 
 **Status legend:** ✅ Granted · 🆕 To request (not yet granted)
 
+> All 19 configured scopes are **granted** for the VNG Group tenant (admin consent confirmed 2026-06-16).
+
 | Delegated scope | Capability it unlocks | Status |
 |---|---|---|
 | `openid` | SSO sign-in | ✅ Granted |
@@ -21,8 +23,8 @@ user can already access. No tenant-wide application permissions are requested.
 | `Mail.Send` | Send email as the signed-in user | ✅ Granted |
 | `Files.Read.All` | Read & download files the user can access | ✅ Granted |
 | `Sites.Read.All` | Read items in SharePoint site collections | ✅ Granted |
-| `Chat.Read` | Read group-chat / DM messages to find shared files (`GET /chats/{id}/messages`) | 🆕 To request |
-| `ChatMember.Read` | List group-chat / DM members (`GET /chats/{id}/members`) | 🆕 To request |
-| `ChannelMember.Read.All` | List Team channel members (`GET /teams/{id}/channels/{cid}/members`) | 🆕 To request |
-| `Files.ReadWrite.All` | Read **and edit** files the user can access — edit/upload SharePoint & OneDrive files (supersedes `Files.Read.All`) | 🆕 To request |
-| `Sites.ReadWrite.All` | Edit items in SharePoint site collections (supersedes `Sites.Read.All`) | 🆕 To request |
+| `Chat.Read` | Read group-chat / DM messages to find shared files (`GET /chats/{id}/messages`) | ✅ Granted |
+| `ChatMember.Read` | List group-chat / DM members (`GET /chats/{id}/members`) | ✅ Granted |
+| `ChannelMember.Read.All` | List Team channel members (`GET /teams/{id}/channels/{cid}/members`) | ✅ Granted |
+| `Files.ReadWrite.All` | Read **and edit** files the user can access — edit/upload SharePoint & OneDrive files (supersedes `Files.Read.All`) | ✅ Granted |
+| `Sites.ReadWrite.All` | Edit items in SharePoint site collections (supersedes `Sites.Read.All`) | ✅ Granted |
