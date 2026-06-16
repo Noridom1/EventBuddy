@@ -6,6 +6,10 @@ from langgraph.graph import END, StateGraph
 
 class AgentState(TypedDict, total=False):
     user_id: str
+    # Impl 18 — stable AAD object id + resolved corporate email for cross-context member
+    # matching. Default-safe: both None when delegated auth/sign-in isn't available.
+    aad_object_id: str | None
+    user_email: str | None
     channel_id: str | None
     text: str
     sent_at: datetime | None
@@ -29,6 +33,8 @@ def build_agent_graph(orchestrator):
     def run_node(state: AgentState) -> AgentState:
         reply = orchestrator.handle(
             user_id=state["user_id"],
+            aad_object_id=state.get("aad_object_id"),
+            user_email=state.get("user_email"),
             channel_id=state.get("channel_id"),
             text=state["text"],
             scope=state.get("scope", "personal"),

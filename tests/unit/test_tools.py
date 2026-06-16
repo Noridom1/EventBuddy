@@ -81,7 +81,8 @@ def test_set_focus_event_unknown_returns_not_found_and_no_write():
 
 
 def test_list_my_tasks_passes_focused_event():
-    deps, _ = _deps(query_tasks_fn=lambda *, user_id, event_id: f"{user_id}:{event_id}")
+    deps, _ = _deps(
+        query_tasks_fn=lambda *, identity, event_id: f"{identity.teams_user_id}:{event_id}")
     deps.session_store.set_current_event("u1", "ev-3")
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert tools["list_my_tasks"].invoke({}) == "u1:ev-3"
@@ -141,8 +142,11 @@ def test_file_tools_pass_scope_and_channel_from_context():
 def _ctx_fn(snapshot="Context from event 'X': earlier discussion"):
     calls = []
 
-    def fn(*, user_id, event_id):
-        calls.append({"user_id": user_id, "event_id": event_id})
+    def fn(*, identity=None, event_id=None):
+        # Impl 18 — the tool now passes a CallerIdentity; record its BF id so the existing
+        # assertions (keyed on user_id) keep reading naturally.
+        calls.append({"user_id": identity.teams_user_id if identity else None,
+                      "event_id": event_id})
         return snapshot
 
     fn.calls = calls

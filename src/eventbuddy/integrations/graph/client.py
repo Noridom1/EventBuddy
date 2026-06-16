@@ -69,6 +69,15 @@ class GraphClient:
         r.raise_for_status()
         return r.json()["id"]
 
+    def get_my_email(self) -> str | None:
+        """The signed-in user's corporate email (delegated 'me') → `mail`, falling back to
+        `userPrincipalName` (Impl 18). Used to resolve the DM caller's own domain identity for
+        cross-context member matching. Returns None when neither is set."""
+        r = self._http.get("/me?$select=mail,userPrincipalName", headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        return data.get("mail") or data.get("userPrincipalName") or None
+
     @staticmethod
     def _as_user(d: dict) -> dict:
         return {

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from eventbuddy.domain.identity import CallerIdentity
 from eventbuddy.domain.models import Task
 
 
@@ -29,6 +30,26 @@ class TaskRepository:
         return list(self.s.scalars(
             select(Task).where(Task.assignee_id == assignee_id, Task.event_id == event_id)
         ))
+
+    def by_assignee_identity(
+        self, identity: CallerIdentity, event_id: str | None = None
+    ) -> list[Task]:
+        """The caller's tasks matched by identity (Impl 18): `assignee_id` is one of the caller's
+        id values (BF id / AAD id) OR `assignee_email` equals the caller's corporate email. Scopes
+        to `event_id` when given (focused event), else all the caller's tasks. Lets task tracking
+        work by domain email — not just the Bot Framework id — so a member enrolled from a group
+        roster sees their tasks in their DM."""
+        conds = []
+        if identity.id_values:
+            conds.append(Task.assignee_id.in_(identity.id_values))
+        if identity.email:
+            conds.append(func.lower(Task.assignee_email) == identity.email)
+        if not conds:
+            return []
+        stmt = select(Task).where(or_(*conds))
+        if event_id:
+            stmt = stmt.where(Task.event_id == event_id)
+        return list(self.s.scalars(stmt))
 
     def due_within(self, event_id: str, hours: int) -> list[Task]:
         cutoff = datetime.now(UTC) + timedelta(hours=hours)

@@ -13,6 +13,7 @@ from eventbuddy.bot.turn_artifacts import emit_card
 from eventbuddy.common.logging import get_logger
 from eventbuddy.config import settings
 from eventbuddy.data.redis import get_redis
+from eventbuddy.domain.identity import CallerIdentity
 
 log = get_logger("agent.wiring")
 
@@ -358,8 +359,13 @@ def _build_event_context_fn(transcript, summarizer):
     from eventbuddy.agent.context import event_thread_id
     from eventbuddy.agent.transcript import sent_at_prefix
 
-    def event_context_fn(*, user_id: str, event_id: str | None) -> str:
+    def event_context_fn(*, user_id: str | None = None, identity=None,
+                          event_id: str | None = None) -> str:
         if not event_id:
+            return ""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
+        if identity is None or identity.is_empty():
             return ""
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.events import EventRepository
@@ -369,7 +375,7 @@ def _build_event_context_fn(transcript, summarizer):
                 ev = EventRepository(s).get(event_id)
                 if ev is None or ev.teams_channel_id is None:
                     return ""  # no shared thread to read
-                if MemberRepository(s).get_by_user(event_id, user_id) is None:
+                if MemberRepository(s).get_by_identity(event_id, identity) is None:
                     return ""  # not a member — don't leak the shared conversation
                 thread_id = event_thread_id(ev.teams_channel_id)
                 event_name = ev.event_name
@@ -425,15 +431,18 @@ def _build_channel_event_fn():
     return channel_event_fn
 
 
-def _build_setup_event_fn():
+def _build_setup_event_fn(sync_members_fn=None):
     """The group/channel onboarding resolver. Binds THIS conversation to an event — resolving it
-    by name, or creating it when new — and enrolls the caller as host. Identity, conversation id,
-    team id and scope are server-supplied (rule 2). Reuses the repositories directly so it does
-    NOT create a second Teams channel; it binds the existing conversation
-    (`Event.teams_channel_id` = the conversation id, the same key `by_channel` resolves). Module-
-    level + lazy `session_scope` import so tests can sqlite-redirect."""
+    by name, or creating it when new — enrolls the caller as host, and (Impl 18) enrolls **every**
+    member of the group/channel by their corporate identity. Identity, conversation id, team id
+    and scope are server-supplied (rule 2). Reuses the repositories directly so it does NOT create
+    a second Teams channel; it binds the existing conversation (`Event.teams_channel_id` = the
+    conversation id, the same key `by_channel` resolves). `sync_members_fn` is injected (the
+    roster sync); None disables enroll-all (tests / no-Graph). Module-level + lazy `session_scope`
+    import so tests can sqlite-redirect."""
     def setup_event_fn(*, name, user_id, channel_id, team_id=None, scope="group",
-                       role="member", display_name=None, objective=""):
+                       role="member", display_name=None, objective="",
+                       aad_object_id=None, email=None):
         from sqlalchemy import select
 
         from eventbuddy.data.db import session_scope
@@ -474,41 +483,149 @@ def _build_setup_event_fn():
                 events.set_channel(target_id, channel_id)
                 if team_id:
                     events.set_team_id(target_id, team_id)
-                if members.get_by_user(target_id, user_id) is None:
-                    members.add_many(target_id, [{
-                        "teams_user_id": user_id, "display_name": display_name,
-                        "role": "host", "email": None,
-                    }])
+                # Enroll the caller as host — store their AAD id + email too (Impl 18) so the
+                # roster sync below (and DM lookups) recognize them as one row, never a duplicate.
+                members.upsert_member(target_id, {
+                    "teams_user_id": user_id, "aad_object_id": aad_object_id,
+                    "email": email, "display_name": display_name, "role": "host",
+                })
         except Exception as e:  # noqa: BLE001 — degrade gracefully, never break the turn
             log.warning(f"setup_event failed ({type(e).__name__}: {e})")
             return "I couldn't set this group up right now — please try again shortly."
+
         verb = "Created and set up" if created else "Set up"
-        return (f"✅ {verb} '{event_name}' for this group — I'll track this conversation's "
-                f"discussion for it, and you're set as host. (event id {target_id})")
+        msg = (f"✅ {verb} '{event_name}' for this group — I'll track this conversation's "
+               f"discussion for it, and you're set as host. (event id {target_id})")
+        # Impl 18 — enroll the rest of the group's members by corporate identity. Best-effort and
+        # additive; degrades to a sign-in nudge when the host isn't signed in to Graph.
+        if sync_members_fn is not None:
+            actor = CallerIdentity.of(
+                teams_user_id=user_id, aad_object_id=aad_object_id, email=email)
+            result = sync_members_fn(
+                event_id=target_id, channel_id=channel_id, team_id=team_id,
+                scope=scope, actor_identity=actor,
+            )
+            msg += " " + _summarize_member_sync(result, on_setup=True)
+        return msg
 
     return setup_event_fn
 
 
+def _summarize_member_sync(result: dict, *, on_setup: bool = False) -> str:
+    """One-line, user-facing summary of a roster sync (Impl 18). `on_setup` softens the phrasing
+    for the setup flow ('Enrolled N members from this group.'); otherwise it's the explicit
+    'update members' phrasing. A degraded result relays its own message."""
+    if not result or not result.get("ok"):
+        return (result or {}).get("message", "I couldn't read the group's members just now.")
+    added = result.get("added") or []
+    if added:
+        names = ", ".join(added[:8]) + ("…" if len(added) > 8 else "")
+        return f"Enrolled {len(added)} member(s) from this group: {names}."
+    if on_setup:
+        return "Everyone in this group is already enrolled."
+    return "No new members to add — everyone here is already enrolled."
+
+
 def _build_member_autoenroll_fn():
-    """Builds the auto-enroll closure. Enrolls the posting user as an EventMember (keyed by Teams
-    id) when they're not yet on the bound event's roster — so organizers who join the group are
-    recognized here and in their own DM (`list_for_user` / task lookup / cross-context all key on
-    teams_user_id). Called best-effort per shared-conversation turn; the orchestrator swallows
-    failures. Module-level + lazy `session_scope` import so tests can sqlite-redirect."""
-    def member_autoenroll_fn(*, event_id, user_id, display_name=None):
+    """Builds the auto-enroll closure (Impl 18). Upserts the posting user into the bound event's
+    roster keyed by their **identity** (Bot Framework id + AAD id + email) — so a member already
+    enrolled from the group's Graph roster (by AAD id / email, no BF id yet) gets their BF id
+    backfilled onto that SAME row instead of a duplicate, and a brand-new poster is inserted once.
+    Called best-effort per shared-conversation turn; the orchestrator swallows failures. Module-
+    level + lazy `session_scope` import so tests can sqlite-redirect."""
+    def member_autoenroll_fn(*, event_id, user_id, display_name=None,
+                             aad_object_id=None, email=None):
         if not (event_id and user_id):
             return
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.members import MemberRepository
         with session_scope() as s:
-            repo = MemberRepository(s)
-            if repo.get_by_user(event_id, user_id) is None:
-                repo.add_many(event_id, [{
-                    "teams_user_id": user_id, "display_name": display_name,
-                    "role": "member", "email": None,
-                }])
+            MemberRepository(s).upsert_member(event_id, {
+                "teams_user_id": user_id, "aad_object_id": aad_object_id,
+                "email": email, "display_name": display_name, "role": "member",
+            })
 
     return member_autoenroll_fn
+
+
+def _build_sync_members_fn(graph_factory=None):
+    """Roster sync (Impl 18): scan the conversation's Graph members and enroll anyone not yet on
+    the event. Group/personal → `/chats/{id}/members`; channel → `/teams/.../channels/.../members`.
+    Diffs by identity and **upserts** the missing ones, keyed by AAD id + corporate email so each
+    member is recognized across the group chat and their own 1-1 DM. The caller's own Graph-member
+    row is merged with their existing (host) row via their Bot Framework id, so the host is never
+    duplicated. Additive (never removes); non-AAD/guest members (no AAD id and no email) are
+    skipped + counted (no silent caps). Returns a result dict — `{ok, added, already, skipped}` or
+    `{ok: False, message}`. Degrades cleanly, never raises. `graph_factory` is injectable for
+    tests; defaults to the per-caller delegated client."""
+    graph_factory = graph_factory or graph_for
+
+    def sync_members_fn(*, event_id, channel_id, team_id=None, scope="group",
+                        actor_identity=None):
+        if not event_id:
+            return {"ok": False, "message": "No event is set up for this conversation yet."}
+        if not _graph_creds():
+            return {"ok": False,
+                    "message": "I can't read the members yet — Microsoft Graph isn't configured."}
+        graph = graph_factory()
+        if graph is None:
+            return {"ok": False,
+                    "message": ("I need access to read this group's members — please sign in to "
+                                "Microsoft 365 (type 'sign in') and ask again.")}
+        try:
+            if scope == "channel":
+                if not (team_id and channel_id):
+                    return {"ok": False, "message": (
+                        "I can't read this channel's members yet — I haven't seen its Teams team "
+                        "id. Post once in the channel and try again.")}
+                graph_members = graph.list_channel_members(team_id, channel_id)
+            else:
+                if not channel_id:
+                    return {"ok": False,
+                            "message": "I can't tell which chat this is, so I can't read members."}
+                graph_members = graph.list_chat_members(channel_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"member sync list failed ({type(e).__name__}: {e})")
+            return {"ok": False,
+                    "message": "I couldn't read the members right now — please try again shortly."}
+
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        added: list[str] = []
+        already = skipped = 0
+        try:
+            with session_scope() as s:
+                repo = MemberRepository(s)
+                for m in graph_members:
+                    aad = m.get("id") or None
+                    email = m.get("email") or None
+                    name = m.get("display_name") or None
+                    if not aad and not email:
+                        skipped += 1  # non-AAD / guest — no stable corporate identity to key on
+                        continue
+                    fields = {"aad_object_id": aad, "email": email,
+                              "display_name": name, "role": "member"}
+                    # If this Graph member IS the caller, attach their Bot Framework id so the
+                    # upsert merges with the host row they were enrolled under at setup.
+                    if actor_identity is not None and (
+                        actor_identity.matches_id(aad) or actor_identity.matches_email(email)
+                    ) and actor_identity.teams_user_id:
+                        fields["teams_user_id"] = actor_identity.teams_user_id
+                    identity = CallerIdentity.of(
+                        teams_user_id=fields.get("teams_user_id"),
+                        aad_object_id=aad, email=email)
+                    if repo.get_by_identity(event_id, identity) is None:
+                        added.append(name or email or aad)
+                    else:
+                        already += 1
+                    repo.upsert_member(event_id, fields)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"member sync upsert failed ({type(e).__name__}: {e})")
+            return {"ok": False,
+                    "message": "I couldn't update the members right now — please try again."}
+        return {"ok": True, "added": added, "already": already, "skipped": skipped}
+
+    return sync_members_fn
 
 
 def _default_graph():
@@ -1001,6 +1118,8 @@ def build_orchestrator() -> Orchestrator:
     chat_catalog = _default_chat_catalog()
 
     def provision_fn(**kw):
+        # `host_aad_object_id` / `host_email` (Impl 18) ride in **kw straight to
+        # ProvisioningService.create_event, which stores them on the host member row.
         from eventbuddy.capabilities.provisioning import ProvisioningService
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.events import EventRepository
@@ -1036,19 +1155,22 @@ def build_orchestrator() -> Orchestrator:
             return 40
         return 0
 
-    def resolve_event_fn(query: str, *, user_id: str | None = None) -> str | None:
-        """Resolve an event-name fragment to an event_id (backs `set_focus_event`). When
-        `user_id` is given, only the caller's own events (member or host) are considered — you
-        can't focus an event you're not part of — and the best name match among them wins
-        (ties broken newest-first). Falls back to a global best-match when the caller has no
-        candidates (or no user_id), so non-DB/test paths and edge cases still resolve."""
+    def resolve_event_fn(query: str, *, user_id: str | None = None,
+                         identity=None) -> str | None:
+        """Resolve an event-name fragment to an event_id (backs `set_focus_event`). When an
+        identity (or `user_id`) is given, only the caller's own events (member or host, matched by
+        identity — Impl 18) are considered — you can't focus an event you're not part of — and the
+        best name match among them wins (ties broken newest-first). Falls back to a global
+        best-match when the caller has no candidates, so non-DB/test paths still resolve."""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.events import EventRepository
         with session_scope() as s:
             repo = EventRepository(s)
             candidates: list = []
-            if user_id:
-                candidates = [ev for ev, _role in repo.list_for_user(user_id)]
+            if identity is not None and not identity.is_empty():
+                candidates = [ev for ev, _role in repo.list_for_identity(identity)]
             if not candidates:
                 from sqlalchemy import select
 
@@ -1195,15 +1317,18 @@ def build_orchestrator() -> Orchestrator:
                 log.warning(f"report email draft skipped ({type(e).__name__}: {e})")
         return tail
 
-    def query_tasks_fn(*, user_id, event_id):
+    def query_tasks_fn(*, user_id=None, identity=None, event_id):
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.tasks import TaskRepository
         with session_scope() as s:
             repo = TaskRepository(s)
             # Scope to the focused event so switching focus changes the list. Without a focus
-            # (event_id None), fall back to the caller's tasks across all their events.
-            tasks = repo.by_assignee_in_event(user_id, event_id) if event_id \
-                else repo.by_assignee(user_id)
+            # (event_id None), fall back to the caller's tasks across all their events. Matched by
+            # identity (Impl 18) — assignee_id (BF/AAD id) or assignee_email (domain identity).
+            tasks = (repo.by_assignee_identity(identity, event_id)
+                     if identity is not None and not identity.is_empty() else [])
             if not tasks:
                 return ("You have no assigned tasks in this event." if event_id
                         else "You have no assigned tasks.")
@@ -1242,9 +1367,12 @@ def build_orchestrator() -> Orchestrator:
             log.warning(f"list event tasks failed ({type(e).__name__}: {e})")
             return "I couldn't load the event's tasks right now — please try again."
 
-    def update_task_fn(*, user_id, role, event_id, task_query, status):
+    def update_task_fn(*, user_id=None, identity=None, role, event_id, task_query, status):
         """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
-        any. Resolves the task by name within the focused event."""
+        any. Resolves the task by name within the focused event. Ownership is matched by identity
+        (Impl 18) — the task's `assignee_id` (BF/AAD id) or `assignee_email` (domain identity)."""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
         valid = {"todo", "in_progress", "done"}
         if status not in valid:
             return f"Status must be one of: {', '.join(sorted(valid))}."
@@ -1262,7 +1390,9 @@ def build_orchestrator() -> Orchestrator:
                     return f"'{task_query}' matches multiple tasks — please be more specific."
                 t = matches[0]
                 is_mod = ROLE_RANK.get(role, 0) >= ROLE_RANK["moderator"]
-                if not is_mod and t.assignee_id != user_id:
+                owns = identity is not None and (
+                    identity.matches_id(t.assignee_id) or identity.matches_email(t.assignee_email))
+                if not is_mod and not owns:
                     return "You can only update your own tasks (moderators can update any)."
                 name = t.task_name
                 repo.set_status(t.task_id, status)
@@ -1626,14 +1756,19 @@ def build_orchestrator() -> Orchestrator:
         return (f"Drafted a reminder to {len(emails)} participant(s) — choose Teams or Outlook "
                 "on the card to send.")
 
-    def list_events_fn(*, user_id, current_event_id=None):
-        """Impl 3: list the caller's events (member or host) with status + role, marking the
-        focused one. Read-only; scoped to the caller's own membership."""
+    def list_events_fn(*, user_id=None, identity=None, current_event_id=None):
+        """Impl 3 + Impl 18: list the caller's events (member or host) with status + role, marking
+        the focused one. Read-only; scoped to the caller's own membership, matched by identity so
+        an event the caller was enrolled into from a group roster (by AAD id / email) shows up in
+        their DM."""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.events import EventRepository
         try:
             with session_scope() as s:
-                rows = EventRepository(s).list_for_user(user_id)
+                rows = (EventRepository(s).list_for_identity(identity)
+                        if identity is not None and not identity.is_empty() else [])
                 lines = []
                 for ev, role in rows:
                     star = " ⭐ focused" if ev.event_id == current_event_id else ""
@@ -1645,29 +1780,33 @@ def build_orchestrator() -> Orchestrator:
             return "You're not part of any events yet."
         return "Your events:\n" + "\n".join(lines)
 
-    def role_resolver(*, user_id, scope, channel_id, event_id=None):
+    def role_resolver(*, user_id, scope, channel_id, event_id=None, identity=None):
         """Membership-backed role (defense in depth). When an event is focused, the caller's
-        real `EventMember.role` overrides the DM-host default — so the in-tool moderator gate
-        and the confirm re-auth reflect actual membership. Falls back to `_default_role`
-        (host-in-DM) when there's no focused event yet (e.g. event creation). A **group chat**
-        is exempt: it's a flat peer space, so we never downgrade a participant to their
-        `EventMember.role` there — `_default_role` keeps everyone at moderator."""
+        real `EventMember.role` (matched by identity — Impl 18) overrides the DM-host default — so
+        the in-tool moderator gate and the confirm re-auth reflect actual membership. Falls back
+        to `_default_role` (host-in-DM) when there's no focused event yet (e.g. event creation). A
+        **group chat** is exempt: it's a flat peer space, so we never downgrade a participant to
+        their `EventMember.role` there — `_default_role` keeps everyone at moderator."""
         if scope == "group":
             return _default_role(
-                user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
+                user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id,
+                identity=identity,
             )
-        if event_id:
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
+        if event_id and identity is not None and not identity.is_empty():
             from eventbuddy.data.db import session_scope
             from eventbuddy.data.repositories.members import MemberRepository
             try:
                 with session_scope() as s:
-                    m = MemberRepository(s).get_by_user(event_id, user_id)
+                    m = MemberRepository(s).get_by_identity(event_id, identity)
                     if m is not None:
                         return m.role
             except Exception as e:  # noqa: BLE001
                 log.warning(f"role lookup failed ({type(e).__name__}: {e})")
         return _default_role(
-            user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
+            user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id,
+            identity=identity,
         )
 
     def execute_confirmed_action(*, payload, channel, actor, authorized):
@@ -1771,7 +1910,8 @@ def build_orchestrator() -> Orchestrator:
                 f"request about '{query}'.")
         return {"text": text, "attachments": attachments}
 
-    setup_event_fn = _build_setup_event_fn()
+    sync_members_fn = _build_sync_members_fn()
+    setup_event_fn = _build_setup_event_fn(sync_members_fn=sync_members_fn)
     member_autoenroll_fn = _build_member_autoenroll_fn()
     channel_event_fn = _build_channel_event_fn()
     runner, summarizer = _build_runner_and_summarizer(
@@ -1787,6 +1927,7 @@ def build_orchestrator() -> Orchestrator:
             catalog=chat_catalog, pending_store=pending_store),
         list_members_fn=_build_list_members_fn(),
         setup_event_fn=setup_event_fn,
+        sync_members_fn=sync_members_fn,
         send_email_fn=send_email_fn, send_teams_message_fn=send_teams_message_fn,
     )
 
@@ -1833,6 +1974,7 @@ def _build_runner_and_summarizer(
     read_participant_file_fn=None, send_participant_reminders_fn=None,
     list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
     send_email_fn=None, send_teams_message_fn=None, list_members_fn=None,
+    sync_members_fn=None,
 ):
     """Build the LLM runner + summarizer, or (None, summarizer) when the chat path can't run
     (no creds / agent_mode=regex). The summarizer is built regardless so the background
@@ -1875,6 +2017,7 @@ def _build_runner_and_summarizer(
         _no_send_teams_message,
         _no_set_feedback,
         _no_setup_event,
+        _no_sync_members,
         _no_update_task,
     )
 
@@ -1897,6 +2040,7 @@ def _build_runner_and_summarizer(
         read_event_file_fn=read_event_file_fn or _no_read_event_file,
         list_members_fn=list_members_fn or _no_list_members,
         setup_event_fn=setup_event_fn or _no_setup_event,
+        sync_members_fn=sync_members_fn or _no_sync_members,
         send_email_fn=send_email_fn or _no_send_email,
         send_teams_message_fn=send_teams_message_fn or _no_send_teams_message,
         web_search_fn=web_search_fn,

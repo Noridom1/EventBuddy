@@ -84,7 +84,10 @@ def test_list_my_events_present_and_delegates_with_identity():
     assert tools["list_my_events"].args == {}  # no identity args exposed to the model
     out = tools["list_my_events"].invoke({})
     assert out.startswith("Your events:")
-    assert calls == {"user_id": "u1", "current_event_id": "ev-3"}
+    # Impl 18 — delegates the caller's full identity (server-side), not a bare user_id.
+    assert set(calls) == {"identity", "current_event_id"}
+    assert calls["identity"].teams_user_id == "u1"
+    assert calls["current_event_id"] == "ev-3"
 
 
 def test_read_channel_discussion_delegates_with_focused_event():

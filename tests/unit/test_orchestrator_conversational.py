@@ -134,8 +134,9 @@ def test_autoenroll_called_in_bound_shared_conversation():
         member_autoenroll_fn=lambda **kw: seen.append(kw),
     )
     orch.handle(user_id="u1", channel_id="conv-1", text="hi", scope="group",
-                display_name="Alice")
-    assert seen == [{"event_id": "ev-bound", "user_id": "u1", "display_name": "Alice"}]
+                display_name="Alice", aad_object_id="aad-1", user_email="alice@corp")
+    assert seen == [{"event_id": "ev-bound", "user_id": "u1", "display_name": "Alice",
+                     "aad_object_id": "aad-1", "email": "alice@corp"}]
 
 
 def test_capture_files_called_in_chat_scopes_with_attachments():

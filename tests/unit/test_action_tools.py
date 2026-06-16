@@ -72,6 +72,9 @@ def test_setup_event_tool_passes_ctx_and_hides_identity():
         "name": "Spring Hackathon", "user_id": "u1", "channel_id": "conv-1",
         "team_id": "team-9", "scope": "group", "role": "member",
         "display_name": "Alice", "objective": "a hackathon",
+        # Impl 18 — the caller's identity (None here, ctx carries no aad/email) rides along so
+        # the host enroll + roster sync can recognize them across contexts.
+        "aad_object_id": None, "email": None,
     }
 
 
@@ -89,9 +92,49 @@ def test_update_task_delegates_with_context_identity_and_role():
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="moderator")))
     out = tools["update_task"].invoke({"task_query": "slides", "status": "done"})
     assert out == "updated:done"
-    assert calls["update"] == dict(
-        user_id="u1", role="moderator", event_id="ev-3", task_query="slides", status="done"
-    )
+    # Impl 18 — update_task delegates the caller's identity (server-side), not a bare user_id.
+    update = calls["update"]
+    assert update["identity"].teams_user_id == "u1"
+    assert update["role"] == "moderator" and update["event_id"] == "ev-3"
+    assert update["task_query"] == "slides" and update["status"] == "done"
+
+
+def test_sync_event_members_delegates_with_scope_and_identity():
+    seen = {}
+
+    def sync_members_fn(**kw):
+        seen.update(kw)
+        return {"ok": True, "added": ["Alice", "Bob"], "already": 1, "skipped": 0}
+
+    deps, _ = _deps(sync_members_fn=sync_members_fn)
+    ctx = RequestContext(user_id="u1", aad_object_id="AAD-1", channel_id="conv-1",
+                         team_id="team-9", scope="group", role="moderator",
+                         current_event_id="ev-3")
+    tools = _by_name(build_tools(deps, ctx))
+    assert tools["sync_event_members"].args == {}  # no model-settable args
+    out = tools["sync_event_members"].invoke({})
+    assert "Added 2 member(s)" in out and "Alice, Bob" in out
+    assert seen["event_id"] == "ev-3" and seen["scope"] == "group"
+    assert seen["channel_id"] == "conv-1" and seen["team_id"] == "team-9"
+    assert seen["actor_identity"].aad_object_id == "AAD-1"
+
+
+def test_sync_event_members_needs_focused_event():
+    calls = {}
+    deps, _ = _deps(sync_members_fn=lambda **kw: calls.update(kw) or {"ok": True, "added": []})
+    ctx = RequestContext(user_id="u1", channel_id="conv-1", scope="group", role="moderator")
+    tools = _by_name(build_tools(deps, ctx))
+    out = tools["sync_event_members"].invoke({})
+    assert "isn't set up for an event" in out and not calls  # closure not called
+
+
+def test_sync_event_members_blocked_in_dm():
+    calls = {}
+    deps, _ = _deps(sync_members_fn=lambda **kw: calls.update(kw))
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", scope="personal",
+                                                      role="host", current_event_id="ev-3")))
+    out = tools["sync_event_members"].invoke({})
+    assert "group" in out.lower() and not calls
 
 
 def test_send_outlook_mail_requires_moderator():

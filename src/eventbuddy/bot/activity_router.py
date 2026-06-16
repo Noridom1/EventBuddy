@@ -91,6 +91,18 @@ def _links_in_html(html: str) -> list[dict]:
     return out
 
 
+def _fetch_my_email(token: str) -> str | None:
+    """Resolve the signed-in caller's corporate email via Graph `/me` using their delegated token
+    (Impl 18). Synchronous (httpx) — run in an executor from the async handler. Best-effort:
+    any failure returns None and the caller falls back to AAD-id matching."""
+    from eventbuddy.integrations.graph.client import GraphClient
+    from eventbuddy.integrations.graph.delegated import StaticTokenProvider
+    try:
+        return GraphClient(StaticTokenProvider(token)).get_my_email()
+    except Exception:  # noqa: BLE001 — degrade to "email unknown"; aad_object_id still bridges
+        return None
+
+
 def _attachments(activity) -> list[dict]:
     """Lightweight descriptors for incoming file attachments (Impl 4 + Impl 9). A file uploaded
     in Teams arrives as `application/vnd.microsoft.teams.file.download.info` with a
@@ -144,6 +156,30 @@ class EventBuddyBot(ActivityHandler):
         self._read_files_resolver = getattr(orchestrator, "read_files_resolver", None)
         # Folds a turn's per-recipient teams_dm cards into one before they're sent (or None).
         self._coalesce_cards = getattr(orchestrator, "coalesce_cards", None)
+        # Impl 18 — reuse the orchestrator's session store to cache the caller's resolved Graph
+        # email (keyed by their stable AAD id), so we don't `/me` on every turn.
+        self._session = getattr(orchestrator, "session", None)
+
+    async def _resolve_user_email(self, token: str | None, aad_object_id: str | None) -> str | None:
+        """The caller's own corporate email (Impl 18), resolved via Graph `/me` and cached by AAD
+        id. Returns None when not signed in (no token) — AAD-id matching still bridges contexts.
+        Best-effort and never raises into the turn."""
+        if not token:
+            return None
+        cache_key = aad_object_id or "me"
+        store = getattr(self, "_session", None)
+        if store is not None:
+            cached = store.get_cached_email(cache_key)
+            if cached:
+                return cached
+        try:
+            loop = asyncio.get_running_loop()
+            email = await loop.run_in_executor(None, _fetch_my_email, token)
+        except Exception:  # noqa: BLE001 — degrade: email stays unknown
+            email = None
+        if email and store is not None:
+            store.set_cached_email(cache_key, email)
+        return email
 
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         activity = turn_context.activity
@@ -192,6 +228,13 @@ class EventBuddyBot(ActivityHandler):
             return
 
         user_id = activity.from_property.id if activity.from_property else "unknown"
+        # Impl 18 — the stable AAD directory object id (server-derived, rule 2). Bridges the Bot
+        # Framework `user_id` to Graph chat/channel member listings (which key on this id), so a
+        # member enrolled from a group roster is recognized in their own DM.
+        aad_object_id = (
+            getattr(activity.from_property, "aad_object_id", None)
+            if activity.from_property else None
+        )
 
         # Diagnostic: reply with the caller's own server-derived identity so they can copy the
         # exact `teams_user_id` for seeding (`make seed HOST_USER_ID=...`). Placed after
@@ -201,6 +244,7 @@ class EventBuddyBot(ActivityHandler):
             name_dbg = activity.from_property.name if activity.from_property else None
             await turn_context.send_activity(
                 f"Your Teams user id is:\n\n`{user_id}`\n\n"
+                f"AAD object id:\n\n`{aad_object_id or 'unknown'}`\n\n"
                 f"(name: {name_dbg or 'unknown'}, scope: {scope_dbg})\n\n"
                 f"Use it with: `make seed HOST_USER_ID={user_id}`"
             )
@@ -219,6 +263,9 @@ class EventBuddyBot(ActivityHandler):
         # cleanly. Identity-bound + server-acquired, never model-supplied (rule 2).
         graph_token = await acquire_graph_token(turn_context)
         clear_signin_needed()  # reset the per-turn "Graph needed but no token" flag
+        # Impl 18 — resolve the caller's own corporate email (cached) so DM lookups can also match
+        # by domain identity, not just the AAD id. None when not signed in (aad still bridges).
+        user_email = await self._resolve_user_email(graph_token, aad_object_id)
         # `activity.timestamp` is the channel-set send-time (UTC) — Phase 1.9 keeps it
         # instead of discarding it, so the agent can reason about when messages were sent.
         artifacts, token = begin_artifacts()
@@ -232,6 +279,8 @@ class EventBuddyBot(ActivityHandler):
         loop = asyncio.get_running_loop()
         payload = {
             "user_id": user_id,
+            "aad_object_id": aad_object_id,
+            "user_email": user_email,
             "channel_id": channel_id,
             "text": text,
             "scope": scope,
