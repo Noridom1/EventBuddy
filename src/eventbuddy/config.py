@@ -76,6 +76,14 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Impl 10 — agent reasoning trace. When True, every turn emits an ordered, structured
+    # trace to the logs under the `agent.trace` logger at INFO: the prompt sent to the model
+    # (system + window), the model's reasoning + tool_calls, and each tool's input/return.
+    # Independent of LOG_LEVEL (visible without global DEBUG noise) and of AGENT_DEBUG (the
+    # reply footer). OFF by default — when on, the logs carry user content (prompts, file
+    # contents, rosters), so don't enable it against a shared/prod log sink without review.
+    agent_trace: bool = False
+
     # HITL action plane (Impl 1). TTL (seconds) of a prepared pending action in Redis: long
     # enough for the user to confirm the Adaptive Card, short enough to bound replay.
     pending_action_ttl: int = 60 * 60

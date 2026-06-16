@@ -141,6 +141,7 @@ class AgentRunner:
         transcript=None,
         summarizer=None,
         debug: bool = False,
+        trace: bool = False,
     ):
         self._model = model
         self._tools_factory = tools_factory
@@ -158,6 +159,7 @@ class AgentRunner:
         self._transcript = transcript
         self._summarizer = summarizer
         self._debug = debug
+        self._trace = trace
 
     def _config(self, ctx: RequestContext) -> dict:
         return {
@@ -242,11 +244,26 @@ class AgentRunner:
         )
         config = self._config(ctx)
         messages: list[BaseMessage] = []
+        seeded = False
         if (self._transcript is not None or self._summarizer is not None) and self._window_empty(
             config
         ):
             messages.extend(self._seed_messages(ctx))
+            seeded = bool(messages)
         messages.append(ctx.tag(text))
+
+        # Impl 10 — attach the per-turn reasoning trace (logs only) when enabled. The
+        # `turn.start` line records the memory provenance (`seeded`) that the model-input
+        # line alone can't show; the handler then logs every LLM round + tool call.
+        if self._trace:
+            from eventbuddy.agent.trace_logger import TracingCallbackHandler
+            from eventbuddy.agent.trace_logger import log as trace_log
+
+            trace_log.info("turn.start", extra={
+                "event": "turn.start", "thread_id": ctx.thread_id, "scope": ctx.scope,
+                "role": ctx.role, "event_id": ctx.current_event_id, "seeded": seeded,
+            })
+            config = {**config, "callbacks": [TracingCallbackHandler(thread_id=ctx.thread_id)]}
 
         trace, token = begin_trace()
         # Plan 13 — publish the caller's delegated Graph token to a request-scoped ContextVar
@@ -295,10 +312,12 @@ def build_agent_runner(
     transcript=None,
     summarizer=None,
     debug: bool = False,
+    trace: bool = False,
 ) -> AgentRunner:
     """Compose the Path-A agent runner. `tools_factory(ctx)` rebuilds the tool set bound to
     the request; `transcript`/`summarizer` (optional) enable empty-window rehydration.
-    `debug` turns on the Phase 1.8 tool-trace footer + error surfacing (no regex fallback)."""
+    `debug` turns on the Phase 1.8 tool-trace footer + error surfacing (no regex fallback).
+    `trace` turns on the Impl 10 reasoning trace to the logs (separate from the footer)."""
     return AgentRunner(
         model=model,
         tools_factory=tools_factory,
@@ -308,4 +327,5 @@ def build_agent_runner(
         transcript=transcript,
         summarizer=summarizer,
         debug=debug,
+        trace=trace,
     )
