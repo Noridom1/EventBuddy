@@ -5,6 +5,7 @@ import asyncio
 
 from botbuilder.schema import ActivityTypes
 
+from eventbuddy.bot import typing as typing_mod
 from eventbuddy.bot.typing import typing_indicator
 
 
@@ -45,6 +46,24 @@ def test_stops_resending_after_block_exits():
     before = asyncio.run(run())
 
     assert before == len(tc.sent)  # cancelled cleanly — no more dots after exit
+
+
+def test_kill_switch_sends_nothing(monkeypatch):
+    """With TYPING_INDICATOR_ENABLED off, the dev kill-switch, the block runs but no typing
+    activity is ever sent."""
+    monkeypatch.setattr(typing_mod.settings, "typing_indicator_enabled", False)
+    tc = _TurnContext()
+    ran = []
+
+    async def run():
+        async with typing_indicator(tc):
+            ran.append(True)
+            await asyncio.sleep(0.05)  # past the re-send interval would-be window
+
+    asyncio.run(run())
+
+    assert ran == [True]  # guarded work still runs
+    assert tc.sent == []  # but not one dot was sent
 
 
 def test_send_failure_never_breaks_the_block():

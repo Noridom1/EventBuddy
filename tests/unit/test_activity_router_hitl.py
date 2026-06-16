@@ -57,6 +57,22 @@ def test_emitted_card_is_sent_as_attachment_after_reply():
     assert attachments[0].content == {"type": "AdaptiveCard", "id": "r1"}
 
 
+def test_empty_turn_sends_a_fallback_so_dots_clear():
+    """The LLM can end a turn with an empty final message and emit no cards. Without a backstop
+    nothing would be sent — leaving the Plan 14 typing indicator stuck. The router must send a
+    fallback so the user gets a reply and the dots clear."""
+    bot = EventBuddyBot.__new__(EventBuddyBot)
+    bot._graph = type("G", (), {"invoke": lambda self, s: {"reply": ""}})()  # empty final message
+    bot._confirm = None
+    tc = _TurnContext(_Activity(text="hi"))
+
+    asyncio.run(bot.on_message_activity(tc))
+
+    replies = _replies(tc.sent)
+    assert len(replies) == 1  # exactly one fallback activity went out
+    assert isinstance(replies[0], str) and replies[0]  # non-empty text
+
+
 def test_card_submit_routes_to_confirm_and_skips_agent():
     calls = []
 
