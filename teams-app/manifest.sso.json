@@ -2,7 +2,7 @@
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
   "manifestVersion": "1.17",
   "id": "c1cb26e0-a557-4669-9bfa-7d8cd9d74bdf",
-  "version": "1.0.3",
+  "version": "1.0.1",
   "developer": {
     "name": "VNG AI Lab",
     "websiteUrl": "https://aiplatform.vngcloud.vn",
@@ -11,7 +11,7 @@
   },
   "name": {
     "short": "EventBuddy",
-    "full": "EventBuddy \u2014 Event Lifecycle Assistant"
+    "full": "EventBuddy — Event Lifecycle Assistant"
   },
   "description": {
     "short": "Plan, run, and report on events from inside Teams.",
@@ -25,57 +25,37 @@
   "bots": [
     {
       "botId": "caa64604-fc25-43c9-9f46-6a9cea4d135e",
-      "scopes": [
-        "personal",
-        "team",
-        "groupChat"
-      ],
+      "scopes": ["personal", "team", "groupChat"],
       "supportsFiles": true,
       "isNotificationOnly": false,
       "commandLists": [
         {
-          "scopes": [
-            "personal",
-            "team",
-            "groupChat"
-          ],
+          "scopes": ["personal", "team", "groupChat"],
           "commands": [
-            {
-              "title": "create event",
-              "description": "Create a new event and its Teams channel"
-            },
-            {
-              "title": "focus",
-              "description": "Focus on an event so following messages apply to it"
-            },
-            {
-              "title": "remind",
-              "description": "Remind members about a task or deadline"
-            },
-            {
-              "title": "list tasks",
-              "description": "List the tasks for the focused event"
-            },
-            {
-              "title": "report",
-              "description": "Generate a report for the focused event"
-            }
+            { "title": "create event", "description": "Create a new event and its Teams channel" },
+            { "title": "focus", "description": "Focus on an event so following messages apply to it" },
+            { "title": "remind", "description": "Remind members about a task or deadline" },
+            { "title": "list tasks", "description": "List the tasks for the focused event" },
+            { "title": "report", "description": "Generate a report for the focused event" }
           ]
         }
       ]
     }
   ],
-  "permissions": [
-    "identity",
-    "messageTeamMembers"
-  ],
+  "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
     "endpoint-0a09ccce-2059-4ce4-b1b7-8a35d674aa0c.agentbase-runtime.aiplatform.vngcloud.vn",
-    "token.botframework.com",
-    "*.botframework.com",
-    "login.microsoftonline.com",
-    "*.microsoftonline.com",
-    "login.microsoft.com",
-    "login.live.com"
-  ]
+    "token.botframework.com"
+  ],
+  "webApplicationInfo": {
+    "id": "caa64604-fc25-43c9-9f46-6a9cea4d135e",
+    "resource": "api://botid-caa64604-fc25-43c9-9f46-6a9cea4d135e/access_as_user"
+  },
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": [
+        { "name": "ChannelMessage.Read.Group", "type": "Application" }
+      ]
+    }
+  }
 }
