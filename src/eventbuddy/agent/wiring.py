@@ -1911,5 +1911,6 @@ def _build_runner_and_summarizer(
         transcript=transcript,
         summarizer=summarizer,
         debug=settings.agent_debug,
+        trace=settings.agent_trace,
     )
     return runner, summarizer
