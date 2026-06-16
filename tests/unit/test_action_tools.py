@@ -53,10 +53,48 @@ def test_new_tools_registered_and_identity_absent():
         assert "user_id" not in tools[name].args and "role" not in tools[name].args
 
 
-def test_update_task_schema_is_query_and_status_only():
+def test_update_task_schema_exposes_query_status_due_and_note():
     deps, _ = _deps()
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
-    assert set(tools["update_task"].args) == {"task_query", "status"}
+    assert set(tools["update_task"].args) == {"task_query", "status", "due_date", "note"}
+
+
+def test_create_task_registered_and_hides_identity():
+    deps, _ = _deps()
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert "create_task" in tools
+    assert set(tools["create_task"].args) == {
+        "task_name", "assignee", "due_date", "status", "note"}
+    assert "user_id" not in tools["create_task"].args
+    assert "identity" not in tools["create_task"].args
+
+
+def test_create_task_needs_focused_event():
+    calls = {}
+    deps, _ = _deps(create_task_fn=lambda **kw: calls.setdefault("create", kw) or "made")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["create_task"].invoke({"task_name": "Send thanks"})
+    assert "focus" in out.lower()
+    assert "create" not in calls
+
+
+def test_create_task_delegates_with_context_identity_any_member():
+    captured = {}
+    deps, _ = _deps(create_task_fn=lambda **kw: captured.update(kw) or "made")
+    deps.session_store.set_current_event("u1", "ev-3")
+    # `member` (not moderator) — any member may create tasks.
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["create_task"].invoke({
+        "task_name": "Send thanks", "assignee": "tho", "due_date": "2026-06-20",
+        "status": "todo", "note": "rescheduled",
+    })
+    assert out == "made"
+    assert captured["identity"].teams_user_id == "u1"
+    assert captured["event_id"] == "ev-3"
+    assert captured["task_name"] == "Send thanks" and captured["assignee"] == "tho"
+    assert captured["due_date"] == "2026-06-20" and captured["note"] == "rescheduled"
+    # identity is server-built, never a model arg
+    assert "user_id" not in captured
 
 
 def test_setup_event_tool_passes_ctx_and_hides_identity():

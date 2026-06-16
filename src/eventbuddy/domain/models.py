@@ -77,6 +77,9 @@ class Task(Base):
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="todo")
     source_document: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Free-form note the agent can attach/append to a task (e.g. a rescheduled deadline,
+    # a blocker, context). Distinct from `task_name` — nullable, agent-maintained.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     event: Mapped["Event"] = relationship(back_populates="tasks")
 
 

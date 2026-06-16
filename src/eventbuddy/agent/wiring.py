@@ -262,6 +262,74 @@ def _expand_aliases(values) -> list[str]:
     return out
 
 
+# --- Task-creation plane: due-date + assignee helpers (module-level → unit-testable) --------
+
+def _parse_due_date(raw):
+    """Parse a model-supplied deadline into a tz-aware UTC datetime, or None.
+
+    Accepts ISO (`2026-06-20`, `2026-06-20T09:00`), `DD/MM/YYYY`, and `DD/MM` (current year).
+    If `raw` carries a range or extra text (e.g. '20/06 - 25/06', 'by 20/06'), the FIRST
+    date-like token wins. Returns None for empty/unparseable input — the caller stores no
+    deadline rather than guessing."""
+    import re as _re
+    from datetime import UTC, datetime
+
+    s = (raw or "").strip()
+    if not s:
+        return None
+
+    def _aware(dt):
+        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+    # ISO first — most explicit, handles optional time.
+    try:
+        return _aware(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except ValueError:
+        pass
+    # YYYY-MM-DD or DD/MM[/YYYY] anywhere in the string (first match).
+    iso = _re.search(r"\d{4}-\d{1,2}-\d{1,2}", s)
+    if iso:
+        try:
+            return _aware(datetime.strptime(iso.group(), "%Y-%m-%d"))
+        except ValueError:
+            pass
+    dmy = _re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", s)
+    if dmy:
+        day, month, year = dmy.group(1), dmy.group(2), dmy.group(3)
+        try:
+            yr = int(year) if year else datetime.now(UTC).year
+            if yr < 100:
+                yr += 2000
+            return datetime(yr, int(month), int(day), tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_task_assignee(member_repo, event_id, assignee):
+    """Resolve a model-supplied `assignee` (alias, email, or display name) to task identity
+    fields {assignee_id, assignee_email} against the event's members. Matches, in order:
+    exact email (raw or alias→corp-domain expanded), then case-insensitive display-name
+    substring. A matched member contributes their `teams_user_id`/`aad_object_id` + email so
+    task ownership works across contexts (Impl 18). Unmatched but email-like input is stored as
+    a bare `assignee_email` (the person may be enrolled later); otherwise returns no fields
+    (unassigned)."""
+    a = (assignee or "").strip()
+    if not a:
+        return {}
+    members = member_repo.list(event_id)
+    expanded = (_expand_aliases([a]) or [None])[0]
+    want_email = (expanded or "").lower()
+    for m in members:
+        if want_email and m.email and m.email.lower() == want_email:
+            return {"assignee_id": m.teams_user_id or m.aad_object_id, "assignee_email": m.email}
+    low = a.lower()
+    for m in members:
+        if m.display_name and low in m.display_name.lower():
+            return {"assignee_id": m.teams_user_id or m.aad_object_id, "assignee_email": m.email}
+    return {"assignee_email": expanded} if expanded else {}
+
+
 # --- Impl 4: participant-roster helpers (module-level → unit-testable) ----------------------
 
 def _filter_emails_by_status(rows: list[dict], only_status: str) -> list[str]:
@@ -1367,15 +1435,61 @@ def build_orchestrator() -> Orchestrator:
             log.warning(f"list event tasks failed ({type(e).__name__}: {e})")
             return "I couldn't load the event's tasks right now — please try again."
 
-    def update_task_fn(*, user_id=None, identity=None, role, event_id, task_query, status):
-        """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
-        any. Resolves the task by name within the focused event. Ownership is matched by identity
-        (Impl 18) — the task's `assignee_id` (BF/AAD id) or `assignee_email` (domain identity)."""
-        if identity is None and user_id:
-            identity = CallerIdentity.of(teams_user_id=user_id)
+    def create_task_fn(
+        *, user_id=None, identity=None, event_id, task_name,
+        assignee="", due_date="", status="todo", note="",
+    ):
+        """Create a new task in the focused event (any member). Resolves `assignee`
+        (alias/email/display name) to a member's identity, parses `due_date` into a deadline,
+        and stores the optional free-form `note`. `status` defaults to 'todo'."""
+        name = (task_name or "").strip()
+        if not name:
+            return "I need a task name to create the task."
         valid = {"todo", "in_progress", "done"}
+        status = (status or "todo").strip() or "todo"
         if status not in valid:
             return f"Status must be one of: {', '.join(sorted(valid))}."
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.tasks import TaskRepository
+        try:
+            with session_scope() as s:
+                repo = TaskRepository(s)
+                if any(name.lower() == t.task_name.lower() for t in repo.list(event_id)):
+                    return (f"A task named '{name}' already exists in this event — "
+                            "update it instead, or pick a different name.")
+                fields = _resolve_task_assignee(MemberRepository(s), event_id, assignee)
+                due = _parse_due_date(due_date)
+                repo.create(
+                    event_id, name, status=status,
+                    note=(note or "").strip() or None, due_date=due, **fields,
+                )
+            who = fields.get("assignee_email") or (assignee.strip() if assignee else None)
+            tail = f" for {who}" if who else ""
+            when = f", due {due.date().isoformat()}" if due else ""
+            return f"Created task '{name}'{tail} ({status}{when})."
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"create_task failed ({type(e).__name__}: {e})")
+            return "Couldn't create the task right now."
+
+    def update_task_fn(
+        *, user_id=None, identity=None, role, event_id, task_query,
+        status="", due_date="", note="",
+    ):
+        """Direct (non-HITL) task update. Member may update own tasks; moderator/host any.
+        Resolves the task by name within the focused event, then updates whichever of `status`,
+        `due_date`, and `note` are supplied. Ownership is matched by identity (Impl 18) — the
+        task's `assignee_id` (BF/AAD id) or `assignee_email` (domain identity)."""
+        if identity is None and user_id:
+            identity = CallerIdentity.of(teams_user_id=user_id)
+        status = (status or "").strip()
+        valid = {"todo", "in_progress", "done"}
+        if status and status not in valid:
+            return f"Status must be one of: {', '.join(sorted(valid))}."
+        due = _parse_due_date(due_date) if (due_date or "").strip() else None
+        note = (note or "").strip()
+        if not (status or due or note):
+            return "Tell me what to change — a status, a deadline, or a note."
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.tasks import TaskRepository
         try:
@@ -1395,8 +1509,17 @@ def build_orchestrator() -> Orchestrator:
                 if not is_mod and not owns:
                     return "You can only update your own tasks (moderators can update any)."
                 name = t.task_name
-                repo.set_status(t.task_id, status)
-                return f"Updated '{name}' → {status}."
+                changed = []
+                if status:
+                    t.status = status
+                    changed.append(f"status → {status}")
+                if due:
+                    t.due_date = due
+                    changed.append(f"due → {due.date().isoformat()}")
+                if note:
+                    t.note = note
+                    changed.append("note updated")
+                return f"Updated '{name}': {', '.join(changed)}."
         except Exception as e:  # noqa: BLE001
             log.warning(f"update_task failed ({type(e).__name__}: {e})")
             return "Couldn't update the task right now."
@@ -1917,6 +2040,7 @@ def build_orchestrator() -> Orchestrator:
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
+        create_task_fn=create_task_fn,
         list_event_tasks_fn=list_event_tasks_fn,
         list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
@@ -1969,6 +2093,7 @@ def build_summarizer():
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
+    create_task_fn=None,
     list_event_tasks_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
@@ -2003,6 +2128,7 @@ def _build_runner_and_summarizer(
     event_context_fn = _build_event_context_fn(transcript, summarizer)
 
     from eventbuddy.agent.tools import (
+        _no_create_task,
         _no_ingest,
         _no_list_event_files,
         _no_list_event_tasks,
@@ -2027,6 +2153,7 @@ def _build_runner_and_summarizer(
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         event_context_fn=event_context_fn,
         update_task_fn=update_task_fn or _no_update_task,
+        create_task_fn=create_task_fn or _no_create_task,
         list_event_tasks_fn=list_event_tasks_fn or _no_list_event_tasks,
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
