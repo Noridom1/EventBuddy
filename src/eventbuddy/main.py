@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from eventbuddy.api import health, messages, webhooks
+from eventbuddy.api import health, landing, messages, webhooks
 from eventbuddy.common.logging import configure_logging, get_logger
 from eventbuddy.config import settings
 from eventbuddy.scheduler.triggers import (
@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
     configure_logging()
     app = FastAPI(title="EventBuddy", lifespan=lifespan)
     app.include_router(health.router)
+    app.include_router(landing.router)
     app.include_router(messages.router)
     app.include_router(webhooks.router)
     from eventbuddy.api import forms
