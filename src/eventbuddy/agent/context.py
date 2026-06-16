@@ -9,6 +9,8 @@ from datetime import datetime
 
 from langchain_core.messages import HumanMessage
 
+from eventbuddy.domain.identity import CallerIdentity
+
 
 def event_thread_id(channel_id: str) -> str:
     """The shared-thread memory key for an event channel. Single source of truth so the
@@ -31,6 +33,13 @@ def focus_key_for(scope: str, user_id: str, channel_id: str | None) -> str:
 class RequestContext:
     user_id: str
     channel_id: str | None = None
+    # Stable cross-context identity for the caller (Impl 18). `aad_object_id` is the AAD
+    # directory GUID from `activity.from_property.aad_object_id` (server-derived, rule 2) — the
+    # bridge to Graph's chat/channel member listings (which key on the same id, not the BF
+    # `user_id`). `user_email` is the caller's own corporate address, resolved server-side via
+    # Graph `/me` when signed in (cached). Both None-safe: matching falls back to `user_id`.
+    aad_object_id: str | None = None
+    user_email: str | None = None
     # "personal" = 1-1 DM, "channel" = a shared event channel. Drives memory scope.
     scope: str = "personal"
     # Real Teams team/group id this conversation lives under (channel scope only — None in a
@@ -71,6 +80,18 @@ class RequestContext:
         if self.scope == "group" and self.channel_id:
             return f"group:{self.channel_id}"
         return f"dm:{self.user_id}"
+
+    @property
+    def identity(self) -> CallerIdentity:
+        """The caller as a matched-by-any identity set (Impl 18): the BF `user_id`, the AAD
+        object id, and the resolved corporate email. Repositories match a stored member when any
+        column equals any of these, so the same human is recognized across group chat / channel /
+        DM regardless of which id a given context supplies."""
+        return CallerIdentity.of(
+            teams_user_id=self.user_id,
+            aad_object_id=self.aad_object_id,
+            email=self.user_email,
+        )
 
     @property
     def focus_key(self) -> str:

@@ -2,6 +2,10 @@ import json
 
 SESSION_KEY = "session:{user_id}"
 SESSION_TTL = 60 * 60 * 24  # 24h
+# Cache for the caller's own corporate email resolved via Graph `/me` (Impl 18). Keyed by the
+# caller's AAD object id (stable) so it's reused across turns without a `/me` call each time.
+EMAIL_KEY = "useremail:{key}"
+EMAIL_TTL = 60 * 60 * 24 * 7  # 7d — directory email rarely changes
 
 
 class SessionStore:
@@ -32,6 +36,21 @@ class SessionStore:
         data = self._load(user_id)
         data.pop("current_event_id", None)
         self._save(user_id, data)
+
+    def get_cached_email(self, key: str) -> str | None:
+        """The caller's cached corporate email (Impl 18), or None. Best-effort — Redis hiccups
+        never break a turn (we just re-resolve)."""
+        try:
+            return self.r.get(EMAIL_KEY.format(key=key)) or None
+        except Exception:  # noqa: BLE001 — cache miss on any error
+            return None
+
+    def set_cached_email(self, key: str, email: str) -> None:
+        """Cache the caller's corporate email under their stable AAD id (Impl 18). Best-effort."""
+        try:
+            self.r.set(EMAIL_KEY.format(key=key), email, ex=EMAIL_TTL)
+        except Exception:  # noqa: BLE001 — caching is an optimization, never fatal
+            pass
 
     def clear_all(self) -> int:
         """Delete every user's session (focused-event state). Dev/demo reset — wipes all

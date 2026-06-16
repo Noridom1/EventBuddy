@@ -8,7 +8,8 @@ class ProvisioningService:
         self.team_id = team_id
 
     def create_event(self, *, name: str, host_user_id: str, member_emails: list[str],
-                     objective: str = "") -> object:
+                     objective: str = "", host_aad_object_id: str | None = None,
+                     host_email: str | None = None) -> object:
         event = self.events.create(event_name=name, host_user_id=host_user_id,
                                    objective=objective, status="ideation")
         # No Graph client (delegated auth: host not signed in yet, or no creds) → persist the
@@ -26,6 +27,13 @@ class ProvisioningService:
             if self.team_id:
                 self.events.set_team_id(event.event_id, self.team_id)
         roster = [{"email": e, "role": "member"} for e in member_emails]
-        roster.append({"email": host_user_id, "role": "host", "teams_user_id": host_user_id})
+        # The host is keyed by their Bot Framework id and (Impl 18) their AAD id + corporate email
+        # when known, so they're recognized across contexts and the roster sync never duplicates
+        # them. Fall back to the BF id in the email slot only when no real email is available.
+        roster.append({
+            "role": "host", "teams_user_id": host_user_id,
+            "aad_object_id": host_aad_object_id,
+            "email": host_email or host_user_id,
+        })
         self.members.add_many(event.event_id, roster)
         return event

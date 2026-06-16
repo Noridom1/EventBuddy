@@ -47,9 +47,18 @@ class EventMember(Base):
     mapping_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     event_id: Mapped[str] = mapped_column(ForeignKey("events.event_id", ondelete="CASCADE"))
     teams_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Stable AAD directory object id (Impl 18). Distinct from `teams_user_id`: that is the Bot
+    # Framework `29:…` channel-account id (per-conversation, what `from_property.id` carries),
+    # whereas this is the tenant-wide AAD GUID — the SAME value `from_property.aad_object_id`
+    # carries on every activity AND that Graph `/chats/{id}/members` returns as `userId`. It is
+    # the cross-context bridge: a member enrolled from a group chat's Graph roster is recognized
+    # in their own 1-1 DM by this id even before they've posted or signed in. Nullable — legacy
+    # rows and non-AAD/guest members lack it; matching falls back to teams_user_id / email.
+    aad_object_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     # Nullable since group-chat onboarding (setup_event / auto-enroll): a member enrolled from a
     # Teams post is keyed by `teams_user_id` + display name — we don't have their email until a
     # roster file / Graph lookup backfills it. Reminder/mail recipient builders skip empty emails.
+    # The corporate email is also the domain identity (Impl 18) — a second cross-context join key.
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     role: Mapped[str] = mapped_column(String(20), default="member")
@@ -68,6 +77,9 @@ class Task(Base):
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="todo")
     source_document: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Free-form note the agent can attach/append to a task (e.g. a rescheduled deadline,
+    # a blocker, context). Distinct from `task_name` — nullable, agent-maintained.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     event: Mapped["Event"] = relationship(back_populates="tasks")
 
 

@@ -9,7 +9,7 @@ log = get_logger("agent.orchestrator")
 
 
 def _default_role(*, user_id: str, scope: str, channel_id: str | None,
-                  event_id: str | None = None) -> str:
+                  event_id: str | None = None, identity=None) -> str:
     """Server-resolved caller role. In a 1-1 DM the user acts as the event leader (host).
     A group chat is a flat peer space — every participant resolves to `moderator`, so anyone
     can run the privileged actions (no host/moderator/member split in group scope). In a
@@ -66,7 +66,9 @@ class Orchestrator:
                    sent_at: datetime | None, team_id: str | None = None,
                    attachments: list[dict] | None = None,
                    graph_token: str | None = None,
-                   display_name: str | None = None) -> RequestContext:
+                   display_name: str | None = None,
+                   aad_object_id: str | None = None,
+                   user_email: str | None = None) -> RequestContext:
         # In a shared conversation (a Team channel *or* a group chat) the focused event is the one
         # bound to this conversation id — resolve it via the binding (and backfill the real team
         # id on the way, a no-op in a group chat where team_id is None). In a 1-1 DM the focus
@@ -77,20 +79,27 @@ class Orchestrator:
             event_id = self.session.get_current_event(
                 focus_key_for(scope, user_id, channel_id)
             )
-        return RequestContext(
+        ctx = RequestContext(
             user_id=user_id,
+            aad_object_id=aad_object_id,
+            user_email=user_email,
             channel_id=channel_id,
             scope=scope,
             team_id=team_id,
-            role=self._role_resolver(
-                user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
-            ),
+            role="member",  # provisional — resolved below now that the identity exists
             current_event_id=event_id,
             sent_at=sent_at,
             attachments=attachments or [],
             graph_token=graph_token,
             display_name=display_name,
         )
+        # Role resolution matches the caller by their full identity (Impl 18) — so a member
+        # enrolled by AAD id / email (not the BF id) gets their real stored role in a DM.
+        ctx.role = self._role_resolver(
+            user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id,
+            identity=ctx.identity,
+        )
+        return ctx
 
     @staticmethod
     def _with_attachment_note(text: str, attachments: list[dict]) -> str:
@@ -107,16 +116,18 @@ class Orchestrator:
     def handle(self, *, user_id: str, channel_id: str | None, text: str,
                scope: str = "personal", sent_at: datetime | None = None,
                team_id: str | None = None, attachments: list[dict] | None = None,
-               graph_token: str | None = None, display_name: str | None = None) -> str:
+               graph_token: str | None = None, display_name: str | None = None,
+               aad_object_id: str | None = None, user_email: str | None = None) -> str:
         # `sent_at` (Phase 1.9), `team_id` (Impl 3), `attachments` (Impl 4), `graph_token`
-        # (Plan 13 — delegated Graph auth) + `display_name` (group-chat speaker tagging) are
-        # additive + keyword-defaulted so existing callers that don't pass them keep working.
+        # (Plan 13 — delegated Graph auth), `display_name` (group-chat speaker tagging) and
+        # `aad_object_id`/`user_email` (Impl 18 — cross-context identity) are additive +
+        # keyword-defaulted so existing callers that don't pass them keep working.
         attachments = attachments or []
         self._maybe_capture_files(scope, channel_id, attachments)
         if self.agent_mode == "llm" and self.runner is not None:
             try:
                 ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments,
-                                      graph_token, display_name)
+                                      graph_token, display_name, aad_object_id, user_email)
                 self._maybe_autoenroll(ctx)
                 return self.runner.run(self._with_attachment_note(text, attachments), ctx)
             except Exception as e:  # noqa: BLE001
@@ -151,6 +162,7 @@ class Orchestrator:
             self._member_autoenroll_fn(
                 event_id=ctx.current_event_id, user_id=ctx.user_id,
                 display_name=ctx.display_name,
+                aad_object_id=ctx.aad_object_id, email=ctx.user_email,
             )
         except Exception as e:  # noqa: BLE001 — enrollment is best-effort, never fatal
             log.warning(f"member auto-enroll skipped ({type(e).__name__}: {e})")

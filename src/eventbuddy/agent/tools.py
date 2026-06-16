@@ -108,6 +108,11 @@ def _no_update_task(**_kw) -> str:
     return "Task updates aren't available right now."
 
 
+def _no_create_task(**_kw) -> str:
+    """Default `create_task_fn` — task creation not wired (no DB path)."""
+    return "Creating tasks isn't available right now."
+
+
 def _no_list_event_tasks(**_kw) -> str:
     """Default `list_event_tasks_fn` — full task-board listing not wired (no DB path)."""
     return "Listing the event's tasks isn't available right now."
@@ -178,6 +183,11 @@ def _no_list_members(**_kw) -> str:
     return "Listing the people in this chat isn't available right now."
 
 
+def _no_sync_members(**_kw) -> dict:
+    """Default `sync_members_fn` — roster enrollment not wired (no Graph/DB path)."""
+    return {"ok": False, "message": "Updating the event's members isn't available right now."}
+
+
 def wrap_untrusted(source: str, content: str) -> str:
     """Frame external/untrusted text (web pages, channel messages) so the model treats it as
     reference data, never as instructions (Impl 3 — prompt-injection guard). Capability
@@ -206,6 +216,9 @@ class AgentDeps:
     # Impl 1 (action plane) — `update_task` (direct) + `send_outlook_mail` (HITL). Default to
     # no-ops so the existing tests/no-DB path still build the tool set.
     update_task_fn: Callable = _no_update_task
+    # Task-creation plane — `create_task` adds a new task (name + assignee + due date + status +
+    # note) to the focused event. Any member. Default no-op so the no-DB path still builds.
+    create_task_fn: Callable = _no_create_task
     # Impl 1 — `list_event_tasks` shows the whole task board (every assignee + status) for the
     # focused event, not just the caller's own tasks. Read-only, any member. Default no-op.
     list_event_tasks_fn: Callable = _no_list_event_tasks
@@ -237,6 +250,9 @@ class AgentDeps:
     # Impl 8 — `list_members` lists the people in the current conversation, scope-aware and
     # event-independent (chat → /chats members; channel → team channel members). Default no-op.
     list_members_fn: Callable = _no_list_members
+    # Impl 18 — `sync_event_members` enrolls the conversation's Graph members into the focused
+    # event by corporate identity (AAD id + email), adding anyone missing. Default no-op.
+    sync_members_fn: Callable = _no_sync_members
     # Generic (event-independent) send tools — `send_email` (any recipients/aliases) and
     # `send_teams_message` (1-1 chat to a resolved colleague). Both HITL-gated, any member.
     # Default no-ops so the no-Graph / no-DB path still builds the tool set.
@@ -269,7 +285,8 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to create events (needs host or moderator)."
         ev = deps.provision_fn(
-            name=name, host_user_id=ctx.user_id, member_emails=member_emails, objective=objective
+            name=name, host_user_id=ctx.user_id, member_emails=member_emails, objective=objective,
+            host_aad_object_id=ctx.aad_object_id, host_email=ctx.user_email,
         )
         return f"Created event '{name}' (id {ev.event_id})."
 
@@ -287,14 +304,44 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
             name=name, user_id=ctx.user_id, channel_id=ctx.channel_id,
             team_id=ctx.team_id, scope=ctx.scope, role=ctx.role,
             display_name=ctx.display_name, objective=objective,
+            aad_object_id=ctx.aad_object_id, email=ctx.user_email,
         )
+
+    @tool
+    @traced
+    def sync_event_members() -> str:
+        """Re-scan the people in THIS group chat or Team channel and enroll anyone who isn't yet a
+        member of the focused event. Use when the user says members are missing or new people
+        joined the group — e.g. "add the new members to the event", "update the event's members".
+        Matches people by their corporate identity, so each enrolled member is recognized in their
+        own 1-1 chat with me. Requires an event to be set up for this conversation; in a 1-1 chat
+        there's no group to scan. In a channel this needs host or moderator."""
+        if ctx.scope not in ("group", "channel"):
+            return ("There's no group to scan here — this works in a group chat or Team channel "
+                    "that's set up for an event.")
+        if ctx.scope == "channel" and not _role_allows(ctx, "moderator"):
+            return "You don't have permission to update members (needs host or moderator)."
+        if not ctx.current_event_id:
+            return ("This conversation isn't set up for an event yet — tell me which event it's "
+                    "for first (e.g. 'this is the group for Spring Hackathon').")
+        result = deps.sync_members_fn(
+            event_id=ctx.current_event_id, channel_id=ctx.channel_id,
+            team_id=ctx.team_id, scope=ctx.scope, actor_identity=ctx.identity,
+        )
+        if not result or not result.get("ok"):
+            return (result or {}).get("message", "I couldn't update the members just now.")
+        added = result.get("added") or []
+        if not added:
+            return "No new members to add — everyone here is already enrolled in the event."
+        names = ", ".join(added[:12]) + ("…" if len(added) > 12 else "")
+        return f"Added {len(added)} member(s) to the event: {names}."
 
     @tool
     @traced
     def set_focus_event(event_query: str) -> str:
         """Switch the focused event to the one matching `event_query` (a name or fragment).
         Subsequent task/reminder/report actions apply to this event."""
-        event_id = deps.resolve_event_fn(event_query, user_id=ctx.user_id)
+        event_id = deps.resolve_event_fn(event_query, identity=ctx.identity)
         if not event_id:
             return f"I couldn't find an event matching '{event_query}'."
         deps.session_store.set_current_event(ctx.focus_key, event_id)
@@ -303,7 +350,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         # the moment the user focuses — deterministic, no reliance on model judgment. Only
         # in a DM; in a channel the event memory already *is* the live window.
         if ctx.scope == "personal":
-            snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)
+            snapshot = deps.event_context_fn(identity=ctx.identity, event_id=event_id)
             if snapshot:
                 msg = f"{msg}\n\n{snapshot}"
         return msg
@@ -326,7 +373,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     def list_my_tasks() -> str:
         """List the caller's assigned tasks in the currently focused event."""
         event_id = deps.session_store.get_current_event(ctx.focus_key)
-        return deps.query_tasks_fn(user_id=ctx.user_id, event_id=event_id)
+        return deps.query_tasks_fn(identity=ctx.identity, event_id=event_id)
 
     @tool
     @traced
@@ -342,16 +389,44 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def update_task(task_query: str, status: str) -> str:
-        """Update the status of a task in the currently focused event. `task_query` matches
-        the task by name; `status` is one of: todo, in_progress, done. You may update your
-        own tasks; moderators/hosts may update any. Requires a focused event."""
+    def create_task(
+        task_name: str, assignee: str = "", due_date: str = "",
+        status: str = "todo", note: str = "",
+    ) -> str:
+        """Create a new task in the currently focused event. Use when the user wants to add a
+        to-do / assign work — e.g. "add a task to send thank-you emails, assign it to Thơ, due
+        June 20". `task_name` is required. `assignee` is who it's for — a corporate alias (the
+        part before @, e.g. 'phucnlt2'), a full email, or a member's display name; leave empty to
+        leave it unassigned. `due_date` is the deadline as a single ISO date ('2026-06-20')
+        — if the user gives a range, pass the END date. `status` is one of todo, in_progress,
+        done (defaults to todo). `note` is any free-form context to attach (a blocker, a reason
+        for a deadline change). Any member may create tasks. Requires a focused event. To change
+        an existing task instead of adding one, use update_task."""
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.create_task_fn(
+            identity=ctx.identity, event_id=event_id, task_name=task_name,
+            assignee=assignee, due_date=due_date, status=status, note=note,
+        )
+
+    @tool
+    @traced
+    def update_task(
+        task_query: str, status: str = "", due_date: str = "", note: str = "",
+    ) -> str:
+        """Update an existing task in the currently focused event. `task_query` matches the task
+        by name. Supply any of: `status` (one of todo, in_progress, done), `due_date` (a single
+        ISO date like '2026-06-20' — to reschedule a deadline), and `note` (free-form context to
+        attach/replace, e.g. why a deadline moved). At least one is required. You may update your
+        own tasks; moderators/hosts may update any. This does NOT create tasks — if the task
+        doesn't exist yet, use create_task. Requires a focused event."""
         event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event first."
         return deps.update_task_fn(
-            user_id=ctx.user_id, role=ctx.role, event_id=event_id,
-            task_query=task_query, status=status,
+            identity=ctx.identity, role=ctx.role, event_id=event_id,
+            task_query=task_query, status=status, due_date=due_date, note=note,
         )
 
     @tool
@@ -394,19 +469,26 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def send_teams_message(recipients: str | list[str], message: str) -> str:
+    def send_teams_message(recipients: str | list[str], message: str, group: str = "") -> str:
         """Send a direct 1-1 Teams chat message to one or more colleagues, independent of any
         event. `recipients` is a corporate alias (the part before @, e.g. 'phucnlt2') or full
-        email address, given as a single value or a list; the same `message` is sent to each.
-        Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines between
-        paragraphs; it's rendered as formatted text in the chat. Pass ALL the people in ONE call
-        (a list) — do NOT call this once per person — so the user gets a single confirmation card
-        instead of one per recipient. Sending is gated by that card — this only drafts it. Any
-        member may use it."""
+        email address, given as a single value or a list; the same `message` goes to everyone in
+        THIS call. Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines
+        between paragraphs; it's rendered as formatted text in the chat.
+
+        To send the SAME message to several people, pass them all as a list in one call (one
+        confirmation card). To PERSONALIZE — give different people different messages — call this
+        once per distinct message. The `group` argument decides how those calls are confirmed:
+        give several calls the SAME non-empty `group` label to fold them into ONE consolidated
+        confirmation card (a per-recipient breakdown the user approves at once); omit `group` (or
+        use different labels) to keep them as SEPARATE confirmation cards. When personalizing a
+        batch of related messages, prefer one shared `group` label.
+
+        Sending is gated by the confirmation card — this only drafts it. Any member may use it."""
         if isinstance(recipients, str):
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_teams_message_fn(
-            user_id=ctx.user_id, recipients=recipients, message=message)
+            user_id=ctx.user_id, recipients=recipients, message=message, group=group)
 
     @tool
     @traced
@@ -454,7 +536,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         event_id = deps.session_store.get_current_event(ctx.focus_key)
         if not event_id:
             return "No event is focused yet — tell me which event to focus on first."
-        snapshot = deps.event_context_fn(user_id=ctx.user_id, event_id=event_id)
+        snapshot = deps.event_context_fn(identity=ctx.identity, event_id=event_id)
         return snapshot or "I don't have any shared discussion recorded for this event yet."
 
     @tool
@@ -463,7 +545,8 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """List the events you are part of (as a member or host), with their status and your
         role. Use when the user asks which events they have / are in — then offer
         set_focus_event to act on one. Works in a 1-1 chat."""
-        return deps.list_events_fn(user_id=ctx.user_id, current_event_id=ctx.current_event_id)
+        return deps.list_events_fn(
+            identity=ctx.identity, current_event_id=ctx.current_event_id)
 
     @tool
     @traced
@@ -563,8 +646,8 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         )
 
     tools: list[BaseTool] = [
-        create_event, setup_event, set_focus_event, prepare_reminders,
-        list_my_tasks, list_event_tasks, update_task, send_outlook_mail,
+        create_event, setup_event, sync_event_members, set_focus_event, prepare_reminders,
+        list_my_tasks, list_event_tasks, create_task, update_task, send_outlook_mail,
         send_email, send_teams_message,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion, list_members,
