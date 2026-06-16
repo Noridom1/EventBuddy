@@ -5,7 +5,8 @@ class _Graph:
     def __init__(self):
         self.chat_msgs = []
         self.mails = []
-    def send_chat_message(self, chat_id, text): self.chat_msgs.append((chat_id, text))
+    def send_chat_message(self, chat_id, text, content_type="text"):
+        self.chat_msgs.append((chat_id, text))
     def send_mail(self, subject, body_html, to): self.mails.append(to)
 
 

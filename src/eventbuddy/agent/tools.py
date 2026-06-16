@@ -108,6 +108,11 @@ def _no_update_task(**_kw) -> str:
     return "Task updates aren't available right now."
 
 
+def _no_list_event_tasks(**_kw) -> str:
+    """Default `list_event_tasks_fn` — full task-board listing not wired (no DB path)."""
+    return "Listing the event's tasks isn't available right now."
+
+
 def _no_send_mail(**_kw) -> str:
     """Default `send_mail_fn` — outbound mail not wired (no Graph/HITL path)."""
     return "Sending mail isn't available right now."
@@ -201,6 +206,9 @@ class AgentDeps:
     # Impl 1 (action plane) — `update_task` (direct) + `send_outlook_mail` (HITL). Default to
     # no-ops so the existing tests/no-DB path still build the tool set.
     update_task_fn: Callable = _no_update_task
+    # Impl 1 — `list_event_tasks` shows the whole task board (every assignee + status) for the
+    # focused event, not just the caller's own tasks. Read-only, any member. Default no-op.
+    list_event_tasks_fn: Callable = _no_list_event_tasks
     send_mail_fn: Callable = _no_send_mail
     # Impl 2 (intelligence plane) — `ingest_event_files` pulls the channel's SharePoint files
     # (or a pasted link) through the parse→structure→upsert pipeline. Default no-op.
@@ -286,7 +294,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     def set_focus_event(event_query: str) -> str:
         """Switch the focused event to the one matching `event_query` (a name or fragment).
         Subsequent task/reminder/report actions apply to this event."""
-        event_id = deps.resolve_event_fn(event_query)
+        event_id = deps.resolve_event_fn(event_query, user_id=ctx.user_id)
         if not event_id:
             return f"I couldn't find an event matching '{event_query}'."
         deps.session_store.set_current_event(ctx.focus_key, event_id)
@@ -322,6 +330,18 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
+    def list_event_tasks() -> str:
+        """List ALL tasks in the currently focused event — every task with its assignee and
+        status — not just the caller's own. Use for "show all tasks", "what's the task board",
+        or "what's left to do" for the event. For only the caller's tasks, use list_my_tasks.
+        Requires a focused event."""
+        event_id = deps.session_store.get_current_event(ctx.focus_key)
+        if not event_id:
+            return "No event is focused yet — tell me which event first."
+        return deps.list_event_tasks_fn(event_id=event_id)
+
+    @tool
+    @traced
     def update_task(task_query: str, status: str) -> str:
         """Update the status of a task in the currently focused event. `task_query` matches
         the task by name; `status` is one of: todo, in_progress, done. You may update your
@@ -340,8 +360,10 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         subject: str, body: str, recipients: str | list[str] | None = None
     ) -> str:
         """Draft an Outlook email to the focused event's members (or to `recipients` if given).
-        `recipients` may be a single address or a list of addresses. Sending is gated by a
-        confirmation card — this only drafts it. Requires host or moderator."""
+        `recipients` may be a single address or a list of addresses. Write `body` in Markdown —
+        use headings (## ), **bold**, bullet lists (- ), and blank lines between paragraphs; it's
+        rendered as formatted HTML. If the user supplied a template, mirror its structure. Sending
+        is gated by a confirmation card — this only drafts it. Requires host or moderator."""
         if not _role_allows(ctx, "moderator"):
             return "You don't have permission to send mail (needs host or moderator)."
         if isinstance(recipients, str):
@@ -361,8 +383,10 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         email — to colleagues, external addresses, anyone — when it's NOT about emailing a
         focused event's members (for that, use send_outlook_mail). `recipients` may be full email
         addresses or corporate aliases (the part before @, e.g. 'phucnlt2'), given as a single
-        value or a list. Sending is gated by a confirmation card — this only drafts it. Any
-        member may use it."""
+        value or a list. Write `body` in Markdown — headings (## ), **bold**, bullet lists (- ),
+        and blank lines between paragraphs; it's rendered as formatted HTML. If the user supplied
+        a template, mirror its structure. Sending is gated by a confirmation card — this only
+        drafts it. Any member may use it."""
         if isinstance(recipients, str):
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_email_fn(
@@ -374,9 +398,11 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
         """Send a direct 1-1 Teams chat message to one or more colleagues, independent of any
         event. `recipients` is a corporate alias (the part before @, e.g. 'phucnlt2') or full
         email address, given as a single value or a list; the same `message` is sent to each.
-        Pass ALL the people in ONE call (a list) — do NOT call this once per person — so the user
-        gets a single confirmation card instead of one per recipient. Sending is gated by that
-        card — this only drafts it. Any member may use it."""
+        Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines between
+        paragraphs; it's rendered as formatted text in the chat. Pass ALL the people in ONE call
+        (a list) — do NOT call this once per person — so the user gets a single confirmation card
+        instead of one per recipient. Sending is gated by that card — this only drafts it. Any
+        member may use it."""
         if isinstance(recipients, str):
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_teams_message_fn(
@@ -475,7 +501,9 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
     ) -> str:
         """Send a reminder/invitation email to the participants from a roster you read with
         read_participant_file. `file_token` is the token that tool returned. `subject` and
-        `body` are the message text. `only_status` optionally limits recipients to rows whose
+        `body` are the message text; write `body` in Markdown (## headings, **bold**, - bullet
+        lists, blank lines between paragraphs) — it's rendered as formatted HTML for the Outlook
+        send. `only_status` optionally limits recipients to rows whose
         status (from the file's own status column) matches the given value — e.g. 'pending' or
         'no' to chase those who haven't registered; leave empty to contact everyone in the file.
         Sending is gated by a Teams-vs-Outlook confirmation card — this only drafts it. Requires
@@ -532,7 +560,7 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     tools: list[BaseTool] = [
         create_event, setup_event, set_focus_event, prepare_reminders,
-        list_my_tasks, update_task, send_outlook_mail,
+        list_my_tasks, list_event_tasks, update_task, send_outlook_mail,
         send_email, send_teams_message,
         generate_report, ingest_event_files, set_feedback_sources, get_event_context,
         list_my_events, read_channel_discussion, list_members,

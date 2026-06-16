@@ -163,7 +163,7 @@ class Orchestrator:
             return f"✅ Created event '{c.slots['event_name']}' (id {ev.event_id})."
 
         if c.intent == Intent.CONTEXT_SWITCH:
-            event_id = self.resolve_event(c.slots["event_query"])
+            event_id = self.resolve_event(c.slots["event_query"], user_id=user_id)
             self.session.set_current_event(user_id, event_id)
             return f"🔒 Focused on '{c.slots['event_query']}'."
 

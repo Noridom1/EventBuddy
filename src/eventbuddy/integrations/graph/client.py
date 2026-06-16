@@ -53,9 +53,12 @@ class GraphClient:
         r.raise_for_status()
         return r.json()
 
-    def send_chat_message(self, chat_id: str, text: str) -> dict:
+    def send_chat_message(self, chat_id: str, text: str, content_type: str = "text") -> dict:
         url = f"/chats/{chat_id}/messages"
-        r = self._http.post(url, json={"body": {"content": text}}, headers=self._headers())
+        body = {"content": text}
+        if content_type != "text":  # default plain (reminders); "html" for formatted DMs
+            body["contentType"] = content_type
+        r = self._http.post(url, json={"body": body}, headers=self._headers())
         r.raise_for_status()
         return r.json()
 

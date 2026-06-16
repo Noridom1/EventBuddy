@@ -48,7 +48,7 @@ def _orch_with_runner(runner):
     return Orchestrator(
         session_store=_FakeSession(),
         provision_fn=lambda **kw: None,
-        resolve_event_fn=lambda q: None,
+        resolve_event_fn=lambda q, **kw: None,
         remind_fn=lambda **kw: None,
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",

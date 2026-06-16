@@ -79,7 +79,7 @@ class _CaptureRunner:
 def _orch(runner):
     return Orchestrator(
         session_store=_FakeSession(),
-        provision_fn=lambda **kw: None, resolve_event_fn=lambda q: None,
+        provision_fn=lambda **kw: None, resolve_event_fn=lambda q, **kw: None,
         remind_fn=lambda **kw: None, report_fn=lambda **kw: "", query_tasks_fn=lambda **kw: "",
         runner=runner, agent_mode="llm",
         role_resolver=lambda **kw: "host",

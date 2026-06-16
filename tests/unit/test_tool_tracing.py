@@ -71,7 +71,7 @@ def _deps(*, debug, provision_fn=None):
     return AgentDeps(
         session_store=_FakeSession(),
         provision_fn=provision_fn or _ok_provision,
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: None,
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",
@@ -149,7 +149,7 @@ def test_debug_off_preserves_regex_fallback():
     orch = Orchestrator(
         session_store=_FakeSession(),
         provision_fn=lambda **kw: type("E", (), {"event_id": "ev-9"})(),
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: None, report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",
         runner=_RaisingRunner(), regex_fallback_on_error=True,
@@ -164,7 +164,7 @@ def test_debug_on_orchestrator_surfaces_error_instead_of_regex():
     orch = Orchestrator(
         session_store=_FakeSession(),
         provision_fn=lambda **kw: type("E", (), {"event_id": "ev-9"})(),
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: None, report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",
         runner=_RaisingRunner(), regex_fallback_on_error=False,

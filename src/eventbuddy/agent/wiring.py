@@ -1,5 +1,6 @@
 from langchain_core.messages import HumanMessage
 
+from eventbuddy.agent.formatting import render_markdown
 from eventbuddy.agent.orchestrator import Orchestrator, _default_role
 from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.roster_store import RosterStore
@@ -140,11 +141,13 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
                        if tid else [])
         if not targets:
             return False, "I don't have a resolved recipient to message."
-        text = payload.get("text", "")
+        # The model authors the message in Markdown; Teams chat renders a subset of HTML,
+        # so convert and post as html (newlines/bold/bullets survive instead of collapsing).
+        body_html = render_markdown(payload.get("text", ""))
         sent = []
         for t in targets:
             chat_id = graph.create_one_on_one_chat(t["user_id"])
-            graph.send_chat_message(chat_id, text)
+            graph.send_chat_message(chat_id, body_html, content_type="html")
             sent.append(t.get("display") or "them")
         if len(sent) == 1:
             return True, f"✅ Sent the Teams message to {sent[0]}."
@@ -911,14 +914,51 @@ def build_orchestrator() -> Orchestrator:
             s.flush()
             return type("E", (), {"event_id": ev.event_id})()
 
-    def resolve_event_fn(query: str) -> str | None:
-        from sqlalchemy import select
+    def _score_event_match(query: str, name: str) -> int:
+        """Rank how well `name` matches `query`. Higher is better; 0 means no match. Prefers
+        exact > prefix > contiguous-substring > all-query-words-present (any order). The
+        word-overlap tier is why "AI Summit" resolves "AI Innovation Summit 2026" even though
+        it isn't a contiguous substring — the old `ilike('%query%')` missed that."""
+        q, n = query.strip().lower(), name.lower()
+        if not q:
+            return 0
+        if q == n:
+            return 100
+        if n.startswith(q):
+            return 80
+        if q in n:
+            return 60
+        q_words = [w for w in q.split() if w]
+        if q_words and all(w in n for w in q_words):
+            return 40
+        return 0
 
+    def resolve_event_fn(query: str, *, user_id: str | None = None) -> str | None:
+        """Resolve an event-name fragment to an event_id (backs `set_focus_event`). When
+        `user_id` is given, only the caller's own events (member or host) are considered — you
+        can't focus an event you're not part of — and the best name match among them wins
+        (ties broken newest-first). Falls back to a global best-match when the caller has no
+        candidates (or no user_id), so non-DB/test paths and edge cases still resolve."""
         from eventbuddy.data.db import session_scope
-        from eventbuddy.domain.models import Event
+        from eventbuddy.data.repositories.events import EventRepository
         with session_scope() as s:
-            ev = s.scalar(select(Event).where(Event.event_name.ilike(f"%{query}%")))
-            return ev.event_id if ev else None
+            repo = EventRepository(s)
+            candidates: list = []
+            if user_id:
+                candidates = [ev for ev, _role in repo.list_for_user(user_id)]
+            if not candidates:
+                from sqlalchemy import select
+
+                from eventbuddy.domain.models import Event
+                candidates = list(s.scalars(
+                    select(Event).order_by(Event.created_at.desc())
+                ))
+            best, best_score = None, 0
+            for ev in candidates:  # candidates are newest-first, so ties keep the newest
+                score = _score_event_match(query, ev.event_name)
+                if score > best_score:
+                    best, best_score = ev, score
+            return best.event_id if best else None
 
     def remind_fn(*, event_id, user_id, raw=""):
         """Impl 1: *prepare* (don't send) — resolve recipients, stash a one-shot pending
@@ -1056,10 +1096,48 @@ def build_orchestrator() -> Orchestrator:
         from eventbuddy.data.db import session_scope
         from eventbuddy.data.repositories.tasks import TaskRepository
         with session_scope() as s:
-            tasks = TaskRepository(s).by_assignee(user_id)
+            repo = TaskRepository(s)
+            # Scope to the focused event so switching focus changes the list. Without a focus
+            # (event_id None), fall back to the caller's tasks across all their events.
+            tasks = repo.by_assignee_in_event(user_id, event_id) if event_id \
+                else repo.by_assignee(user_id)
             if not tasks:
-                return "You have no assigned tasks."
+                return ("You have no assigned tasks in this event." if event_id
+                        else "You have no assigned tasks.")
             return "Your tasks:\n" + "\n".join(f"- {t.task_name} ({t.status})" for t in tasks)
+
+    def list_event_tasks_fn(*, event_id):
+        """The whole task board for one event — every task with assignee + status, grouped by
+        status — backing `list_event_tasks`. Read-only; the focused-event gate happens upstream."""
+        from eventbuddy.data.db import session_scope
+        from eventbuddy.data.repositories.members import MemberRepository
+        from eventbuddy.data.repositories.tasks import TaskRepository
+        try:
+            with session_scope() as s:
+                tasks = TaskRepository(s).list(event_id)
+                if not tasks:
+                    return "This event has no tasks yet."
+                # Resolve assignee display names once (id/email → name) for readable output.
+                members = MemberRepository(s).list(event_id)
+                by_id = {m.teams_user_id: m.display_name for m in members if m.teams_user_id}
+                by_email = {m.email: m.display_name for m in members if m.email}
+
+                def who(t):
+                    name = by_id.get(t.assignee_id) or by_email.get(t.assignee_email)
+                    return name or t.assignee_email or "unassigned"
+
+                order = {"todo": 0, "in_progress": 1, "done": 2}
+                label = {"todo": "To do", "in_progress": "In progress", "done": "Done"}
+                tasks.sort(key=lambda t: (order.get(t.status, 9), t.task_name.lower()))
+                lines = [f"Task board ({len(tasks)} task(s)):"]
+                for t in tasks:
+                    lines.append(
+                        f"- {t.task_name} — {label.get(t.status, t.status)} (assignee: {who(t)})"
+                    )
+                return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"list event tasks failed ({type(e).__name__}: {e})")
+            return "I couldn't load the event's tasks right now — please try again."
 
     def update_task_fn(*, user_id, role, event_id, task_query, status):
         """Direct (non-HITL) task status update. Member may update own tasks; moderator/host
@@ -1114,7 +1192,7 @@ def build_orchestrator() -> Orchestrator:
         payload = {
             "type": "mail", "event_id": event_id, "event_name": event_name,
             "requested_by": user_id, "subject": subject,
-            "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+            "body_html": render_markdown(body), "recipient_emails": emails,
         }
         try:
             pending_id = pending_store.put(payload)
@@ -1137,7 +1215,7 @@ def build_orchestrator() -> Orchestrator:
                     "corporate domain is configured.")
         payload = {
             "type": "mail", "event_id": None, "requested_by": user_id,
-            "subject": subject, "body_html": f"<p>{body}</p>", "recipient_emails": emails,
+            "subject": subject, "body_html": render_markdown(body), "recipient_emails": emails,
             "min_role": "member",
         }
         try:
@@ -1405,7 +1483,7 @@ def build_orchestrator() -> Orchestrator:
                 log.warning(f"event lookup for participant send failed ({type(e).__name__}: {e})")
         payload = {
             "type": "mail", "event_id": event_id, "event_name": event_name,
-            "requested_by": user_id, "subject": subject, "body_html": f"<p>{body}</p>",
+            "requested_by": user_id, "subject": subject, "body_html": render_markdown(body),
             "recipient_emails": emails, "channel_id": channel_id, "team_id": team_id,
             "notice_text": body,
         }
@@ -1528,6 +1606,7 @@ def build_orchestrator() -> Orchestrator:
     runner, summarizer = _build_runner_and_summarizer(
         session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
         update_task_fn, send_mail_fn, ingest_fn, set_feedback_fn,
+        list_event_tasks_fn=list_event_tasks_fn,
         list_events_fn=list_events_fn, read_channel_fn=_build_read_channel_fn(),
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
         read_participant_file_fn=read_participant_file_fn,
@@ -1573,6 +1652,7 @@ def build_summarizer():
 def _build_runner_and_summarizer(
     session_store, provision_fn, resolve_event_fn, remind_fn, report_fn, query_tasks_fn,
     update_task_fn=None, send_mail_fn=None, ingest_fn=None, set_feedback_fn=None,
+    list_event_tasks_fn=None,
     list_events_fn=None, read_channel_fn=None, web_search_fn=None, web_fetch_fn=None,
     read_participant_file_fn=None, send_participant_reminders_fn=None,
     list_event_files_fn=None, read_event_file_fn=None, setup_event_fn=None,
@@ -1607,6 +1687,7 @@ def _build_runner_and_summarizer(
     from eventbuddy.agent.tools import (
         _no_ingest,
         _no_list_event_files,
+        _no_list_event_tasks,
         _no_list_events,
         _no_list_members,
         _no_read_channel,
@@ -1627,6 +1708,7 @@ def _build_runner_and_summarizer(
         report_fn=report_fn, query_tasks_fn=query_tasks_fn,
         event_context_fn=event_context_fn,
         update_task_fn=update_task_fn or _no_update_task,
+        list_event_tasks_fn=list_event_tasks_fn or _no_list_event_tasks,
         send_mail_fn=send_mail_fn or _no_send_mail,
         ingest_fn=ingest_fn or _no_ingest,
         set_feedback_fn=set_feedback_fn or _no_set_feedback,

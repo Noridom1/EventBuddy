@@ -111,7 +111,7 @@ class _FakeSession:
 def _orch(channel_event_fn=None, session=None):
     return Orchestrator(
         session_store=session or _FakeSession(),
-        provision_fn=lambda **kw: None, resolve_event_fn=lambda q: None,
+        provision_fn=lambda **kw: None, resolve_event_fn=lambda q, **kw: None,
         remind_fn=lambda **kw: None, report_fn=lambda **kw: "", query_tasks_fn=lambda **kw: "",
         channel_event_fn=channel_event_fn,
     )

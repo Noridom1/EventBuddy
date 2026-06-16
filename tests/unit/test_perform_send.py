@@ -20,7 +20,7 @@ class _Graph:
         self.chats_created.append(target_user_id)
         return f"chat-{target_user_id}"
 
-    def send_chat_message(self, chat_id, text):
+    def send_chat_message(self, chat_id, text, content_type="text"):
         self.chat_posts.append((chat_id, text))
 
 
@@ -96,7 +96,8 @@ def test_teams_dm_creates_chat_and_posts():
     ok, summary = _perform_send(graph=g, payload=payload, channel=None)
     assert ok and "Phuc" in summary
     assert g.chats_created == ["u-42"]
-    assert g.chat_posts == [("chat-u-42", "standup at 10")]
+    # The message is Markdown-rendered to HTML before posting (Teams renders a subset).
+    assert g.chat_posts == [("chat-u-42", "<p>standup at 10</p>")]
     assert g.mails == [] and g.channel_posts == []
 
 
@@ -109,7 +110,7 @@ def test_teams_dm_batch_sends_to_each_target():
     ok, summary = _perform_send(graph=g, payload=payload, channel=None)
     assert ok and "2 people" in summary and "Anh" in summary and "Lam" in summary
     assert g.chats_created == ["u-1", "u-2"]
-    assert g.chat_posts == [("chat-u-1", "hi all"), ("chat-u-2", "hi all")]
+    assert g.chat_posts == [("chat-u-1", "<p>hi all</p>"), ("chat-u-2", "<p>hi all</p>")]
 
 
 def test_teams_dm_legacy_single_target_shape_still_works():

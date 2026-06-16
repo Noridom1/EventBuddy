@@ -25,7 +25,7 @@ def _deps(**overrides):
     base = dict(
         session_store=_FakeSession(),
         provision_fn=provision_fn,
-        resolve_event_fn=lambda q: "ev-7",
+        resolve_event_fn=lambda q, **kw: "ev-7",
         remind_fn=lambda **kw: calls.setdefault("remind", kw),
         report_fn=lambda **kw: "report",
         query_tasks_fn=lambda **kw: "tasks",
@@ -72,7 +72,7 @@ def test_set_focus_event_resolves_and_writes_session():
 
 
 def test_set_focus_event_unknown_returns_not_found_and_no_write():
-    deps, _ = _deps(resolve_event_fn=lambda q: None)
+    deps, _ = _deps(resolve_event_fn=lambda q, **kw: None)
     ctx = RequestContext(user_id="u1", role="host")
     tools = _by_name(build_tools(deps, ctx))
     out = tools["set_focus_event"].invoke({"event_query": "Nope"})
@@ -85,6 +85,19 @@ def test_list_my_tasks_passes_focused_event():
     deps.session_store.set_current_event("u1", "ev-3")
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert tools["list_my_tasks"].invoke({}) == "u1:ev-3"
+
+
+def test_list_event_tasks_passes_focused_event():
+    deps, _ = _deps(list_event_tasks_fn=lambda *, event_id: f"board:{event_id}")
+    deps.session_store.set_current_event("u1", "ev-9")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert tools["list_event_tasks"].invoke({}) == "board:ev-9"
+
+
+def test_list_event_tasks_requires_focus():
+    deps, _ = _deps(list_event_tasks_fn=lambda *, event_id: "should-not-run")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    assert "no event is focused" in tools["list_event_tasks"].invoke({}).lower()
 
 
 @pytest.mark.parametrize("name", ["list_my_tasks", "generate_report", "get_event_context"])
