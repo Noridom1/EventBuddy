@@ -11,6 +11,10 @@ COPY src/ ./src/
 RUN pip install --no-cache-dir .
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
+# Landing page served at "/" and the installable Teams package at "/download/eventbuddy.zip"
+# (Impl 11). Resolved CWD-relative (from /app) at request time; missing files degrade to 404.
+COPY landing_page/ ./landing_page/
+COPY teams-app/eventbuddy.zip ./teams-app/eventbuddy.zip
 COPY deployment/entrypoint.sh ./deployment/
 RUN chmod +x ./deployment/entrypoint.sh
 EXPOSE 8080

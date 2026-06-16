@@ -76,6 +76,21 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Impl 11 — landing page on the default endpoint. The runtime endpoint root ("/") serves
+    # the Event Buddy install page, and "/download/eventbuddy.zip" hands out the Teams package.
+    # Paths are resolved relative to the process CWD (the repo root locally, /app in the
+    # container — matching how .env and alembic.ini are located). Missing files degrade to a
+    # clean 404 at request time; they never break app startup or the /health probe.
+    landing_page_dir: str = "landing_page"
+    teams_package_path: str = "teams-app/eventbuddy.zip"
+    # Fallback for "/download/eventbuddy.zip" when the bundled ZIP isn't present on disk (e.g.
+    # the asset wasn't baked into the image): the route redirects here instead of 404ing, so
+    # the landing page's Download button keeps working. Empty → fall back to a 404.
+    teams_package_fallback_url: str = (
+        "https://vngms-my.sharepoint.com/:u:/r/personal/hanntn6_vng_com_vn/"
+        "Documents/Claw-a-thon/eventbuddy.zip?csf=1&web=1&e=AAYkDN"
+    )
+
     # Impl 10 — agent reasoning trace. When True, every turn emits an ordered, structured
     # trace to the logs under the `agent.trace` logger at INFO: the prompt sent to the model
     # (system + window), the model's reasoning + tool_calls, and each tool's input/return.
