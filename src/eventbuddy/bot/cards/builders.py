@@ -67,6 +67,34 @@ def file_pick_card(*, query: str, names: list[str], pending_id: str,
     }
 
 
+def personalized_dm_card(*, items: list[dict], pending_id: str) -> dict:
+    """A consolidated HITL card for a batch of *personalized* 1-1 Teams messages: each recipient
+    gets their own section (bold name + their message), with a single "Confirm & send all" button.
+    The button data carries ONLY the action type + opaque `pending_id` (rule 2) — recipients and
+    per-recipient messages live server-side in the pending store and are *display only* here.
+    `items` = [{"display": <name>, "message": <text>}, ...]."""
+    n = len(items)
+    title = (f"Send a personalized Teams message to {items[0]['display']}?" if n == 1
+             else f"Send {n} personalized Teams messages?")
+    blocks: list[dict] = [
+        {"type": "TextBlock", "weight": "Bolder", "text": title, "wrap": True},
+    ]
+    for it in items:
+        blocks.append({"type": "TextBlock", "weight": "Bolder", "text": it["display"],
+                       "wrap": True, "spacing": "Medium"})
+        blocks.append({"type": "TextBlock", "text": it["message"], "wrap": True,
+                       "spacing": "Small"})
+    return {
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": blocks,
+        "actions": [
+            {"type": "Action.Submit", "title": "✅ Confirm & send all",
+             "data": {"action": "teams_dm", "pending_id": pending_id}},
+        ],
+    }
+
+
 def confirm_card(*, title: str, summary: str, pending_id: str, action: str,
                  channel: str | None = None, recipients: list[str] | None = None,
                  body: str | None = None) -> dict:

@@ -6,7 +6,11 @@ from eventbuddy.agent.pending import PendingActionStore
 from eventbuddy.agent.roster_store import RosterStore
 from eventbuddy.agent.session import SessionStore
 from eventbuddy.bot.auth import ROLE_RANK
-from eventbuddy.bot.cards.builders import confirm_card, reminder_channel_card
+from eventbuddy.bot.cards.builders import (
+    confirm_card,
+    personalized_dm_card,
+    reminder_channel_card,
+)
 from eventbuddy.bot.cards.report_card import report_card
 from eventbuddy.bot.confirm import ConfirmHandler
 from eventbuddy.bot.turn_artifacts import emit_card
@@ -142,12 +146,15 @@ def _perform_send(*, graph, payload: dict, channel: str | None) -> tuple[bool, s
                        if tid else [])
         if not targets:
             return False, "I don't have a resolved recipient to message."
-        # The model authors the message in Markdown; Teams chat renders a subset of HTML,
-        # so convert and post as html (newlines/bold/bullets survive instead of collapsing).
-        body_html = render_markdown(payload.get("text", ""))
+        # The model authors the message in Markdown; Teams chat renders a subset of HTML, so
+        # convert and post as html (newlines/bold/bullets survive instead of collapsing). Each
+        # target may carry its own `text` (personalized batch); fall back to the shared top-level
+        # `text` (the same-message-to-many case, and legacy pendings).
+        shared = payload.get("text", "")
         sent = []
         for t in targets:
             chat_id = graph.create_one_on_one_chat(t["user_id"])
+            body_html = render_markdown(t.get("text") or shared)
             graph.send_chat_message(chat_id, body_html, content_type="html")
             sent.append(t.get("display") or "them")
         if len(sent) == 1:
@@ -164,21 +171,28 @@ def _card_action_data(card: dict) -> dict:
         return {}
 
 
-def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn) -> list[dict]:
-    """Merge the turn's `teams_dm` confirm cards that share the same message text into ONE card
-    per distinct message — so a model that (against instructions) calls `send_teams_message` once
-    per person still yields a single confirmation card instead of a flood.
+def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn,
+                            personalized_card_fn=personalized_dm_card) -> list[dict]:
+    """Fold the turn's `teams_dm` confirm cards into one card *per group* — so several
+    `send_teams_message` calls yield a single confirmation instead of a flood. The agent controls
+    grouping (Impl 10): calls that share a non-empty `group` label merge together; calls with no
+    label fall back to grouping by identical message text (the original safety net). Calls in
+    distinct groups (or with distinct text and no label) stay as separate cards — that is how the
+    agent keeps personalized messages separate.
 
     The recipient list lives server-side in the pending store (rule 2 — never on the card button),
-    so merging means: read each card's pending payload, union the `targets` (deduped by user id),
-    store one merged pending, and emit one rebuilt card pointing at it (superseded pendings are
-    popped to free them). Non-`teams_dm` cards, and a message that only produced one card, pass
-    through untouched and in place. Best-effort: any store hiccup returns the cards unchanged so
-    card delivery never breaks."""
+    so merging means: read each card's pending payload, union the `targets` (deduped by user id,
+    each tagged with its own message text), store one merged pending, and emit one rebuilt card
+    pointing at it (superseded pendings are popped to free them). A merged group whose members all
+    share one text renders as a single batch card (one message to many); a merged group with
+    *distinct* texts renders as a consolidated **personalized** card (a per-recipient breakdown).
+    Non-`teams_dm` cards, and a group that produced only one card, pass through untouched and in
+    place. Best-effort: any store hiccup returns the cards unchanged so card delivery never
+    breaks."""
     try:
-        groups: dict[str, dict] = {}  # text -> {targets, pids, payload, first_card}
+        groups: dict[str, dict] = {}  # key -> {targets, pids, payload, first_card}
         order: list[str] = []
-        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", text)
+        plan: list[tuple[str, object]] = []  # ("pass", card) | ("dm", key)
         for card in cards:
             data = _card_action_data(card)
             pid = data.get("pending_id")
@@ -188,40 +202,58 @@ def coalesce_teams_dm_cards(cards: list[dict], *, pending_store, confirm_card_fn
                 plan.append(("pass", card))
                 continue
             text = payload.get("text", "")
-            g = groups.get(text)
+            label = payload.get("group") or ""
+            # A non-empty agent-supplied label is the grouping key; otherwise fall back to the
+            # message text so an unlabelled batch of the same note still collapses to one card.
+            key = f"__group__:{label}" if label else f"__text__:{text}"
+            g = groups.get(key)
             if g is None:
-                g = groups[text] = {"targets": [], "pids": [], "payload": payload,
-                                    "first_card": card}
-                order.append(text)
+                g = groups[key] = {"targets": [], "pids": [], "payload": payload,
+                                   "first_card": card}
+                order.append(key)
             seen_ids = {t["user_id"] for t in g["targets"]}
             for t in payload["targets"]:
                 if t["user_id"] not in seen_ids:
                     seen_ids.add(t["user_id"])
-                    g["targets"].append(t)
+                    g["targets"].append({**t, "text": text})  # tag each target with its message
             g["pids"].append(pid)
-            plan.append(("dm", text))
+            plan.append(("dm", key))
 
         if not any(len(g["pids"]) > 1 for g in groups.values()):
             return cards  # nothing to merge — leave the list (and pendings) exactly as-is
 
         final: dict[str, dict] = {}
-        for text in order:
-            g = groups[text]
+        for key in order:
+            g = groups[key]
             if len(g["pids"]) <= 1:
-                final[text] = g["first_card"]
+                final[key] = g["first_card"]
                 continue
-            merged = dict(g["payload"])
-            merged["targets"] = g["targets"]
-            merged["text"] = text
-            new_pid = pending_store.put(merged)
+            targets = g["targets"]
+            texts = {t["text"] for t in targets}
+            merged = dict(g["payload"])  # carry over type/event_id/requested_by/min_role
+            if len(texts) == 1:
+                # One message to many — the original batch card; keep the simple shared-text shape.
+                shared = next(iter(texts))
+                merged["targets"] = [{"user_id": t["user_id"], "display": t["display"]}
+                                     for t in targets]
+                merged["text"] = shared
+                new_pid = pending_store.put(merged)
+                displays = [t["display"] for t in targets]
+                title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
+                         else f"Send Teams message to {len(displays)} people?")
+                final[key] = confirm_card_fn(
+                    title=title, summary="A direct 1-1 Teams chat message.",
+                    pending_id=new_pid, action="teams_dm", recipients=displays, body=shared)
+            else:
+                # Personalized batch — each target keeps its own text; render a per-recipient card.
+                merged["targets"] = [{"user_id": t["user_id"], "display": t["display"],
+                                      "text": t["text"]} for t in targets]
+                merged["text"] = ""
+                new_pid = pending_store.put(merged)
+                items = [{"display": t["display"], "message": t["text"]} for t in targets]
+                final[key] = personalized_card_fn(items=items, pending_id=new_pid)
             for pid in g["pids"]:
                 pending_store.pop(pid)  # supersede the per-recipient pendings
-            displays = [t["display"] for t in g["targets"]]
-            title = (f"Send Teams message to {displays[0]}?" if len(displays) == 1
-                     else f"Send Teams message to {len(displays)} people?")
-            final[text] = confirm_card_fn(
-                title=title, summary="A direct 1-1 Teams chat message.",
-                pending_id=new_pid, action="teams_dm", recipients=displays, body=text)
 
         out, emitted = [], set()
         for kind, val in plan:
@@ -1585,12 +1617,14 @@ def build_orchestrator() -> Orchestrator:
         ))
         return f"Drafted the email to {len(emails)} recipient(s) — confirm on the card to send."
 
-    def send_teams_message_fn(*, user_id, recipients, message):
+    def send_teams_message_fn(*, user_id, recipients, message, group=""):
         """Generic (event-independent) 1-1 Teams message to one or more colleagues: resolve each
-        recipient (corporate alias/email) to a directory user, then draft a SINGLE HITL confirm
-        card covering the whole batch — the same `message` goes to each. The directory lookup
-        acts on the caller's behalf (delegated Graph) and degrades cleanly. The sends (create
-        chat + post, per recipient) happen on confirm."""
+        recipient (corporate alias/email) to a directory user, then draft a HITL confirm card —
+        the same `message` goes to each recipient in this call. To personalize, the model calls
+        this once per distinct message; `group` (a non-empty label shared across those calls)
+        folds them into ONE consolidated confirmation card (see `coalesce_teams_dm_cards`). The
+        directory lookup acts on the caller's behalf (delegated Graph) and degrades cleanly. The
+        sends (create chat + post, per recipient) happen on confirm."""
         # Normalize to a deduped list (case-insensitive, order-preserving) — the model may pass a
         # single string or a list; either way we want one card for the batch.
         raw = recipients if isinstance(recipients, list) else [recipients]
@@ -1650,6 +1684,9 @@ def build_orchestrator() -> Orchestrator:
         payload = {
             "type": "teams_dm", "event_id": None, "requested_by": user_id,
             "targets": resolved, "text": message, "min_role": "member",
+            # Coalescing key (Impl 10): a non-empty label folds several per-recipient calls into
+            # ONE consolidated confirmation card; empty falls back to the text-based default.
+            "group": group or "",
         }
         try:
             pending_id = pending_store.put(payload)
@@ -2077,7 +2114,8 @@ def build_orchestrator() -> Orchestrator:
     # The router calls this on the turn's emitted cards before sending, to fold a flood of
     # per-recipient teams_dm cards into one (belt-and-suspenders over the batch tool).
     orch.coalesce_cards = lambda cards: coalesce_teams_dm_cards(
-        cards, pending_store=pending_store, confirm_card_fn=confirm_card)
+        cards, pending_store=pending_store, confirm_card_fn=confirm_card,
+        personalized_card_fn=personalized_dm_card)
     return orch
 
 

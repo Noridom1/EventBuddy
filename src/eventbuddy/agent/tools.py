@@ -469,19 +469,26 @@ def build_tools(deps: AgentDeps, ctx: RequestContext) -> list[BaseTool]:
 
     @tool
     @traced
-    def send_teams_message(recipients: str | list[str], message: str) -> str:
+    def send_teams_message(recipients: str | list[str], message: str, group: str = "") -> str:
         """Send a direct 1-1 Teams chat message to one or more colleagues, independent of any
         event. `recipients` is a corporate alias (the part before @, e.g. 'phucnlt2') or full
-        email address, given as a single value or a list; the same `message` is sent to each.
-        Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines between
-        paragraphs; it's rendered as formatted text in the chat. Pass ALL the people in ONE call
-        (a list) — do NOT call this once per person — so the user gets a single confirmation card
-        instead of one per recipient. Sending is gated by that card — this only drafts it. Any
-        member may use it."""
+        email address, given as a single value or a list; the same `message` goes to everyone in
+        THIS call. Write `message` in Markdown — **bold**, bullet lists (- ), and blank lines
+        between paragraphs; it's rendered as formatted text in the chat.
+
+        To send the SAME message to several people, pass them all as a list in one call (one
+        confirmation card). To PERSONALIZE — give different people different messages — call this
+        once per distinct message. The `group` argument decides how those calls are confirmed:
+        give several calls the SAME non-empty `group` label to fold them into ONE consolidated
+        confirmation card (a per-recipient breakdown the user approves at once); omit `group` (or
+        use different labels) to keep them as SEPARATE confirmation cards. When personalizing a
+        batch of related messages, prefer one shared `group` label.
+
+        Sending is gated by the confirmation card — this only drafts it. Any member may use it."""
         if isinstance(recipients, str):
             recipients = [r.strip() for r in re.split(r"[,;]", recipients) if r.strip()]
         return deps.send_teams_message_fn(
-            user_id=ctx.user_id, recipients=recipients, message=message)
+            user_id=ctx.user_id, recipients=recipients, message=message, group=group)
 
     @tool
     @traced

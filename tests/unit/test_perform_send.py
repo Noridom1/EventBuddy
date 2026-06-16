@@ -113,6 +113,39 @@ def test_teams_dm_batch_sends_to_each_target():
     assert g.chat_posts == [("chat-u-1", "<p>hi all</p>"), ("chat-u-2", "<p>hi all</p>")]
 
 
+def test_teams_dm_personalized_sends_per_target_text():
+    # Impl 10 — a merged personalized batch carries a `text` on each target; the dispatcher
+    # sends each recipient their OWN message, falling back to the shared top-level text only
+    # for targets without one.
+    g = _Graph()
+    payload = {"type": "teams_dm", "text": "shared fallback", "targets": [
+        {"user_id": "u-1", "display": "Anh", "text": "your task A is due 25/06"},
+        {"user_id": "u-2", "display": "Lam", "text": "your tasks B,C are due 30/06"},
+    ]}
+    ok, summary = _perform_send(graph=g, payload=payload, channel=None)
+    assert ok and "2 people" in summary
+    assert g.chats_created == ["u-1", "u-2"]
+    assert g.chat_posts == [
+        ("chat-u-1", "<p>your task A is due 25/06</p>"),
+        ("chat-u-2", "<p>your tasks B,C are due 30/06</p>"),
+    ]
+
+
+def test_teams_dm_per_target_text_falls_back_to_shared():
+    # A mix: one target has its own text, one relies on the shared text.
+    g = _Graph()
+    payload = {"type": "teams_dm", "text": "hello everyone", "targets": [
+        {"user_id": "u-1", "display": "Anh", "text": "custom for Anh"},
+        {"user_id": "u-2", "display": "Lam"},
+    ]}
+    ok, _ = _perform_send(graph=g, payload=payload, channel=None)
+    assert ok
+    assert g.chat_posts == [
+        ("chat-u-1", "<p>custom for Anh</p>"),
+        ("chat-u-2", "<p>hello everyone</p>"),
+    ]
+
+
 def test_teams_dm_legacy_single_target_shape_still_works():
     # Old pending payloads (pre-batch) carried target_user_id/target_display directly.
     g = _Graph()

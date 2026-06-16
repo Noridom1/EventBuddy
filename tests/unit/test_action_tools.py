@@ -246,7 +246,7 @@ def test_generic_send_tools_registered_with_identity_absent():
     tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
     assert {"send_email", "send_teams_message"} <= set(tools)
     assert set(tools["send_email"].args) == {"subject", "body", "recipients"}
-    assert set(tools["send_teams_message"].args) == {"recipients", "message"}
+    assert set(tools["send_teams_message"].args) == {"recipients", "message", "group"}
 
 
 def test_send_email_callable_by_member_and_delegates():
@@ -269,8 +269,10 @@ def test_send_teams_message_callable_by_member_and_delegates():
     out = tools["send_teams_message"].invoke(
         {"recipients": "phucnlt2", "message": "standup at 10"})
     assert out == "drafted"
-    # A single string is coerced to a one-item list before reaching the closure.
-    assert calls == {"user_id": "u1", "recipients": ["phucnlt2"], "message": "standup at 10"}
+    # A single string is coerced to a one-item list before reaching the closure; `group`
+    # defaults to "" when the model omits it.
+    assert calls == {"user_id": "u1", "recipients": ["phucnlt2"],
+                     "message": "standup at 10", "group": ""}
 
 
 def test_send_teams_message_coerces_delimited_string_to_list():
@@ -281,3 +283,14 @@ def test_send_teams_message_coerces_delimited_string_to_list():
         {"recipients": "anhpn8, lamtt7; phucnlt2", "message": "hi"})
     assert out == "drafted"
     assert calls["recipients"] == ["anhpn8", "lamtt7", "phucnlt2"]
+
+
+def test_send_teams_message_passes_group_label_through():
+    # Impl 10 — the agent's `group` label reaches the closure verbatim (it decides merge/separate).
+    calls = {}
+    deps, _ = _deps(send_teams_message_fn=lambda **kw: calls.update(kw) or "drafted")
+    tools = _by_name(build_tools(deps, RequestContext(user_id="u1", role="member")))
+    out = tools["send_teams_message"].invoke(
+        {"recipients": "phucnlt2", "message": "your task is due", "group": "task-update"})
+    assert out == "drafted"
+    assert calls["group"] == "task-update"

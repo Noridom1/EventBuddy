@@ -1,6 +1,7 @@
 from eventbuddy.bot.cards.builders import (
     confirm_card,
     event_overview_card,
+    personalized_dm_card,
     reminder_channel_card,
 )
 
@@ -37,3 +38,25 @@ def test_confirm_card_single_button_with_action_and_token():
     assert len(card["actions"]) == 1
     data = card["actions"][0]["data"]
     assert data == {"action": "mail", "pending_id": "tok-2"}
+
+
+def test_personalized_dm_card_shows_each_recipient_message():
+    card = personalized_dm_card(items=[
+        {"display": "Phuc", "message": "your task A is due 26/06"},
+        {"display": "Tho", "message": "your task B is due 25/06"},
+    ], pending_id="tok-9")
+    body = str(card["body"])
+    assert "Phuc" in body and "your task A is due 26/06" in body
+    assert "Tho" in body and "your task B is due 25/06" in body
+    assert "2 personalized" in card["body"][0]["text"]
+
+
+def test_personalized_dm_card_data_carries_only_opaque_token():
+    # rule 2 — the button never carries recipients/messages/identity, only action + token.
+    card = personalized_dm_card(items=[
+        {"display": "Phuc", "message": "secret per-person note"},
+    ], pending_id="tok-9")
+    assert len(card["actions"]) == 1
+    data = card["actions"][0]["data"]
+    assert data == {"action": "teams_dm", "pending_id": "tok-9"}
+    assert "secret per-person note" not in str(data)
