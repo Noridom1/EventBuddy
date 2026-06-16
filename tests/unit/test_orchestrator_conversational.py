@@ -138,6 +138,35 @@ def test_autoenroll_called_in_bound_shared_conversation():
     assert seen == [{"event_id": "ev-bound", "user_id": "u1", "display_name": "Alice"}]
 
 
+def test_capture_files_called_in_chat_scopes_with_attachments():
+    seen = []
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(**_deps(), runner=runner,
+                        capture_files_fn=lambda **kw: seen.append(kw))
+    atts = [{"name": "f.csv", "content_url": "https://x/f"}]
+    orch.handle(user_id="u1", channel_id="a:dm", text="read this", scope="personal",
+                attachments=atts)
+    orch.handle(user_id="u1", channel_id="19:g", text="read this", scope="group",
+                attachments=atts)
+    assert seen == [
+        {"chat_id": "a:dm", "attachments": atts},
+        {"chat_id": "19:g", "attachments": atts},
+    ]
+
+
+def test_capture_files_skipped_in_channel_and_without_attachments():
+    seen = []
+    runner = _FakeRunner(reply="ok")
+    orch = Orchestrator(**_deps(), runner=runner,
+                        capture_files_fn=lambda **kw: seen.append(kw))
+    # channel scope → files live in SharePoint (ingestion), not the chat catalog.
+    orch.handle(user_id="u1", channel_id="c1", text="hi", scope="channel",
+                attachments=[{"name": "f.csv", "content_url": "https://x/f"}])
+    # no attachments → nothing to capture.
+    orch.handle(user_id="u1", channel_id="a:dm", text="hi", scope="personal")
+    assert seen == []
+
+
 def test_autoenroll_skipped_in_dm():
     seen = []
     runner = _FakeRunner(reply="ok")

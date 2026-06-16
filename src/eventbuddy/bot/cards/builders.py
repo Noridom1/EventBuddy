@@ -38,6 +38,35 @@ def reminder_channel_card(
     }
 
 
+SHOW_ALL_CHOICE = "__all__"
+
+
+def file_pick_card(*, query: str, names: list[str], pending_id: str,
+                   show_all: bool = True) -> dict:
+    """Disambiguation picker (Impl 9): when a file name/description matches several files, ask
+    the user to choose with a **multi-select dropdown** (no typing). The submit carries only the
+    opaque `pending_id` + the selected file names (rule 2 — the candidate set + the original
+    question live server-side in the pending store). A "Show all files in this chat" choice lets
+    the user override to any file. `selected` arrives comma-joined for a multi-select ChoiceSet."""
+    choices = [{"title": n, "value": n} for n in names]
+    if show_all:
+        choices.append({"title": "📂 Show all files in this chat", "value": SHOW_ALL_CHOICE})
+    return {
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+            {"type": "TextBlock", "weight": "Bolder", "wrap": True,
+             "text": f"A few files match '{query}'. Which should I read?"},
+            {"type": "Input.ChoiceSet", "id": "selected", "isMultiSelect": True,
+             "style": "compact", "placeholder": "Pick one or more files", "choices": choices},
+        ],
+        "actions": [
+            {"type": "Action.Submit", "title": "📄 Read selected",
+             "data": {"action": "read_files", "pending_id": pending_id}},
+        ],
+    }
+
+
 def confirm_card(*, title: str, summary: str, pending_id: str, action: str,
                  channel: str | None = None, recipients: list[str] | None = None,
                  body: str | None = None) -> dict:

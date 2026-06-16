@@ -91,6 +91,30 @@ def test_run_drives_tool_then_returns_grounded_reply():
     assert reply == "Done — created 'Smoke Test'."
 
 
+class _LoopingChatModel(ScriptedChatModel):
+    """Always emits a tool call — never a final answer — so the ReAct loop runs to its cap."""
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        msg = AIMessage(content="", tool_calls=[
+            {"name": "list_my_events", "args": {}, "id": "loop"}])
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+def test_recursion_limit_returns_clean_message_not_crash():
+    # A model that loops forever hits the recursion cap; the runner must return a terminal
+    # guidance message (Impl 9), not raise GraphRecursionError up to the orchestrator.
+    deps = _deps({})
+    runner = build_agent_runner(
+        _LoopingChatModel(responses=[]),
+        tools_factory=lambda ctx: build_tools(deps, ctx),
+        checkpointer=InMemorySaver(),
+        token_counter=_word_counter,
+    )
+    runner._recursion_limit = 2  # force the cap quickly
+    reply = runner.run("list my events forever", RequestContext(user_id="u1", role="host"))
+    assert "circles" in reply.lower() or "couldn't find" in reply.lower()
+    assert "GraphRecursionError" not in reply
+
+
 def test_thread_id_is_scope_aware():
     assert RequestContext(user_id="u1").thread_id == "dm:u1"
     assert RequestContext(user_id="u1", channel_id="ch9", scope="channel").thread_id == "event:ch9"

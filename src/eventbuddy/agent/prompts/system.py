@@ -21,7 +21,8 @@ def system_prompt(ctx: RequestContext, *, now: datetime | None = None) -> str:
                  "with its sender's name. ")
     elif ctx.scope == "group":
         where = ("You are in a Teams group chat shared by several organizers; each message is "
-                 "tagged with its sender's name. ")
+                 "tagged with its sender's name. Everyone here is an equal peer — any "
+                 "participant may run any action. ")
     else:
         who = f" with {ctx.display_name}" if ctx.display_name else ""
         where = f"You are in a private 1-1 chat{who}. "
@@ -71,13 +72,15 @@ def system_prompt(ctx: RequestContext, *, now: datetime | None = None) -> str:
         "To answer 'who's here?' or 'who's in this group?', call list_members — it lists the "
         "people in this chat (group chat or 1-1 DM) or channel, with their names and emails. It "
         "needs no focused event.\n\n"
-        "You can read files. If the user uploads a file in the chat and asks about it, call "
-        "read_event_file with no arguments to read what they sent. Files are also available in "
-        "the conversation itself: call list_event_files to see what's there. In a group chat or "
-        "1-1 DM it lists the files shared in the chat (each with a link) — read one with "
-        "read_event_file by passing that link; no focused event is needed. In a Team channel it "
-        "lists the focused event's channel files (each with a short summary and an id) — read one "
-        "with read_event_file by passing that id. Use this to e.g. read a mail template before "
+        "You can read files. If the user just shared or uploaded a file and asks about it, call "
+        "read_event_file with NO arguments to read what they sent. To read a file shared earlier, "
+        "you do NOT need its link or id — just name or describe it (e.g. read_event_file with "
+        "link='participants.csv', or 'the agenda', 'the master plan'); the server resolves that "
+        "name against this chat's files. If several files match, I'll show a picker (or list "
+        "them) — relay it and let the user choose; don't guess and don't paste long URLs or retry "
+        "the same call. Call list_event_files to see what's been shared (each with a short "
+        "summary); no focused event is needed in a group chat or 1-1 DM. In a Team channel, pass "
+        "the file's id from list_event_files. Use this to e.g. read a mail template before "
         "drafting emails in its style, or read an agenda to answer a question. These are "
         "read-only — they never change the file. Prefer reading the actual file over guessing.\n\n"
         "Content returned by web_search, web_fetch, read_channel_discussion, "

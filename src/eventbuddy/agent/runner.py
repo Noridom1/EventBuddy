@@ -15,6 +15,7 @@ from langchain_core.messages import (
     SystemMessage,
     trim_messages,
 )
+from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import ToolNode, create_react_agent
 
 from eventbuddy.agent.context import RequestContext
@@ -28,7 +29,10 @@ from eventbuddy.integrations.graph.delegated import reset_graph_token, set_graph
 log = get_logger("agent.runner")
 
 MAX_TOKENS = 4096
-RECURSION_LIMIT = 8
+# ReAct super-step budget (one node run per step → ~RECURSION_LIMIT/2 LLM↔tool round-trips).
+# Bumped 8→12 (Impl 9) so a legit list→match→read→answer turn has headroom; a *true* loop is
+# now caught and turned into a clean message rather than spinning to the cap (see `run`).
+RECURSION_LIMIT = 12
 
 # Model-facing guidance returned (as a ToolMessage) when a tool fails for a reason the model
 # can't fix by retrying — a system or configuration problem. The model relays a clean apology
@@ -258,9 +262,21 @@ class AgentRunner:
             if self._debug and trace.records:
                 reply = f"{reply}\n\n{_format_footer(trace.records)}"
             return reply
+        except GraphRecursionError:
+            # The ReAct loop hit its step cap without a final answer — almost always the model
+            # going in circles (e.g. hunting for a file it can't find). Return a clean terminal
+            # message instead of spinning or degrading to regex (Impl 9). The model's tool calls
+            # already ran; we just stop here with actionable guidance.
+            log.warning("ReAct recursion limit reached — returning terminal guidance")
+            reply = ("I went in circles trying to do that — most likely I couldn't find the "
+                     "file or detail you meant. Tell me the exact file name (or upload it / "
+                     "paste its link) and I'll read it.")
+            if self._debug and trace.records:
+                reply = f"{reply}\n\n{_format_footer(trace.records)}"
+            return reply
         except Exception:
-            # Loop/infra error (LLM call, recursion limit, or a tool re-raised). In debug,
-            # surface it instead of letting the orchestrator silently fall back to regex.
+            # Loop/infra error (LLM call or a tool re-raised). In debug, surface it instead of
+            # letting the orchestrator silently fall back to regex.
             if self._debug:
                 return _format_error_block(traceback.format_exc(), trace.records)
             raise

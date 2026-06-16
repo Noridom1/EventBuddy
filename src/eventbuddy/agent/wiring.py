@@ -523,6 +523,77 @@ def _default_graph():
     return graph
 
 
+def _default_chat_catalog():
+    """Default per-chat file catalog (Impl 9) for the file-tool closures, shared by the list +
+    read paths so a sync done by one is seen by the other."""
+    from eventbuddy.capabilities.chat_files_catalog import ChatFileCatalog
+    return ChatFileCatalog(vision_enabled=settings.llm_vision_enabled)
+
+
+def _read_share_url(share_url: str):
+    """Download a cataloged chat file by its share URL → `(filename, bytes)` or None. Uses the
+    caller's delegated Graph client (`graph_for()`), the same path uploads take."""
+    if not share_url:
+        return None
+    from eventbuddy.capabilities.attachments import fetch_attachment_bytes
+    descriptor = {"name": "", "content_type": "", "download_url": None,
+                  "content_url": share_url}
+    needs_graph = share_url.startswith(("http://", "https://"))
+    graph = graph_for() if needs_graph else None
+    try:
+        return fetch_attachment_bytes(descriptor, graph=graph)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"chat-file share-url read failed ({type(e).__name__}: {e})")
+        return None
+
+
+def _resolve_named_chat_file(catalog, *, channel_id, scope, attachments, query):
+    """Resolve a file *name/description* against the chat catalog (Impl 9). Returns one of:
+      ("bytes", (filename, content)) — a single confident match, downloaded;
+      ("ambiguous", [rows])          — several candidates, caller disambiguates;
+      ("none", message)              — nothing matched (message lists what's available).
+    Runs a sync first so freshly-shared files are catalogued before matching."""
+    graph = graph_for() if scope == "group" else None
+    catalog.sync(channel_id, scope=scope, attachments=attachments or [], graph=graph)
+    result = catalog.match(channel_id, query)
+    if result.exact is not None:
+        fetched = _read_share_url(result.exact.share_url)
+        if fetched is None:
+            return ("none", "I found that file but couldn't open it — please re-share it or "
+                    "paste its SharePoint/OneDrive link.")
+        return ("bytes", fetched)
+    if result.candidates:
+        return ("ambiguous", result.candidates)
+    return ("none", None)  # caller composes the "no match" message (it can list the catalog)
+
+
+def _chat_file_disambiguation(channel_id, query, candidates, *, pending_store=None):
+    """Several catalog files match the query → ask the user which. Emits a dropdown picker card
+    (Impl 9) when a pending store is available + an artifacts context is active, and always
+    returns a text message listing the candidates so a plain-text reply ('the v4 one') works
+    too. The model relays the message; the next turn resolves the narrowed name."""
+    names = [c.filename for c in candidates]
+    if pending_store is not None:
+        try:
+            from eventbuddy.bot.cards.builders import file_pick_card
+            from eventbuddy.bot.turn_artifacts import emit_card
+            pending_id = pending_store.put({
+                "type": "read_files", "action": "read_files", "chat_id": channel_id,
+                "query": query,
+                "candidates": [
+                    {"filename": c.filename, "share_url": c.share_url,
+                     "drive_item_id": c.drive_item_id}
+                    for c in candidates
+                ],
+            })
+            emit_card(file_pick_card(query=query, names=names, pending_id=pending_id))
+        except Exception as e:  # noqa: BLE001 — card is a nicety; the text below still works
+            log.warning(f"file-pick card skipped ({type(e).__name__}: {e})")
+    listing = "\n".join(f"• {n}" for n in names)
+    return (f"I found a few files matching '{query}':\n{listing}\n"
+            "Which one should I read? (pick from the list above, or tell me the exact name.)")
+
+
 def _build_read_channel_fn(graph_factory=None):
     """The brainstorm channel read (Impl 3, Part 3). Reads the focused event channel's recent
     messages, membership-guarded, wrapping the result as untrusted external content. Degrades
@@ -658,34 +729,47 @@ def _resolve_channel_access(event_id, user_id):
     return True, {"team_id": team_id, "channel_id": channel_id, "event_name": event_name}
 
 
-def _build_list_event_files_fn(graph_factory=None):
-    """List the files available in the current conversation (Impl 5 + Impl 8). In a Team channel
-    this is the focused event channel's SharePoint files, enriched with each file's stored
-    catalog summary + doc_type, membership-gated. In a group chat / 1-1 DM (Impl 8) it is the
-    files shared in the chat itself (OneDrive driveItems referenced on messages) — keyed on the
-    chat id, **no focused event required**. Read-only; wraps the list as untrusted."""
+def _build_list_event_files_fn(graph_factory=None, catalog=None):
+    """List the files available in the current conversation (Impl 5 + Impl 8 + Impl 9). In a Team
+    channel this is the focused event channel's SharePoint files, enriched with each file's stored
+    catalog summary + doc_type, membership-gated. In a **group chat / 1-1 DM** it is the chat's
+    own files from the `chat_files` catalog (Impl 9) — keyed on the chat id, **no focused event
+    required**, with *real* stored summaries (no longer name+URL only). A group chat draws from a
+    Graph message scan + current attachments; a 1-1 DM draws from attachments only (a bot DM has
+    no Graph chat, so `/chats/{a:…}` is never called). Read-only; wraps the list as untrusted."""
     graph_factory = graph_factory or _default_graph
+    catalog = catalog or _default_chat_catalog()
 
-    def _list_chat_files(channel_id):
+    def _list_chat_files(channel_id, scope, attachments):
         from eventbuddy.agent.tools import wrap_untrusted
         if not _graph_creds():
             return "I can't read files yet — Microsoft Graph isn't configured."
         if not channel_id:
             return "I can't tell which chat this is, so I can't list its files."
-        try:
-            files = graph_factory().list_chat_files(channel_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"chat file list failed ({type(e).__name__}: {e})")
-            return "I couldn't list this chat's files right now — please try again shortly."
-        if not files:
+        # Personal scope (1-1 DM) has no Graph chat → discover from attachments only, never a
+        # /chats/{a:…} scan. Group scope additionally scans the chat's messages via Graph.
+        graph = graph_for() if scope == "group" else None
+        rows = catalog.sync(channel_id, scope=scope, attachments=attachments or [], graph=graph)
+        if not rows:
+            if scope == "personal":
+                return ("No files yet in this chat — share a file here (or paste a "
+                        "SharePoint/OneDrive link) and I'll read it.")
             return "No files have been shared in this chat yet."
-        lines = [f"• {f.get('name') or '(unnamed)'} (link: {f.get('url')})" for f in files]
+        lines = []
+        for r in rows:
+            label = f"• {r.filename}"
+            if r.doc_type:
+                label += f" — {r.doc_type}"
+            if r.summary:
+                label += f" — {r.summary}"
+            lines.append(label)
         return wrap_untrusted("files shared in this chat", "\n".join(lines))
 
-    def list_event_files_fn(*, user_id, event_id, scope="channel", channel_id=None):
+    def list_event_files_fn(*, user_id, event_id, scope="channel", channel_id=None,
+                            attachments=None):
         from eventbuddy.agent.tools import wrap_untrusted
         if scope in ("group", "personal"):
-            return _list_chat_files(channel_id)
+            return _list_chat_files(channel_id, scope, attachments)
         ok, info = _resolve_channel_access(event_id, user_id)
         if not ok:
             return info
@@ -729,44 +813,60 @@ def _build_list_event_files_fn(graph_factory=None):
     return list_event_files_fn
 
 
-def _build_read_event_file_fn(graph_factory=None):
-    """Read ONE file's content on demand (Impl 5). Resolves `file_id` against the focused
-    event's channel folder (or a pasted `link`), downloads it LIVE, and returns its content:
-    text via the parsers, images/image-PDFs via the vision model. Read-only, membership-gated;
-    lazily backfills the catalog summary; wraps the content as untrusted and bounds its size."""
+def _build_read_event_file_fn(graph_factory=None, catalog=None, pending_store=None):
+    """Read ONE file's content on demand (Impl 5 + Impl 9). In a Team channel, resolves a
+    `file_id` against the focused event's channel folder. In a **group chat / 1-1 DM**, prefers
+    a file the user just shared (`attachments`), else resolves a file by **name/description**
+    against the chat catalog (Impl 9) — a non-URL `link` value is treated as that name. A pasted
+    SharePoint/OneDrive `link` works anywhere. Downloads LIVE and returns its content: text via
+    the parsers, images/image-PDFs via the vision model. Read-only; wraps + bounds the content."""
     graph_factory = graph_factory or _default_graph
+    catalog = catalog or _default_chat_catalog()
 
     def read_event_file_fn(
         *, user_id, event_id, attachments=None, file_id="", link="",
         scope="channel", channel_id=None,
     ):
-        # `scope`/`channel_id` are accepted for parity with the scope-aware tools (Impl 8). A
-        # group-chat / DM file is read via its share `link` (surfaced by list_event_files's chat
-        # branch) — the `link` path below already works in any scope and needs no event. A bare
-        # `file_id` only addresses a Team channel's SharePoint folder, so it stays channel-scoped.
         from eventbuddy.agent.tools import wrap_untrusted
         from eventbuddy.ingestion.parsers import parse, render_pdf_first_page
 
         attachments = attachments or []
-        if not file_id and not link and not attachments:
-            return ("Tell me which file to read — upload it here, use the id from "
-                    "list_event_files, or paste a SharePoint/OneDrive link.")
-        # In a group chat / DM there's no channel folder to address by id — chat files are read
-        # by their share link (which list_event_files surfaces). Route a stray file_id to clean
-        # guidance instead of the channel "focus on an event" path.
-        if scope in ("group", "personal") and file_id and not link and not attachments:
-            return ("In this chat I read a file by its link — call list_event_files to get the "
-                    "file's link, then pass it as `link` (or just upload the file here).")
+        link = (link or "").strip()
+        link_is_url = link.startswith(("http://", "https://"))
+        # A `link` that isn't a URL is the model naming a file (e.g. "participants.csv") — in a
+        # chat we resolve that name against the catalog, not as a share URL.
+        name_query = link if (link and not link_is_url) else ""
 
-        # Source resolution → (filename, content, drive_item_id|None). An uploaded attachment
-        # (file_id/link not given) is read directly — works offline (no Graph for a Teams
-        # downloadUrl / data: URI), the natural path for "upload a file and ask about it".
         item_id = None
-        if not file_id and not link and attachments:
+        # 1) A file shared in THIS turn is the preferred source in every scope — read it
+        #    directly (no Graph chat scan; share links resolve via the caller's token).
+        if not file_id and not link_is_url and attachments:
             fetched = _download_uploaded_file(attachments)
             if isinstance(fetched, str):  # a degradation message
                 return fetched
             filename, content = fetched
+        # 2) Group chat / 1-1 DM, no current attachment: resolve by name/description (Impl 9).
+        elif scope in ("group", "personal") and not link_is_url:
+            if not _graph_creds():
+                return "I can't read files yet — Microsoft Graph isn't configured."
+            if not name_query:
+                return ("Tell me which file to read — name it (e.g. 'the agenda'), share it "
+                        "here, or paste its SharePoint/OneDrive link.")
+            kind, payload = _resolve_named_chat_file(
+                catalog, channel_id=channel_id, scope=scope,
+                attachments=attachments, query=name_query)
+            if kind == "bytes":
+                filename, content = payload
+            elif kind == "ambiguous":
+                return _chat_file_disambiguation(
+                    channel_id, name_query, payload, pending_store=pending_store)
+            else:  # none
+                return payload or (
+                    f"I don't see a file matching '{name_query}' here — call list_event_files "
+                    "to see what's been shared, or upload the file.")
+        elif not file_id and not link:
+            return ("Tell me which file to read — upload it here, use the id from "
+                    "list_event_files, or paste a SharePoint/OneDrive link.")
         elif file_id:
             ok, info = _resolve_channel_access(event_id, user_id)
             if not ok:
@@ -896,6 +996,9 @@ def build_orchestrator() -> Orchestrator:
     session_store = SessionStore(get_redis())
     pending_store = PendingActionStore(get_redis(), ttl=settings.pending_action_ttl)
     roster_store = RosterStore(get_redis(), ttl=settings.pending_action_ttl)
+    # Impl 9 — one per-chat file catalog shared by the list + read paths (a sync done by one is
+    # seen by the other) and by capture-on-receive.
+    chat_catalog = _default_chat_catalog()
 
     def provision_fn(**kw):
         from eventbuddy.capabilities.provisioning import ProvisioningService
@@ -1390,41 +1493,66 @@ def build_orchestrator() -> Orchestrator:
             bits.append("responses workbook link")
         return f"Saved the {' and '.join(bits)} for this event."
 
-    def read_participant_file_fn(*, user_id, event_id, attachments=None, link=""):
-        """Impl 4: read a participant-roster file (an uploaded attachment or a SharePoint/
-        OneDrive link), extract the participant email addresses, stash the reading in the
-        transient RosterStore, and return a bounded summary for the agent to relay + confirm.
-        Stateless — the roster is never persisted to the DB and never becomes EventMembers."""
+    def read_participant_file_fn(*, user_id, event_id, attachments=None, link="",
+                                 scope="personal", channel_id=None):
+        """Impl 4 + Impl 9: read a participant-roster file — a file the user just shared, a
+        SharePoint/OneDrive `link`, or (in a group chat / 1-1 DM) a file resolved by
+        **name/description** against the chat catalog (a non-URL `link` is treated as that name).
+        Extract the participant email addresses, stash the reading in the transient RosterStore,
+        and return a bounded summary for the agent to relay + confirm. Stateless — the roster is
+        never persisted to the DB and never becomes EventMembers."""
         from eventbuddy.agent.tools import wrap_untrusted
         from eventbuddy.capabilities.attachments import fetch_attachment_bytes
         from eventbuddy.ingestion.parsers import parse
         from eventbuddy.ingestion.roster import extract_roster
 
         attachments = attachments or []
+        link = (link or "").strip()
+        link_is_url = link.startswith(("http://", "https://"))
+        name_query = link if (link and not link_is_url) else ""
+
         descriptor = _pick_roster_attachment(attachments)
-        if descriptor is None and link:
+        if descriptor is None and link_is_url:
             descriptor = {"name": "", "content_type": "", "download_url": None,
                           "content_url": link}
-        if descriptor is None:
-            return ("Upload a participant list (.xlsx or .csv) here, or paste a SharePoint/"
-                    "OneDrive share link, and I'll read it.")
-        graph = None
-        content_url = descriptor.get("content_url") or ""
-        # A remote SharePoint/OneDrive link needs Graph; an uploaded file (downloadUrl/data URI)
-        # reads offline. `graph_for()` degrades to None (no raise) when the user isn't signed in.
-        if not descriptor.get("download_url") and content_url.startswith(("http://", "https://")):
+        fetched = None
+        if descriptor is not None:
+            graph = None
+            content_url = descriptor.get("content_url") or ""
+            # A remote SharePoint/OneDrive link needs Graph; an uploaded file (downloadUrl/data
+            # URI) reads offline. `graph_for()` degrades to None when the user isn't signed in.
+            if not descriptor.get("download_url") and content_url.startswith(
+                    ("http://", "https://")):
+                if not _graph_creds():
+                    return ("I can't open that link — Microsoft Graph isn't configured. Upload "
+                            "the file directly in the chat instead.")
+                graph = graph_for()
+                if graph is None:
+                    return ("I can't open that link yet — please sign in to Microsoft 365 (type "
+                            "'sign in'), or upload the file directly in the chat instead.")
+            try:
+                fetched = fetch_attachment_bytes(descriptor, graph=graph)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"participant file download failed ({type(e).__name__}: {e})")
+                fetched = None
+        elif scope in ("group", "personal") and name_query:
+            # Resolve the roster by name/description against the chat catalog (Impl 9).
             if not _graph_creds():
-                return ("I can't open that link — Microsoft Graph isn't configured. Upload the "
-                        "file directly in the chat instead.")
-            graph = graph_for()
-            if graph is None:
-                return ("I can't open that link yet — please sign in to Microsoft 365 (type "
-                        "'sign in'), or upload the file directly in the chat instead.")
-        try:
-            fetched = fetch_attachment_bytes(descriptor, graph=graph)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"participant file download failed ({type(e).__name__}: {e})")
-            fetched = None
+                return "I can't read files yet — Microsoft Graph isn't configured."
+            kind, payload = _resolve_named_chat_file(
+                chat_catalog, channel_id=channel_id, scope=scope,
+                attachments=attachments, query=name_query)
+            if kind == "ambiguous":
+                return _chat_file_disambiguation(
+                    channel_id, name_query, payload, pending_store=pending_store)
+            if kind == "none":
+                return payload or (
+                    f"I don't see a participant file matching '{name_query}' here — upload an "
+                    ".xlsx/.csv list, or call list_event_files to see what's been shared.")
+            fetched = payload  # ("bytes", (filename, content))
+        else:
+            return ("Upload a participant list (.xlsx or .csv) here, name the file you mean, or "
+                    "paste a SharePoint/OneDrive share link, and I'll read it.")
         if not fetched:
             return "I couldn't download that file — please re-send it or check the link."
         filename, content = fetched
@@ -1521,7 +1649,13 @@ def build_orchestrator() -> Orchestrator:
         """Membership-backed role (defense in depth). When an event is focused, the caller's
         real `EventMember.role` overrides the DM-host default — so the in-tool moderator gate
         and the confirm re-auth reflect actual membership. Falls back to `_default_role`
-        (host-in-DM) when there's no focused event yet (e.g. event creation)."""
+        (host-in-DM) when there's no focused event yet (e.g. event creation). A **group chat**
+        is exempt: it's a flat peer space, so we never downgrade a participant to their
+        `EventMember.role` there — `_default_role` keeps everyone at moderator."""
+        if scope == "group":
+            return _default_role(
+                user_id=user_id, scope=scope, channel_id=channel_id, event_id=event_id
+            )
         if event_id:
             from eventbuddy.data.db import session_scope
             from eventbuddy.data.repositories.members import MemberRepository
@@ -1600,6 +1734,43 @@ def build_orchestrator() -> Orchestrator:
                 return f"Couldn't fetch readable content from {url}."
             return wrap_untrusted(f"web page: {url}", page["content"])
 
+    def read_files_resolve(value: dict) -> dict:
+        """Impl 9 — turn a file-picker `Action.Submit` into a synthesized user turn. Pops the
+        one-shot pending payload (the candidate set + the original question), maps the selected
+        file name(s) to share-link attachments, and returns `{text, attachments}` for the router
+        to re-run through the agent (which then reads the file(s) and answers the original
+        question, with that question still in the working window). Returns `{message}` on a
+        degraded/expired path. Rule 2: the candidate set + question live server-side, never on
+        the card."""
+        from eventbuddy.bot.cards.builders import SHOW_ALL_CHOICE
+        pending_id = value.get("pending_id")
+        try:
+            payload = pending_store.pop(pending_id) if pending_id else None
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"pending store unavailable ({type(e).__name__}: {e})")
+            payload = None
+        if not payload or payload.get("type") != "read_files":
+            return {"message": "That file picker expired — ask me to read the file again."}
+        candidates = payload.get("candidates") or []
+        query = payload.get("query") or "the file"
+        selected = [s.strip() for s in str(value.get("selected") or "").split(",") if s.strip()]
+        if SHOW_ALL_CHOICE in selected or not selected:
+            # The picker only held the ambiguous subset; "show all" routes back through the
+            # agent's own file listing so the user can pick from everything in the chat.
+            return {"text": "List all the files shared in this chat so I can pick one.",
+                    "attachments": []}
+        chosen = [c for c in candidates if c.get("filename") in selected]
+        if not chosen:
+            return {"message": "I didn't catch which file you picked — please choose from the "
+                               "list and submit again."}
+        attachments = [{"name": c["filename"], "content_type": "reference",
+                        "download_url": None, "content_url": c.get("share_url")}
+                       for c in chosen]
+        names = ", ".join(c["filename"] for c in chosen)
+        text = (f"Read the file(s) I selected ({names}) and use them to answer my earlier "
+                f"request about '{query}'.")
+        return {"text": text, "attachments": attachments}
+
     setup_event_fn = _build_setup_event_fn()
     member_autoenroll_fn = _build_member_autoenroll_fn()
     channel_event_fn = _build_channel_event_fn()
@@ -1611,8 +1782,9 @@ def build_orchestrator() -> Orchestrator:
         web_search_fn=web_search_fn, web_fetch_fn=web_fetch_fn,
         read_participant_file_fn=read_participant_file_fn,
         send_participant_reminders_fn=send_participant_reminders_fn,
-        list_event_files_fn=_build_list_event_files_fn(),
-        read_event_file_fn=_build_read_event_file_fn(),
+        list_event_files_fn=_build_list_event_files_fn(catalog=chat_catalog),
+        read_event_file_fn=_build_read_event_file_fn(
+            catalog=chat_catalog, pending_store=pending_store),
         list_members_fn=_build_list_members_fn(),
         setup_event_fn=setup_event_fn,
         send_email_fn=send_email_fn, send_teams_message_fn=send_teams_message_fn,
@@ -1625,6 +1797,8 @@ def build_orchestrator() -> Orchestrator:
         runner=runner, agent_mode=settings.agent_mode if runner else "regex",
         role_resolver=role_resolver, channel_event_fn=channel_event_fn,
         member_autoenroll_fn=member_autoenroll_fn,
+        capture_files_fn=lambda *, chat_id, attachments: chat_catalog.capture(
+            chat_id, attachments),
         regex_fallback_on_error=not settings.agent_debug,
     )
     orch.summarizer = summarizer  # exposed so main.py can schedule the consolidation job
@@ -1633,6 +1807,8 @@ def build_orchestrator() -> Orchestrator:
         pending_store=pending_store, role_resolver=role_resolver,
         execute_fn=execute_confirmed_action,
     )
+    # Impl 9 — the router calls this on a file-picker submit to synthesize a re-entry turn.
+    orch.read_files_resolver = read_files_resolve
     # The router calls this on the turn's emitted cards before sending, to fold a flood of
     # per-recipient teams_dm cards into one (belt-and-suspenders over the batch tool).
     orch.coalesce_cards = lambda cards: coalesce_teams_dm_cards(

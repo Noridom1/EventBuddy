@@ -1,5 +1,8 @@
 import asyncio
 import contextvars
+import re
+from html import unescape
+from urllib.parse import urlparse
 
 from botbuilder.core import ActivityHandler, CardFactory, MessageFactory, TurnContext
 from botbuilder.schema import InvokeResponse
@@ -65,25 +68,63 @@ def _clean_text(activity) -> str:
 
 
 _CARD_PREFIX = "application/vnd.microsoft.card"
+# SharePoint/OneDrive share hosts, for sniffing file links out of the HTML message body
+# (Impl 9). Mirrors `capabilities.attachments._SHARE_HOSTS`.
+_SHARE_HOSTS = ("sharepoint.com", "onedrive.live.com", "1drv.ms")
+# <a href="…">name</a> in the message body — how a file shared *as a link* (not a structured
+# attachment) arrives. Captured so a "read this file" turn has a URL, not just a name (Impl 9).
+_ANCHOR_RE = re.compile(r'<a\b[^>]*\bhref="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _links_in_html(html: str) -> list[dict]:
+    """Pull SharePoint/OneDrive file links out of an HTML message body → `[{name, content_url}]`.
+    Teams renders a shared file as an anchor in the body; without this its link is never seen."""
+    out: list[dict] = []
+    for href, label in _ANCHOR_RE.findall(html or ""):
+        host = (urlparse(href).hostname or "").lower()
+        if not any(h in host for h in _SHARE_HOSTS):
+            continue
+        name = unescape(_TAG_RE.sub("", label)).strip() or href.rsplit("/", 1)[-1]
+        out.append({"name": name, "content_type": "reference",
+                    "download_url": None, "content_url": href})
+    return out
 
 
 def _attachments(activity) -> list[dict]:
-    """Lightweight descriptors for incoming file attachments (Impl 4). A file uploaded in
-    Teams arrives as `application/vnd.microsoft.teams.file.download.info` with a
+    """Lightweight descriptors for incoming file attachments (Impl 4 + Impl 9). A file uploaded
+    in Teams arrives as `application/vnd.microsoft.teams.file.download.info` with a
     pre-authenticated `content.downloadUrl`; a file dragged from SharePoint/OneDrive carries a
-    `contentUrl`. Adaptive-card and HTML (the message body) attachments are skipped. We carry
-    no bytes — a tool downloads on demand — so the model can't fabricate a file (rule 2)."""
+    `contentUrl`. A file shared *as a link* shows up only as an `<a href>` inside the HTML body
+    attachment — we now sniff those out too (Impl 9), so the file's URL is captured, not just its
+    name. True Adaptive-Card UI is still ignored. We carry no bytes — a tool downloads on demand
+    — so the model can't fabricate a file (rule 2). De-duplicated by URL."""
     out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(desc: dict) -> None:
+        key = desc.get("download_url") or desc.get("content_url")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(desc)
+
     for att in getattr(activity, "attachments", None) or []:
         content_type = getattr(att, "content_type", None) or ""
-        if content_type.startswith(_CARD_PREFIX) or content_type == "text/html":
+        if content_type == "text/html":
+            # The message body — mine it for shared-file anchors, then skip the markup itself.
+            body = att.content if isinstance(getattr(att, "content", None), str) else ""
+            for desc in _links_in_html(body):
+                add(desc)
+            continue
+        if content_type.startswith(_CARD_PREFIX):
             continue
         content = att.content if isinstance(getattr(att, "content", None), dict) else {}
         download_url = content.get("downloadUrl")
         content_url = getattr(att, "content_url", None)
         if not (download_url or content_url):
             continue
-        out.append({
+        add({
             "name": getattr(att, "name", None) or content.get("fileName") or "",
             "content_type": content_type,
             "download_url": download_url,
@@ -98,24 +139,40 @@ class EventBuddyBot(ActivityHandler):
         self._graph = build_agent_graph(orchestrator)
         # HITL confirm loop (Impl 1): handles Adaptive Card `Action.Submit` clicks.
         self._confirm = getattr(orchestrator, "confirm_handler", None)
+        # Impl 9: resolves a file-picker submit (pending_id + selected names) into a synthesized
+        # user turn (text + attachments) that re-enters the agent to answer the original question.
+        self._read_files_resolver = getattr(orchestrator, "read_files_resolver", None)
         # Folds a turn's per-recipient teams_dm cards into one before they're sent (or None).
         self._coalesce_cards = getattr(orchestrator, "coalesce_cards", None)
 
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         activity = turn_context.activity
 
-        # An Adaptive Card `Action.Submit` arrives as a message with `activity.value` set —
-        # route it to the confirm handler instead of the agent (it was authorized at prepare
-        # time; recipients live server-side, not in the model's head).
+        # An Adaptive Card `Action.Submit` arrives as a message with `activity.value` set.
+        # Impl 9 — a file-picker submit is resolved into a synthesized user turn (text +
+        # attachments) and re-run through the agent below; everything else (HITL confirms) is
+        # routed to the confirm handler (authorized at prepare time; recipients live server-side).
         value = activity.value
         confirm = getattr(self, "_confirm", None)  # defensive: bot may be built via __new__
-        if confirm is not None and isinstance(value, dict) and value.get("action"):
+        synth_text = synth_attachments = None
+        if isinstance(value, dict) and value.get("action") == "read_files":
+            resolver = getattr(self, "_read_files_resolver", None)
+            resolved = resolver(value) if resolver is not None else None
+            if not resolved or resolved.get("message"):
+                msg = (resolved or {}).get(
+                    "message", "That file picker expired — ask me to read the file again.")
+                await turn_context.send_activity(msg)
+                return
+            synth_text = resolved.get("text")
+            synth_attachments = resolved.get("attachments") or []
+        elif confirm is not None and isinstance(value, dict) and value.get("action"):
             await confirm.handle(turn_context)
             return
 
         # Bot @mention stripped (group chat / channel) so the LLM sees a clean message; no-op
-        # in a 1-1 DM. Used for both the sign-in keyword match and the agent input.
-        text = _clean_text(activity)
+        # in a 1-1 DM. Used for both the sign-in keyword match and the agent input. A file-picker
+        # re-entry overrides this with its synthesized continuation text.
+        text = synth_text if synth_text is not None else _clean_text(activity)
 
         # Plan 13 — an explicit "sign in" message starts the Microsoft 365 sign-in flow (shows
         # the OAuth card). Only meaningful when delegated auth is configured.
@@ -180,7 +237,8 @@ class EventBuddyBot(ActivityHandler):
             "scope": scope,
             "team_id": team_id,
             "sent_at": activity.timestamp,
-            "attachments": _attachments(activity),
+            "attachments": (
+                synth_attachments if synth_attachments is not None else _attachments(activity)),
             "graph_token": graph_token,
             "display_name": display_name,
         }

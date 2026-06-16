@@ -60,6 +60,24 @@ def test_no_attachments_yields_empty_list():
     assert _attachments(SimpleNamespace(attachments=None)) == []
 
 
+def test_extracts_sharepoint_link_from_html_body():
+    # A file shared *as a link* shows up only as an <a href> inside the HTML body (Impl 9).
+    html = ('<div>Đọc file này '
+            '<a href="https://contoso.sharepoint.com/sites/x/kichban-demo.docx">'
+            'kichban-demo.docx</a></div>')
+    act = _activity([_att(content_type="text/html", content=html)])
+    out = _attachments(act)
+    assert len(out) == 1
+    assert out[0]["name"] == "kichban-demo.docx"
+    assert out[0]["content_url"] == "https://contoso.sharepoint.com/sites/x/kichban-demo.docx"
+
+
+def test_ignores_non_share_links_in_html_body():
+    act = _activity([_att(content_type="text/html",
+                          content='<a href="https://example.com/page">not a file</a>')])
+    assert _attachments(act) == []
+
+
 # --- orchestrator threading + awareness note ----------------------------------------------
 
 class _FakeSession:
