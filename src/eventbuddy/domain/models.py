@@ -90,6 +90,41 @@ class Document(Base):
     )
 
 
+class ChatFile(Base):
+    """Per-chat file catalog (Impl 9) — the intelligence-plane analogue of `documents`, but for
+    files shared in a **group chat or 1-1 DM** rather than a Team channel's SharePoint folder.
+    Keyed on the conversation's `chat_id` (the inbound Bot Framework `conversation.id`: a
+    `19:…@thread.v2` group id or an `a:…` DM id — both are fine string keys), with **no FK to
+    events** because a chat usually has no bound event. A row is created the moment a file is
+    shared (a cheap `reference` upsert — `share_url` + `filename`, no download), then `summary`/
+    `doc_type`/`drive_item_id` are filled lazily on first list/read. This is what lets the agent
+    resolve a file by name/description on a later turn — the share link is otherwise delivered
+    only on the activity that bore the file and is lost by the next turn."""
+
+    __tablename__ = "chat_files"
+    file_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chat_id: Mapped[str] = mapped_column(String(200))
+    filename: Mapped[str] = mapped_column(String(500))
+    # The OneDrive/SharePoint sharing URL the file was shared by (a chat attachment's
+    # `contentUrl`). Resolved to a stable `drive_item_id` lazily on first read for idempotency.
+    share_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    drive_item_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # "reference" (captured, not yet read) | "parsed" | "failed".
+    parse_status: Mapped[str] = mapped_column(String(20), default="reference")
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_chat_files_chat_id", "chat_id"),
+        # NULL drive_item_ids are distinct in Postgres, so reference rows (pre-resolution)
+        # dedupe in the repository by share_url/filename instead.
+        UniqueConstraint("chat_id", "drive_item_id", name="uq_chat_files_chat_item"),
+    )
+
+
 class ScheduledJob(Base):
     __tablename__ = "scheduled_jobs"
     job_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

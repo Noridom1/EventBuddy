@@ -73,7 +73,8 @@ def test_read_participant_file_forwards_context_attachments():
     out = tools["read_participant_file"].invoke({"link": ""})
     assert "file_token" in out
     assert calls["read"] == dict(
-        user_id="h1", event_id="ev-3", attachments=atts, link=""
+        user_id="h1", event_id="ev-3", attachments=atts, link="",
+        scope="personal", channel_id=None,
     )
 
 

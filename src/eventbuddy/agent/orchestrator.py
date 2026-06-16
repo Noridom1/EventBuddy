@@ -10,10 +10,16 @@ log = get_logger("agent.orchestrator")
 
 def _default_role(*, user_id: str, scope: str, channel_id: str | None,
                   event_id: str | None = None) -> str:
-    """Server-resolved caller role. In a 1-1 DM the user acts as the event leader (host);
-    in a channel, default to member. Wiring may inject a membership-backed resolver that
-    overrides this with the caller's real `EventMember.role` when an event is focused."""
-    return "host" if scope == "personal" else "member"
+    """Server-resolved caller role. In a 1-1 DM the user acts as the event leader (host).
+    A group chat is a flat peer space — every participant resolves to `moderator`, so anyone
+    can run the privileged actions (no host/moderator/member split in group scope). In a
+    channel, default to member; wiring injects a membership-backed resolver that overrides
+    this with the caller's real `EventMember.role` when an event is focused."""
+    if scope == "personal":
+        return "host"
+    if scope == "group":
+        return "moderator"
+    return "member"
 
 
 class Orchestrator:
@@ -27,6 +33,7 @@ class Orchestrator:
                  remind_fn, report_fn, query_tasks_fn,
                  runner=None, agent_mode: str = "llm", role_resolver=None,
                  channel_event_fn=None, member_autoenroll_fn=None,
+                 capture_files_fn=None,
                  regex_fallback_on_error: bool = True):
         self.session = session_store
         self.provision = provision_fn
@@ -45,6 +52,11 @@ class Orchestrator:
         # enroll the posting user as an EventMember (keyed by Teams id) so they're recognized
         # here and in their own DM. Best-effort, server-side — None disables it (tests).
         self._member_autoenroll_fn = member_autoenroll_fn
+        # Impl 9: capture file references shared in a group chat / 1-1 DM into the per-chat
+        # catalog the moment they arrive — the share link rides only this activity and is lost
+        # by the next turn (and a DM has no Graph chat to re-derive it). Best-effort; None
+        # disables it (tests). Summaries are still backfilled lazily on a later list/read.
+        self._capture_files_fn = capture_files_fn
         # Phase 1.8: when False, a *runtime* LLM error is surfaced (debug) instead of
         # degrading to regex. The no-creds path (runner is None / agent_mode=regex) is
         # decided at wiring time and is unaffected by this flag.
@@ -100,6 +112,7 @@ class Orchestrator:
         # (Plan 13 — delegated Graph auth) + `display_name` (group-chat speaker tagging) are
         # additive + keyword-defaulted so existing callers that don't pass them keep working.
         attachments = attachments or []
+        self._maybe_capture_files(scope, channel_id, attachments)
         if self.agent_mode == "llm" and self.runner is not None:
             try:
                 ctx = self._build_ctx(user_id, channel_id, scope, sent_at, team_id, attachments,
@@ -112,6 +125,19 @@ class Orchestrator:
                     return f"[agent error] {type(e).__name__}: {e}\n{traceback.format_exc()}"
                 log.warning(f"LLM agent failed ({type(e).__name__}: {e}); falling back to regex")
         return self._regex_handle(user_id=user_id, channel_id=channel_id, text=text)
+
+    def _maybe_capture_files(self, scope: str, channel_id: str | None,
+                             attachments: list[dict]) -> None:
+        """Record any files shared this turn into the per-chat catalog (Impl 9) — only in a
+        group chat / 1-1 DM (a channel's files live in SharePoint, handled by ingestion). Cheap
+        reference upsert; best-effort, never breaks the turn."""
+        if (self._capture_files_fn is None or not attachments
+                or scope not in ("group", "personal") or not channel_id):
+            return
+        try:
+            self._capture_files_fn(chat_id=channel_id, attachments=attachments)
+        except Exception as e:  # noqa: BLE001 — capture is best-effort
+            log.warning(f"file capture skipped ({type(e).__name__}: {e})")
 
     def _maybe_autoenroll(self, ctx: RequestContext) -> None:
         """In a bound shared conversation, enroll the posting user as an EventMember (keyed by

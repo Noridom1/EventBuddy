@@ -235,6 +235,20 @@ All event-scoped tables carry `event_id` (FK → `events.event_id`) as a **manda
 | `parse_status` | VARCHAR(20) | `pending` \| `parsed` \| `failed` |
 | `ingested_at` | TIMESTAMPTZ | |
 
+**`chat_files`** (Impl 9 — per-chat file catalog; the intelligence-plane analogue of `documents` for **group-chat / 1-1 DM** files, which have no Team/SharePoint backing)
+| Column | Type | Notes |
+|--------|------|-------|
+| `file_id` | UUID PK | |
+| `chat_id` | VARCHAR(200) | the conversation id (`19:…@thread.v2` group / `a:…` DM) — **no FK to events** |
+| `filename` | VARCHAR(500) | |
+| `share_url` | VARCHAR(1000) | the file's OneDrive/SharePoint sharing URL (a chat attachment's `contentUrl`) |
+| `drive_item_id` | VARCHAR(200) | resolved from `share_url` on first read; idempotency key with `chat_id` |
+| `summary` / `doc_type` | TEXT / VARCHAR(40) | filled lazily on first list/read |
+| `parse_status` | VARCHAR(20) | `reference` (captured, not yet read) \| `parsed` \| `failed` |
+| `synced_at` | TIMESTAMPTZ | |
+
+A row is created the moment a file is shared (a cheap `reference` upsert — `share_url` + `filename`, no download), so a file named/described on a *later* turn still resolves even though the share link rides only the activity that bore it. Discovery is lazy and user-driven (no auto-ingest / on-join hook): a group chat scans `/chats/{id}/messages` + current attachments; a **1-1 DM uses attachments only** (a bot DM has no Graph chat — `/chats/{a:…}` is never called). The agent resolves a file by **name/description** against this catalog; on an ambiguous match it posts a multi-select dropdown picker whose submit re-enters the agent to read the chosen file(s) and answer the original question.
+
 **`scheduled_jobs`**
 | Column | Type | Notes |
 |--------|------|-------|
@@ -379,7 +393,7 @@ classifier. Per request:
 
 1. **Build server context** — the orchestrator resolves identity/role/scope/focused-event into a `RequestContext` and the scope-aware `thread_id`. Identity is **never** a model-settable tool arg.
 2. **Run the ReAct loop** — the model chats normally and emits `tool_calls` only when the user wants an event action, extracting the arguments itself (replacing the old regex `classify()`, which remains the graceful fallback). The `pre_model_hook` trims the working window to ≤4096 tokens on user/assistant boundaries before each LLM call.
-3. **Enforce permissions in code** — mutating tools (`create_event`, `prepare_reminders`) run the `Gatekeeper`/role check *inside the tool body*; the model never decides authorization.
+3. **Enforce permissions in code** — mutating tools (`create_event`, `prepare_reminders`) run the `Gatekeeper`/role check *inside the tool body*; the model never decides authorization. Role is scope-dependent (`_default_role` + the wiring `role_resolver`): a **1-1 DM** caller resolves to `host`; a **group chat is a flat peer space** — every participant resolves to `moderator` regardless of any focused event / `EventMember` row, so anyone can run the privileged actions (outbound sends still pass the HITL confirm card); a **channel** uses the caller's real `EventMember.role` (defaulting to `member`).
 4. **Ground & respond** — the reply is built on real tool results (no fabricated event names/ids); on LLM failure or `agent_mode=regex` the orchestrator degrades to the deterministic Phase 1 router.
 
 > HITL bulk/destructive flows (Adaptive Card propose → confirm activity) remain handled by the activity router, unchanged by Phase 1.7.
