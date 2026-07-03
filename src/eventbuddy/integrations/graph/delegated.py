@@ -163,7 +163,10 @@ async def acquire_graph_token(turn_context, magic_code: str | None = None) -> st
             if token:
                 return token
         except Exception as e:  # noqa: BLE001 — try the adapter path next
-            log.debug(f"UserTokenClient token fetch failed ({type(e).__name__}: {e})")
+            # WARNING (not debug): during sign-in triage this is the real reason a verifyState
+            # completion returned no token (e.g. an AADSTS code, correlation miss). Surfaces at
+            # the default INFO level without turning on global DEBUG.
+            log.warning(f"UserTokenClient token fetch failed ({type(e).__name__}: {e})")
 
     # Legacy adapter fallback only — CloudAdapter has no get_user_token (the UserTokenClient
     # above is the route). Guard so we never AttributeError on the modern adapter.
@@ -175,7 +178,7 @@ async def acquire_graph_token(turn_context, magic_code: str | None = None) -> st
         token = getattr(res, "token", None) if res else None
         return token or None
     except Exception as e:  # noqa: BLE001 — degrade: treat as "no token", never break the turn
-        log.debug(f"adapter token fetch failed ({type(e).__name__}: {e})")
+        log.warning(f"adapter token fetch failed ({type(e).__name__}: {e})")
         return None
 
 

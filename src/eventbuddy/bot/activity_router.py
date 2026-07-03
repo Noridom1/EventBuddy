@@ -11,6 +11,7 @@ from eventbuddy.agent.graph import build_agent_graph
 from eventbuddy.agent.wiring import build_orchestrator
 from eventbuddy.bot.turn_artifacts import begin_artifacts, end_artifacts
 from eventbuddy.bot.typing import typing_indicator
+from eventbuddy.common.logging import get_logger
 from eventbuddy.integrations.graph.delegated import (
     acquire_graph_token,
     clear_signin_needed,
@@ -29,6 +30,8 @@ _SIGNOUT_COMMANDS = {"sign out", "signout", "sign-out", "log out", "logout", "di
 # the bot keys everything on) so you can grab it for `make seed HOST_USER_ID=...`. Only ever
 # reveals the caller's *own* id to themselves, so it carries no identity-spoofing risk (rule 2).
 _WHOAMI_COMMANDS = {"whoami", "who am i", "my id", "myid"}
+
+log = get_logger("bot.activity_router")
 
 
 def _scope_and_team(activity) -> tuple[str, str | None]:
@@ -343,7 +346,19 @@ class EventBuddyBot(ActivityHandler):
         if name in ("signin/verifyState", "signin/tokenExchange"):
             value = turn_context.activity.value if isinstance(turn_context.activity.value, dict) \
                 else {}
+            # Diagnostic (sign-in triage): who is completing the flow, and did a token come back?
+            # The failing case ("code not found or expired") means the token service couldn't
+            # correlate the completed AAD login back to *this* Teams identity — the two ids below
+            # let us tell "wrong account / different tenant / not assigned" apart in the logs.
+            actor = turn_context.activity.from_property
+            has_state = bool(value.get("state"))
             token = await acquire_graph_token(turn_context, magic_code=value.get("state"))
+            log.info(
+                f"sign-in {name}: token={'YES' if token else 'NONE'} state_present={has_state} "
+                f"user_id={getattr(actor, 'id', None)} "
+                f"aad_object_id={getattr(actor, 'aad_object_id', None)} "
+                f"name={getattr(actor, 'name', None)}"
+            )
             if token:
                 await turn_context.send_activity(
                     "✅ You're signed in. Ask me again and I'll act on your behalf in Microsoft "
