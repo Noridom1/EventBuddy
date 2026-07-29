@@ -178,3 +178,39 @@ def test_match_resolves_by_name_after_sync(patched_db):
              attachments=[{"name": "participants.csv", "content_url": "https://x/participants"}])
     result = cat.match("a:dm", "the participants")
     assert result.exact is not None and result.exact.filename == "participants.csv"
+
+
+# --- _summarize_row is fully best-effort: one bad row can't blank the whole sync -----------
+
+def test_sync_survives_parse_failure_and_marks_row_failed(patched_db):
+    def boom_parse(filename, content):
+        raise ValueError("corrupt file")
+
+    cat = ChatFileCatalog(
+        parse=boom_parse,
+        understand=lambda parsed, *, llm, vision: {"summary": "unused", "doc_type": "other"},
+        vision_enabled=False,
+    )
+    graph = _Graph()
+    rows = cat.sync("a:dm", scope="personal", graph=graph,
+                    attachments=[{"name": "bad.csv", "content_url": "https://x/bad"}])
+    # the reference row survives (session not rolled back) and is marked failed, not retried.
+    assert [r.filename for r in rows] == ["bad.csv"]
+    assert rows[0].parse_status == "failed"
+
+
+def test_sync_survives_understand_failure_and_still_parses(patched_db):
+    def boom_understand(parsed, *, llm, vision):
+        raise RuntimeError("MaaS hiccup")
+
+    cat = ChatFileCatalog(
+        parse=lambda f, c: ParsedDoc(kind="csv", filename=f, text="a,b\n1,2"),
+        understand=boom_understand,
+        vision_enabled=False,
+    )
+    graph = _Graph()
+    rows = cat.sync("a:dm", scope="personal", graph=graph,
+                    attachments=[{"name": "ok.csv", "content_url": "https://x/ok"}])
+    assert [r.filename for r in rows] == ["ok.csv"]
+    # degrades to the existing empty-summary path rather than propagating and blanking the sync.
+    assert rows[0].parse_status == "parsed" and rows[0].summary is None

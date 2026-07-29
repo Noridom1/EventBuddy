@@ -209,29 +209,30 @@ class ChatFileCatalog:
             return []
 
     def _summarize_row(self, repo, row, graph) -> None:
-        """Resolve → download → parse → understand one reference row, backfilling the catalog."""
+        """Resolve → download → parse → understand one reference row, backfilling the catalog.
+        Best-effort end to end: any failure here marks this row `failed` (or degrades to an empty
+        summary) rather than raising, so one bad file can't blank the whole sync (which would
+        roll back every other row's upsert) or get retried forever."""
         if graph is None:
             return
         try:
             drive_id, item_id = graph.resolve_share_url(row.share_url)
             content, filename, _mime = graph.get_drive_item_content(drive_id, item_id)
+            parsed = self._parse(filename or row.filename, content)
         except Exception as e:  # noqa: BLE001
             log.warning(f"chat-file resolve failed for {row.filename} ({type(e).__name__}: {e})")
             row.parse_status = "failed"
             return
-        parsed = self._parse(filename or row.filename, content)
         if parsed.kind == "unsupported":
             repo.upsert(row.chat_id, filename=row.filename, drive_item_id=item_id,
                         doc_type="other", summary="(unsupported file type)",
                         parse_status="failed")
             return
-        vision = None
-        if self._vision_enabled:
-            from eventbuddy.integrations.llm.client import LLMGateway
-            vision = LLMGateway()
-        from eventbuddy.integrations.llm.client import LLMGateway
         try:
-            info = self._understand(parsed, llm=LLMGateway(), vision=vision)
+            from eventbuddy.integrations.llm.client import LLMGateway
+            llm = LLMGateway()
+            vision = llm if self._vision_enabled else None
+            info = self._understand(parsed, llm=llm, vision=vision)
         except Exception as e:  # noqa: BLE001
             log.warning(f"chat-file understand failed for {row.filename} "
                         f"({type(e).__name__}: {e})")
