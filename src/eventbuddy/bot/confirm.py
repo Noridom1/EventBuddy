@@ -65,7 +65,12 @@ class ConfirmHandler:
         value = activity.value if isinstance(activity.value, dict) else {}
         clicker = activity.from_property.id if activity.from_property else "unknown"
         conv = activity.conversation
-        scope = "channel" if (conv and getattr(conv, "is_group", False)) else "personal"
+        # Reuse the router's canonical scope derivation (Impl 3) so this handler agrees with the
+        # request path on group vs. channel vs. personal — a divergent rule here previously made
+        # a group-chat "group" scope re-derive as "channel", downgrading the clicker's role and
+        # wrongly denying confirms that were authorized at prepare time.
+        from eventbuddy.bot.activity_router import _scope_and_team
+        scope, _ = _scope_and_team(activity)
         # Plan 13 — acquire the clicker's delegated Graph token so the confirmed send acts on
         # their behalf, and publish it to the request-scoped ContextVar that `graph_for()`
         # reads inside `execute_fn`. None when not signed in / app-only configured — the

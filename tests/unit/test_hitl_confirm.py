@@ -3,6 +3,10 @@
 `ConfirmHandler.resolve` is the pure decision: pop the one-shot pending action, re-authorize
 the clicker (cross-cutting rule 2 — never trust the card), and hand off to an injected
 `execute_fn` for the side effects. Tested here with fakes — no Bot Framework, no Graph, no DB."""
+from types import SimpleNamespace
+
+import pytest
+
 from eventbuddy.bot.confirm import ConfirmHandler
 
 
@@ -118,3 +122,51 @@ def test_redis_failure_degrades_to_expired():
                        execute_fn=lambda **kw: (True, "x"))
     out = h.resolve(action="remind", pending_id="p1", channel="outlook", clicker="u1")
     assert "expired" in out.lower()  # never a 500
+
+
+# --- handle(): scope derivation must agree with the request path (_scope_and_team) ----------
+
+def _turn_context(conv_type):
+    activity = SimpleNamespace(
+        value={"action": "remind", "pending_id": "p1", "channel": "outlook"},
+        from_property=SimpleNamespace(id="u1"),
+        conversation=SimpleNamespace(id="chat-1", conversation_type=conv_type),
+        channel_data=None,
+    )
+    sent = []
+
+    async def send_activity(text):
+        sent.append(text)
+
+    return SimpleNamespace(activity=activity, send_activity=send_activity), sent
+
+
+@pytest.mark.asyncio
+async def test_handle_group_chat_authorizes_moderator_like_role(monkeypatch):
+    # A group chat is a flat peer space (role_resolver treats scope="group" as moderator); the
+    # regression this guards against re-derived a groupChat activity as scope="channel", which
+    # would (via role_resolver) fall through to a real, lower EventMember.role and wrongly deny.
+    monkeypatch.setattr(
+        "eventbuddy.integrations.graph.delegated.acquire_graph_token",
+        lambda turn_context, magic_code=None: _async_none(),
+    )
+    seen_scope = {}
+
+    def role_resolver(*, user_id, scope, channel_id, event_id=None):
+        seen_scope["scope"] = scope
+        return "moderator"
+
+    def execute_fn(*, payload, channel, actor, authorized):
+        return (True, "✅ done")
+
+    h = ConfirmHandler(
+        pending_store=_Pending(_PAYLOAD), role_resolver=role_resolver, execute_fn=execute_fn,
+    )
+    turn_context, sent = _turn_context("groupChat")
+    await h.handle(turn_context)
+    assert seen_scope["scope"] == "group"
+    assert sent == ["✅ done"]
+
+
+async def _async_none():
+    return None
